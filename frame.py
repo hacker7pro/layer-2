@@ -384,13 +384,7 @@ def ask_l3_ipv4():
     ip_id   = get("Identification (decimal)",   "4660")
     dscp    = get("DSCP/ECN (decimal, usu. 0)", "0")
     df      = get("DF flag? (y/n)",             "y")
-
-    print("    L4 protocol inside IPv4:")
-    print("      1=ICMP   6=TCP   17=UDP   [other: enter number]")
-    proto_raw = get("Protocol number", "1")
-    proto_num = int(proto_raw)
-
-    return src_ip, dst_ip, int(ttl), int(ip_id), int(dscp), df.lower().startswith('y'), proto_num
+    return src_ip, dst_ip, int(ttl), int(ip_id), int(dscp), df.lower().startswith('y'), 0
 
 def build_ipv4(l4_payload, src_ip, dst_ip, ttl, ip_id, dscp, df, proto_num):
     flags_frag = 0x4000 if df else 0x0000
@@ -656,6 +650,267 @@ def build_icmp(icmp_type, icmp_code, icmp_id, icmp_seq, icmp_data, data_hex_repr
     return msg, fields, ck
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  WELL-KNOWN PORT TABLE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+WELL_KNOWN_PORTS = {
+    20: "FTP-Data",     21: "FTP-Control",  22: "SSH",
+    23: "Telnet",       25: "SMTP",         53: "DNS",
+    67: "DHCP-Server",  68: "DHCP-Client",  69: "TFTP",
+    80: "HTTP",         110:"POP3",         119:"NNTP",
+    123:"NTP",          143:"IMAP",         161:"SNMP",
+    162:"SNMP-Trap",    179:"BGP",          194:"IRC",
+    389:"LDAP",         443:"HTTPS",        445:"SMB",
+    514:"Syslog",       520:"RIP",          587:"SMTP-TLS",
+    636:"LDAPS",        993:"IMAPS",        995:"POP3S",
+   1194:"OpenVPN",     1433:"MSSQL",       1521:"Oracle",
+   3306:"MySQL",       3389:"RDP",         5060:"SIP",
+   5432:"PostgreSQL",  5900:"VNC",         6379:"Redis",
+   8080:"HTTP-Alt",    8443:"HTTPS-Alt",   9200:"Elasticsearch",
+   27017:"MongoDB",
+}
+
+def port_note(port):
+    return WELL_KNOWN_PORTS.get(port, "")
+
+def print_port_table():
+    print(f"\n  {'─'*100}")
+    print(f"  {'WELL-KNOWN PORT REFERENCE  (TCP & UDP)':^100}")
+    print(f"  {'─'*100}")
+    ports = sorted(WELL_KNOWN_PORTS.items())
+    # print in 3 columns
+    cols = 3
+    rows = (len(ports) + cols - 1) // cols
+    for r in range(rows):
+        line = "  "
+        for c in range(cols):
+            idx = r + c * rows
+            if idx < len(ports):
+                p, n = ports[idx]
+                line += f"  {p:>5} = {n:<18}"
+        print(line)
+    print(f"  {'─'*100}")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  TCP PSEUDO-HEADER CHECKSUM  (RFC 793)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def tcp_checksum(src_ip, dst_ip, tcp_segment):
+    """RFC 793: checksum over pseudo-header + TCP segment."""
+    pseudo = (ip_b(src_ip) + ip_b(dst_ip) +
+              b'\x00' + b'\x06' +
+              struct.pack("!H", len(tcp_segment)))
+    return inet_cksum(pseudo + tcp_segment)
+
+def udp_checksum(src_ip, dst_ip, udp_datagram):
+    """RFC 768: checksum over pseudo-header + UDP datagram."""
+    pseudo = (ip_b(src_ip) + ip_b(dst_ip) +
+              b'\x00' + b'\x11' +
+              struct.pack("!H", len(udp_datagram)))
+    return inet_cksum(pseudo + udp_datagram)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  TCP  –  3-WAY HANDSHAKE BUILDER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+TCP_FLAGS = {
+    'FIN':0x01, 'SYN':0x02, 'RST':0x04,
+    'PSH':0x08, 'ACK':0x10, 'URG':0x20,
+    'ECE':0x40, 'CWR':0x80,
+}
+
+TCP_STEPS = {
+    '1': ("SYN",     0x02, "Client → Server  (open connection request)"),
+    '2': ("SYN-ACK", 0x12, "Server → Client  (acknowledge + own SYN)"),
+    '3': ("ACK",     0x10, "Client → Server  (acknowledge server SYN)"),
+    '4': ("PSH+ACK", 0x18, "Data segment with push flag"),
+    '5': ("FIN+ACK", 0x11, "Initiating graceful close"),
+    '6': ("RST",     0x04, "Abrupt connection reset"),
+}
+
+def print_tcp_handshake_diagram():
+    print("""
+  ┌──────────────────────────────────────────────────────────────────────┐
+  │                 TCP 3-WAY HANDSHAKE FLOW                             │
+  │                                                                      │
+  │   CLIENT                                          SERVER             │
+  │     │                                               │                │
+  │     │  ── STEP 1: SYN ──────────────────────────>  │  SEQ=x         │
+  │     │             SYN=1  ACK=0                      │                │
+  │     │                                               │                │
+  │     │  <─ STEP 2: SYN-ACK ───────────────────────  │  SEQ=y ACK=x+1 │
+  │     │             SYN=1  ACK=1                      │                │
+  │     │                                               │                │
+  │     │  ── STEP 3: ACK ──────────────────────────>  │  SEQ=x+1       │
+  │     │             SYN=0  ACK=1  ACK_NUM=y+1         │                │
+  │     │                                               │                │
+  │     │  ── STEP 4: PSH+ACK (data) ───────────────>  │                │
+  │     │                                               │                │
+  │     │  ── STEP 5: FIN+ACK (close) ──────────────>  │                │
+  │     │                                               │                │
+  │     │  ── STEP 6: RST (reset) ──────────────────>  │                │
+  │                                                                      │
+  │  Flags:  SYN=0x02  ACK=0x10  SYN+ACK=0x12  PSH=0x08  FIN=0x01     │
+  │          RST=0x04  URG=0x20  ECE=0x40  CWR=0x80                     │
+  └──────────────────────────────────────────────────────────────────────┘""")
+
+def ask_l4_tcp(src_ip, dst_ip):
+    print_tcp_handshake_diagram()
+    print_port_table()
+    section("LAYER 4 — TCP")
+
+    print("    Handshake step:")
+    for k,(name,_,desc) in TCP_STEPS.items():
+        print(f"      {k} = {name:<10}  {desc}")
+    step = get("Choose step", "1")
+    if step not in TCP_STEPS: step = '1'
+    step_name, default_flags, step_desc = TCP_STEPS[step]
+
+    print(f"\n    Building: {step_name}  —  {step_desc}")
+
+    src_port = int(get("Source Port",      "49152"))
+    dst_port = int(get("Destination Port", "80"))
+    pn = port_note(dst_port) or port_note(src_port)
+    if pn: print(f"    -> Port note: {pn}")
+
+    seq_num  = int(get("Sequence Number  (ISN for SYN, else continuation)", "1000"))
+    ack_num  = int(get("Acknowledgement Number  (0 if SYN, else peer_seq+1)", "0" if step=='1' else "1001"))
+    data_off = 5     # header length = 5 * 4 = 20 bytes (no options)
+    flags_val = default_flags
+    print(f"    TCP Flags (hex, default={default_flags:#04x} = {step_name})")
+    flags_in = get("Flags hex (Enter=default)", f"{default_flags:02x}")
+    try:    flags_val = int(flags_in, 16)
+    except: flags_val = default_flags
+
+    window   = int(get("Window Size (bytes)", "65535"))
+    urg_ptr  = int(get("Urgent Pointer      (0 unless URG set)", "0"))
+
+    # Optional data payload (for PSH+ACK)
+    tcp_data = b''
+    if step in ('4',):
+        print("    TCP data payload hex  (default = 'GET / HTTP/1.0\\r\\n')")
+        dhex = get("Data hex", "474554202f20485454502f312e300d0a")
+        try:    tcp_data = bytes.fromhex(dhex.replace(" ",""))
+        except: tcp_data = b''
+
+    return (step, step_name, src_port, dst_port, seq_num, ack_num,
+            data_off, flags_val, window, urg_ptr, tcp_data, src_ip, dst_ip)
+
+def build_tcp(step, step_name, src_port, dst_port, seq_num, ack_num,
+              data_off, flags_val, window, urg_ptr, tcp_data,
+              src_ip, dst_ip):
+    # Build with checksum=0
+    hdr_no_ck = struct.pack("!HHIIBBHHH",
+        src_port, dst_port,
+        seq_num, ack_num,
+        (data_off << 4),   # data offset in high nibble
+        flags_val,
+        window, 0, urg_ptr)
+    seg_no_ck = hdr_no_ck + tcp_data
+    ck = tcp_checksum(src_ip, dst_ip, seg_no_ck)
+    hdr = struct.pack("!HHIIBBHHH",
+        src_port, dst_port,
+        seq_num, ack_num,
+        (data_off << 4),
+        flags_val,
+        window, ck, urg_ptr)
+    seg = hdr + tcp_data
+
+    # Decode flags for display
+    flag_names = [n for n,v in TCP_FLAGS.items() if flags_val & v]
+    flag_str   = '+'.join(flag_names) if flag_names else "none"
+    pn_src = port_note(src_port); pn_dst = port_note(dst_port)
+
+    fields = [
+        {"layer":4,"name":"TCP Source Port",     "raw":seg[0:2],  "user_val":str(src_port),
+         "note":pn_src or "ephemeral"},
+        {"layer":4,"name":"TCP Dest Port",       "raw":seg[2:4],  "user_val":str(dst_port),
+         "note":pn_dst or ""},
+        {"layer":4,"name":"TCP Sequence Num",    "raw":seg[4:8],  "user_val":str(seq_num),
+         "note":f"0x{seq_num:08x}"},
+        {"layer":4,"name":"TCP Ack Number",      "raw":seg[8:12], "user_val":str(ack_num),
+         "note":f"0x{ack_num:08x}"},
+        {"layer":4,"name":"TCP Data Offset+Res", "raw":seg[12:13],"user_val":str(data_off),
+         "note":f"{data_off*4}B header, reserved=0"},
+        {"layer":4,"name":"TCP Flags",           "raw":seg[13:14],"user_val":f"0x{flags_val:02x}",
+         "note":f"{flag_str}  [{step_name}]"},
+        {"layer":4,"name":"TCP Window Size",     "raw":seg[14:16],"user_val":str(window),
+         "note":"bytes"},
+        {"layer":4,"name":"TCP Checksum",        "raw":seg[16:18],"user_val":"auto",
+         "note":f"0x{ck:04x}  RFC793 pseudo-hdr+segment"},
+        {"layer":4,"name":"TCP Urgent Pointer",  "raw":seg[18:20],"user_val":str(urg_ptr),
+         "note":"0 unless URG flag set"},
+    ]
+    if tcp_data:
+        fields.append({"layer":4,"name":"TCP Data Payload","raw":tcp_data,
+                       "user_val":tcp_data.hex()[:24],"note":f"{len(tcp_data)}B"})
+    return seg, fields, ck
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  UDP  –  DATAGRAM BUILDER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+UDP_COMMON = {
+    ('53','53'):   "DNS Query/Response",
+    ('67','68'):   "DHCP",
+    ('123','123'): "NTP",
+    ('161','162'): "SNMP",
+    ('514','514'): "Syslog",
+    ('520','520'): "RIP",
+    ('69','69'):   "TFTP",
+    ('5060','5060'):"SIP",
+}
+
+def ask_l4_udp(src_ip, dst_ip):
+    print_port_table()
+    section("LAYER 4 — UDP")
+    print("    UDP is connectionless – single datagram, no handshake.")
+    print("    Common uses: DNS (53), DHCP (67/68), NTP (123), SNMP (161), TFTP (69)")
+
+    src_port = int(get("Source Port",      "49152"))
+    dst_port = int(get("Destination Port", "53"))
+    pn = port_note(dst_port) or port_note(src_port)
+    if pn: print(f"    -> Port note: {pn}")
+
+    print("    UDP data payload hex")
+    print("      DNS query example : 0001010000010000000000000377777703636f6d00000100 01")
+    print("      NTP request       : e300000000000000000000000000000000000000000000000000000000000000000000000000000000000000")
+    print("      Syslog example    : 3c31343e4a756c2031352030303a30303a303020686f73 74206d657373616765")
+    dhex = get("Data hex  (Enter=empty datagram)", "")
+    try:    udp_data = bytes.fromhex(dhex.replace(" ",""))
+    except: udp_data = b''
+
+    return src_port, dst_port, udp_data, src_ip, dst_ip
+
+def build_udp(src_port, dst_port, udp_data, src_ip, dst_ip):
+    length = 8 + len(udp_data)
+    # Build with checksum=0
+    hdr_no_ck = struct.pack("!HHHH", src_port, dst_port, length, 0)
+    dgram_no_ck = hdr_no_ck + udp_data
+    ck = udp_checksum(src_ip, dst_ip, dgram_no_ck)
+    # RFC 768: if computed checksum is 0, transmit 0xFFFF
+    if ck == 0: ck = 0xFFFF
+    hdr  = struct.pack("!HHHH", src_port, dst_port, length, ck)
+    dgram = hdr + udp_data
+
+    pn_src = port_note(src_port); pn_dst = port_note(dst_port)
+
+    fields = [
+        {"layer":4,"name":"UDP Source Port",  "raw":dgram[0:2],"user_val":str(src_port),
+         "note":pn_src or "ephemeral"},
+        {"layer":4,"name":"UDP Dest Port",    "raw":dgram[2:4],"user_val":str(dst_port),
+         "note":pn_dst or ""},
+        {"layer":4,"name":"UDP Length",       "raw":dgram[4:6],"user_val":"auto",
+         "note":f"{length}B (8 hdr + {len(udp_data)} data)"},
+        {"layer":4,"name":"UDP Checksum",     "raw":dgram[6:8],"user_val":"auto",
+         "note":f"0x{ck:04x}  RFC768 pseudo-hdr+datagram"},
+    ]
+    if udp_data:
+        fields.append({"layer":4,"name":"UDP Data Payload","raw":udp_data,
+                       "user_val":udp_data.hex()[:24],"note":f"{len(udp_data)}B"})
+    return dgram, fields, ck
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  FRAME ASSEMBLERS
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -761,7 +1016,7 @@ def flow_eth_ip_icmp():
     (dst_mb, src_mb, type_len_b, llc_b, snap_b,
      variant, dst_s, src_s, v) = ask_l2_ethernet("0800")
     (src_ip, dst_ip, ttl, ip_id, dscp,
-     df, proto_num) = ask_l3_ipv4()
+     df, _) = ask_l3_ipv4()
     # L4
     icmp_type, icmp_code, icmp_id, icmp_seq, icmp_data, data_hex = ask_l4_icmp()
     icmp_msg, icmp_fields, icmp_ck = build_icmp(icmp_type, icmp_code, icmp_id, icmp_seq, icmp_data, data_hex)
@@ -929,8 +1184,88 @@ def flow_eth_lacp():
     print_final_hex(full_frame)
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  FLOW: Serial / WAN
+#  FLOW: Ethernet + IPv4 + TCP
 # ──────────────────────────────────────────────────────────────────────────────
+
+def flow_eth_ip_tcp():
+    banner("ETHERNET  +  IPv4  +  TCP",
+           "L1: Preamble+SFD  |  L2: Ethernet II (0x0800)  |  L3: IPv4  |  L4: TCP")
+    preamble, sfd = ask_layer1_eth()
+    (dst_mb, src_mb, type_len_b, llc_b, snap_b,
+     variant, dst_s, src_s, v) = ask_l2_ethernet("0800")
+    (src_ip, dst_ip, ttl, ip_id, dscp, df, _) = ask_l3_ipv4()
+    # Force protocol=6 (TCP) regardless of user proto input
+    (step, step_name, src_port, dst_port, seq_num, ack_num,
+     data_off, flags_val, window, urg_ptr, tcp_data,
+     sip, dip) = ask_l4_tcp(src_ip, dst_ip)
+
+    tcp_seg, tcp_fields, tcp_ck = build_tcp(
+        step, step_name, src_port, dst_port, seq_num, ack_num,
+        data_off, flags_val, window, urg_ptr, tcp_data, src_ip, dst_ip)
+
+    ip_hdr, ip_fields, ip_ck = build_ipv4(
+        tcp_seg, src_ip, dst_ip, ttl, ip_id, dscp, df, 6)
+
+    l3_payload = ip_hdr + tcp_seg
+    all_upper  = ip_fields + tcp_fields
+
+    full_frame, records = assemble_eth_frame(
+        l3_payload, all_upper, dst_mb, src_mb, type_len_b,
+        llc_b, snap_b, variant, dst_s, src_s, v, preamble, sfd)
+
+    print_frame_table(records)
+    fcs_stored = full_frame[-4:]
+    fcs_ref    = crc32_eth(full_frame[8:-4])
+    ip_ver     = inet_cksum(ip_hdr)
+    tcp_ver    = tcp_checksum(src_ip, dst_ip, tcp_seg)
+    verify_report([
+        ("IP Header Checksum",    f"0x{ip_ck:04x}",  f"0x{ip_ver:04x}",  ip_ver==0),
+        ("TCP Checksum",          f"0x{tcp_ck:04x}", f"0x{tcp_ver:04x}", tcp_ver==0),
+        ("Ethernet FCS (CRC-32)", fcs_stored.hex(),  fcs_ref.hex(),       fcs_stored==fcs_ref),
+    ])
+    print_final_hex(full_frame)
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  FLOW: Ethernet + IPv4 + UDP
+# ──────────────────────────────────────────────────────────────────────────────
+
+def flow_eth_ip_udp():
+    banner("ETHERNET  +  IPv4  +  UDP",
+           "L1: Preamble+SFD  |  L2: Ethernet II (0x0800)  |  L3: IPv4  |  L4: UDP")
+    preamble, sfd = ask_layer1_eth()
+    (dst_mb, src_mb, type_len_b, llc_b, snap_b,
+     variant, dst_s, src_s, v) = ask_l2_ethernet("0800")
+    (src_ip, dst_ip, ttl, ip_id, dscp, df, _) = ask_l3_ipv4()
+
+    (src_port, dst_port, udp_data,
+     sip, dip) = ask_l4_udp(src_ip, dst_ip)
+
+    udp_dgram, udp_fields, udp_ck = build_udp(
+        src_port, dst_port, udp_data, src_ip, dst_ip)
+
+    ip_hdr, ip_fields, ip_ck = build_ipv4(
+        udp_dgram, src_ip, dst_ip, ttl, ip_id, dscp, df, 17)
+
+    l3_payload = ip_hdr + udp_dgram
+    all_upper  = ip_fields + udp_fields
+
+    full_frame, records = assemble_eth_frame(
+        l3_payload, all_upper, dst_mb, src_mb, type_len_b,
+        llc_b, snap_b, variant, dst_s, src_s, v, preamble, sfd)
+
+    print_frame_table(records)
+    fcs_stored = full_frame[-4:]
+    fcs_ref    = crc32_eth(full_frame[8:-4])
+    ip_ver     = inet_cksum(ip_hdr)
+    udp_ver    = udp_checksum(src_ip, dst_ip, udp_dgram)
+    verify_report([
+        ("IP Header Checksum",    f"0x{ip_ck:04x}",  f"0x{ip_ver:04x}",  ip_ver==0),
+        ("UDP Checksum",          f"0x{udp_ck:04x}", f"0x{udp_ver:04x}", udp_ver==0),
+        ("Ethernet FCS (CRC-32)", fcs_stored.hex(),  fcs_ref.hex(),       fcs_stored==fcs_ref),
+    ])
+    print_final_hex(full_frame)
+
+
 
 def flow_serial():
     banner("SERIAL / WAN FRAME BUILDER",
@@ -963,7 +1298,7 @@ def flow_serial():
             try:    l3_payload = bytes.fromhex(phex.replace(" ",""))
             except: l3_payload = b''
         elif l3ch == '3':
-            (src_ip, dst_ip, ttl, ip_id, dscp, df, proto_num) = ask_l3_ipv4()
+            (src_ip, dst_ip, ttl, ip_id, dscp, df, _) = ask_l3_ipv4()
             icmp_type, icmp_code, icmp_id, icmp_seq, icmp_data, data_hex = ask_l4_icmp()
             icmp_msg, icmp_flds, icmp_ck = build_icmp(icmp_type, icmp_code, icmp_id, icmp_seq, icmp_data, data_hex)
             ip_hdr, ip_flds, ip_ck = build_ipv4(icmp_msg, src_ip, dst_ip, ttl, ip_id, dscp, df, 1)
@@ -1037,10 +1372,12 @@ L3_ETH_MENU = """
   ├───┬─────────────────────────────────────────────────────────────────┤
   │ 1 │ ARP                      (EtherType 0x0806)                     │
   │ 2 │ IPv4 + ICMP              (EtherType 0x0800)                     │
-  │ 3 │ STP / RSTP BPDU          (802.3 + LLC wrapper)                  │
-  │ 4 │ DTP  – Cisco Trunking    (802.3 + SNAP)                         │
-  │ 5 │ PAgP – Cisco Port Agg.   (802.3 + SNAP)                         │
-  │ 6 │ LACP – 802.3ad           (EtherType 0x8809)                     │
+  │ 3 │ IPv4 + TCP               (EtherType 0x0800, proto=6)            │
+  │ 4 │ IPv4 + UDP               (EtherType 0x0800, proto=17)           │
+  │ 5 │ STP / RSTP BPDU          (802.3 + LLC wrapper)                  │
+  │ 6 │ DTP  – Cisco Trunking    (802.3 + SNAP)                         │
+  │ 7 │ PAgP – Cisco Port Agg.   (802.3 + SNAP)                         │
+  │ 8 │ LACP – 802.3ad           (EtherType 0x8809)                     │
   └───┴─────────────────────────────────────────────────────────────────┘"""
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1054,20 +1391,21 @@ MAIN_MENU = """
 ║  SELECT LAYER 2 TECHNOLOGY FIRST                                          ║
 ╠═══╦═══════════════════════════════════════════════════════════════════════╣
 ║ 1 ║ Ethernet / 802.3  →  then choose Layer 3 protocol                    ║
-║   ║   Supports:  ARP  |  IPv4+ICMP  |  STP/RSTP  |  DTP  |  PAgP  |LACP ║
+║   ║   ARP | IPv4+ICMP | IPv4+TCP | IPv4+UDP | STP | DTP | PAgP | LACP   ║
 ╠═══╬═══════════════════════════════════════════════════════════════════════╣
 ║ 2 ║ Serial / WAN  →  then choose L2 protocol + optional L3/L4 payload    ║
-║   ║   Supports:  PPP  |  HDLC  |  SLIP  |  Modbus RTU  |  ATM AAL5      ║
-║   ║             Cisco HDLC  |  KISS  |  COBS  |  HDLC+BitStuff           ║
+║   ║   PPP | HDLC | SLIP | Modbus RTU | ATM AAL5 | Cisco HDLC | KISS     ║
 ╚═══╩═══════════════════════════════════════════════════════════════════════╝"""
 
 L3_DISPATCH = {
     '1': flow_eth_arp,
     '2': flow_eth_ip_icmp,
-    '3': flow_eth_stp,
-    '4': flow_eth_dtp,
-    '5': flow_eth_pagp,
-    '6': flow_eth_lacp,
+    '3': flow_eth_ip_tcp,
+    '4': flow_eth_ip_udp,
+    '5': flow_eth_stp,
+    '6': flow_eth_dtp,
+    '7': flow_eth_pagp,
+    '8': flow_eth_lacp,
 }
 
 def main():
@@ -1076,7 +1414,7 @@ def main():
 
     if top == '1':
         print(L3_ETH_MENU)
-        l3ch = input("  Choose L3 protocol (1-6): ").strip()
+        l3ch = input("  Choose L3 protocol (1-8): ").strip()
         fn = L3_DISPATCH.get(l3ch)
         if fn: fn()
         else:  print("  Invalid choice.")
