@@ -191,18 +191,201 @@ def print_frame_table(records):
     print(f"  {'Total':>5}: {offset} bytes  /  {offset*8} bits")
     print(SEP)
 
-def print_final_hex(frame):
+def print_encapsulation(records, frame):
+    """
+    Print three things:
+    1. Nested encapsulation box diagram showing which bytes belong to which layer
+    2. Annotated hex dump with layer markers
+    3. Plain final hex (no gaps) + total bytes
+    """
+    W2 = 110
+
+    # ── collect layer spans ────────────────────────────────────────────────────
+    # Each span: (start_byte, end_byte_inclusive, layer, group_name)
+    layer_spans = []   # list of (start, end, layer, label)
+    offset = 0
+    for r in records:
+        sz = len(r['raw'])
+        layer_spans.append((offset, offset+sz-1, r['layer'], r['name']))
+        offset += sz
+    total_bytes = offset
+
+    # ── group spans by layer into contiguous blocks ────────────────────────────
+    # We want: L1 block, L2 block, L3 block, L4 block, Trailer block
+    # Build: layer -> (first_byte, last_byte, display_label)
+    layer_groups = {}
+    for (s, e, lay, name) in layer_spans:
+        if lay not in layer_groups:
+            layer_groups[lay] = [s, e, name]
+        else:
+            layer_groups[lay][1] = e   # extend end
+    # Assign group labels
+    LAYER_LABELS = {
+        1: "LAYER 1  Physical  (Preamble + SFD / Flags)",
+        2: "LAYER 2  Data Link  (MAC / Serial header)",
+        3: "LAYER 3  Network   (IP / ARP / BPDU / DTP / PAgP / LACP)",
+        4: "LAYER 4  Transport (TCP / UDP / ICMP)",
+        0: "TRAILER  (FCS / CRC)",
+    }
+
+    # ── determine protocol names per layer from records ────────────────────────
+    def proto_names(layer):
+        seen = []
+        for r in records:
+            if r['layer'] == layer:
+                n = r['name'].split()[0]
+                if n not in seen:
+                    seen.append(n)
+        return ' | '.join(seen[:4])
+
+    # ── Print encapsulation diagram ────────────────────────────────────────────
     print(f"\n{SEP}")
-    print(f"  {'FINAL HEX OUTPUT  (no gaps)':^{W-2}}")
-    print(DIV)
+    print(f"  {'FRAME ENCAPSULATION  —  STRUCTURE DIAGRAM':^{W-2}}")
+    print(SEP)
+    print()
+
+    sorted_layers = sorted(layer_groups.keys(), key=lambda x: (x if x != 0 else 99))
+
+    # Box drawing chars
+    TL='╔'; TR='╗'; BL='╚'; BR='╝'; H='═'; V='║'
+    ITL='╠'; ITR='╣'; IH='─'; IML='├'; IMR='┤'
+
+    indent_map = {1:0, 2:2, 3:4, 4:6, 0:0}
+
+    for lay in sorted_layers:
+        s, e, _ = layer_groups[lay]
+        ind   = ' ' * indent_map.get(lay, 0)
+        width = W2 - indent_map.get(lay, 0) - 2
+        label = LAYER_LABELS.get(lay, f"Layer {lay}")
+        proto = proto_names(lay)
+        bytes_count = e - s + 1
+
+        # Top border
+        print(f"  {ind}{TL}{H*width}{TR}")
+        # Label line
+        content = f"  {label}"
+        print(f"  {ind}{V}{content:<{width}}{V}")
+        # Protocol line
+        if proto:
+            pcontent = f"  Protocols: {proto}"
+            print(f"  {ind}{V}{pcontent:<{width}}{V}")
+        # Byte range line
+        bcontent = f"  Bytes {s}–{e}  ({bytes_count} bytes / {bytes_count*8} bits)"
+        print(f"  {ind}{V}{bcontent:<{width}}{V}")
+        # Fields line — list all field names
+        fnames = [r['name'] for r in records if r['layer'] == lay]
+        # wrap field names into lines of ~width-4 chars
+        line_buf = "  Fields: "
+        field_lines = []
+        for fn in fnames:
+            candidate = line_buf + fn + "  "
+            if len(candidate) > width - 2:
+                field_lines.append(line_buf.rstrip())
+                line_buf = "          " + fn + "  "
+            else:
+                line_buf = candidate
+        if line_buf.strip():
+            field_lines.append(line_buf.rstrip())
+        for fl in field_lines:
+            print(f"  {ind}{V}{fl:<{width}}{V}")
+        # Hex preview (first 24 bytes of this layer)
+        layer_bytes = frame[s:e+1]
+        hex_preview = ' '.join(f'{b:02x}' for b in layer_bytes[:24])
+        if len(layer_bytes) > 24:
+            hex_preview += ' ..'
+        hcontent = f"  Hex: {hex_preview}"
+        print(f"  {ind}{V}{hcontent:<{width}}{V}")
+        # Bottom border (no close for layers that nest inside)
+        if lay == 0:
+            print(f"  {ind}{BL}{H*width}{BR}")
+        elif lay == max(sorted_layers[:-1] if 0 in sorted_layers else sorted_layers):
+            print(f"  {ind}{BL}{H*width}{BR}")
+        else:
+            # partial close — inner layer will continue
+            print(f"  {ind}{BL}{H*width}{BR}")
+        print()
+
+    # ── Nesting summary ────────────────────────────────────────────────────────
+    print(f"  {DIV}")
+    print(f"  ENCAPSULATION SUMMARY  (outermost → innermost)")
+    print(f"  {DIV}")
+    nesting = []
+    for lay in sorted(layer_groups.keys()):
+        if lay == 0: continue
+        s, e, _ = layer_groups[lay]
+        proto = proto_names(lay)
+        nesting.append(f"L{lay}({proto})")
+    nesting_str = '  ──encapsulates──>  '.join(nesting)
+    if 0 in layer_groups:
+        s, e, _ = layer_groups[0]
+        nesting_str += f"  ──trailer──>  FCS/CRC({e-s+1}B)"
+    print(f"  {nesting_str}")
+    print()
+    # total sizes
+    for lay in sorted(layer_groups.keys(), key=lambda x: x if x != 0 else 99):
+        s, e, _ = layer_groups[lay]
+        lname = LAYER_LABELS.get(lay, f"Layer {lay}")
+        print(f"    {lname:<55}  {e-s+1:4d} bytes  /  {(e-s+1)*8:5d} bits  [byte {s}–{e}]")
+    print(f"  {DIV}")
+    print(f"  {'TOTAL FRAME':<55}  {total_bytes:4d} bytes  /  {total_bytes*8:5d} bits")
+    print(f"  {DIV}")
+
+    # ── Annotated hex dump ─────────────────────────────────────────────────────
+    print()
+    print(f"  {'─'*W2}")
+    print(f"  {'ANNOTATED HEX DUMP  (16 bytes per row)':^{W2}}")
+    print(f"  {'─'*W2}")
+    print(f"  {'Offset':>6}  {'Hex (16 bytes per row)':<48}  {'ASCII':<16}  Layer annotation")
+    print(f"  {'─'*W2}")
+
+    # Build per-byte layer map
+    byte_layer = {}
+    byte_field  = {}
+    for (s, e, lay, fname) in layer_spans:
+        for b in range(s, e+1):
+            byte_layer[b] = lay
+            byte_field[b]  = fname
+
+    LAYER_ABBR = {1:'PHY', 2:'DL ', 3:'NET', 4:'TRP', 0:'TRL'}
+
+    row_size = 16
+    for row_start in range(0, total_bytes, row_size):
+        row_bytes = frame[row_start:row_start+row_size]
+        hex_part  = ' '.join(f'{b:02x}' for b in row_bytes)
+        asc_part  = ''.join(chr(b) if 32 <= b < 127 else '.' for b in row_bytes)
+
+        # determine dominant layer annotation for this row
+        layers_in_row = []
+        for i, b_idx in enumerate(range(row_start, row_start+len(row_bytes))):
+            lay = byte_layer.get(b_idx, -1)
+            if not layers_in_row or layers_in_row[-1][0] != lay:
+                layers_in_row.append([lay, b_idx, b_idx])
+            else:
+                layers_in_row[-1][2] = b_idx
+
+        # build annotation: "PHY[0-7] DL[8-21] NET[22-41]"
+        ann_parts = []
+        for (lay, bs, be) in layers_in_row:
+            abbr = LAYER_ABBR.get(lay, '???')
+            ann_parts.append(f"{abbr}[{bs}-{be}]")
+        annotation = '  '.join(ann_parts)
+
+        print(f"  {row_start:6d}  {hex_part:<48}  {asc_part:<16}  {annotation}")
+
+    print(f"  {'─'*W2}")
+
+    # ── Final hex no gaps ──────────────────────────────────────────────────────
+    print()
+    print(f"  {'─'*W2}")
+    print(f"  {'FINAL HEX  (continuous, no gaps)':^{W2}}")
+    print(f"  {'─'*W2}")
     hex_str = ''.join(f'{b:02x}' for b in frame)
-    # print in rows of 32 bytes (64 hex chars) for readability
     for i in range(0, len(hex_str), 64):
         print(f"  {hex_str[i:i+64]}")
-    print(DIV)
-    print(f"  Total bytes : {len(frame)}")
-    print(f"  Total bits  : {len(frame)*8}")
-    print(SEP+"\n")
+    print(f"  {'─'*W2}")
+    print(f"  Total bytes : {total_bytes}")
+    print(f"  Total bits  : {total_bytes * 8}")
+    print(SEP + "\n")
 
 def ask_fcs_eth(fcs_input_bytes):
     """Ask user for Ethernet FCS preference, return (fcs_bytes, fcs_note)."""
@@ -1003,7 +1186,7 @@ def flow_eth_arp():
     verify_report([
         ("Ethernet FCS (CRC-32)", fcs_stored.hex(), fcs_ref.hex(), fcs_stored==fcs_ref),
     ])
-    print_final_hex(full_frame)
+    print_encapsulation(records, full_frame)
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  FLOW: Ethernet + IPv4 + ICMP
@@ -1038,7 +1221,7 @@ def flow_eth_ip_icmp():
         ("ICMP Checksum",         f"0x{icmp_ck:04x}",f"0x{icmp_ver:04x}", icmp_ver==0),
         ("Ethernet FCS (CRC-32)", fcs_stored.hex(),  fcs_ref.hex(),        fcs_stored==fcs_ref),
     ])
-    print_final_hex(full_frame)
+    print_encapsulation(records, full_frame)
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  FLOW: Ethernet + STP/RSTP
@@ -1080,7 +1263,7 @@ def flow_eth_stp():
     fcs_stored = full_frame[-4:]
     fcs_ref    = crc32_eth(full_frame[8:-4])
     verify_report([("Ethernet FCS (CRC-32)", fcs_stored.hex(), fcs_ref.hex(), fcs_stored==fcs_ref)])
-    print_final_hex(full_frame)
+    print_encapsulation(records, full_frame)
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  FLOW: Ethernet + DTP
@@ -1114,7 +1297,7 @@ def flow_eth_dtp():
     fcs_stored = full_frame[-4:]
     fcs_ref    = crc32_eth(full_frame[8:-4])
     verify_report([("Ethernet FCS (CRC-32)", fcs_stored.hex(), fcs_ref.hex(), fcs_stored==fcs_ref)])
-    print_final_hex(full_frame)
+    print_encapsulation(records, full_frame)
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  FLOW: Ethernet + PAgP
@@ -1148,7 +1331,7 @@ def flow_eth_pagp():
     fcs_stored = full_frame[-4:]
     fcs_ref    = crc32_eth(full_frame[8:-4])
     verify_report([("Ethernet FCS (CRC-32)", fcs_stored.hex(), fcs_ref.hex(), fcs_stored==fcs_ref)])
-    print_final_hex(full_frame)
+    print_encapsulation(records, full_frame)
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  FLOW: Ethernet + LACP
@@ -1181,7 +1364,7 @@ def flow_eth_lacp():
     fcs_stored = full_frame[-4:]
     fcs_ref    = crc32_eth(full_frame[8:-4])
     verify_report([("Ethernet FCS (CRC-32)", fcs_stored.hex(), fcs_ref.hex(), fcs_stored==fcs_ref)])
-    print_final_hex(full_frame)
+    print_encapsulation(records, full_frame)
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  FLOW: Ethernet + IPv4 + TCP
@@ -1223,7 +1406,7 @@ def flow_eth_ip_tcp():
         ("TCP Checksum",          f"0x{tcp_ck:04x}", f"0x{tcp_ver:04x}", tcp_ver==0),
         ("Ethernet FCS (CRC-32)", fcs_stored.hex(),  fcs_ref.hex(),       fcs_stored==fcs_ref),
     ])
-    print_final_hex(full_frame)
+    print_encapsulation(records, full_frame)
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  FLOW: Ethernet + IPv4 + UDP
@@ -1263,7 +1446,7 @@ def flow_eth_ip_udp():
         ("UDP Checksum",          f"0x{udp_ck:04x}", f"0x{udp_ver:04x}", udp_ver==0),
         ("Ethernet FCS (CRC-32)", fcs_stored.hex(),  fcs_ref.hex(),       fcs_stored==fcs_ref),
     ])
-    print_final_hex(full_frame)
+    print_encapsulation(records, full_frame)
 
 
 
@@ -1360,7 +1543,297 @@ def flow_serial():
 
     banner(f"SERIAL FRAME — {proto_name}")
     print_frame_table(records)
-    print_final_hex(full_frame)
+    print_encapsulation(records, full_frame)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  LAYER 3 MENU  (what runs inside Ethernet)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  ETHERNET PAUSE FRAME  (IEEE 802.3x / 802.3-2015 Clause 31)
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+#  PURPOSE
+#  ───────
+#  An Ethernet Pause Frame is a MAC Control frame defined in IEEE 802.3x (now
+#  part of IEEE 802.3-2015, Clause 31).  It implements *symmetric* (link-level)
+#  flow control between two directly connected full-duplex Ethernet stations
+#  (usually a NIC and a switch port, or two switch ports).
+#
+#  When a receiver's buffer is filling up it transmits a Pause frame toward the
+#  sender, asking it to STOP sending for a given time quantum.  The sender MUST
+#  honour the request and halt its transmission for that many quanta, after which
+#  it may resume.  A Pause value of 0 means "resume immediately".
+#
+#  FIELD MAP  (64-byte minimum frame on the wire)
+#  ──────────────────────────────────────────────
+#  Byte  Field                  Size    Value / Notes
+#  ────  ─────────────────────  ──────  ──────────────────────────────────────
+#    0   Preamble               7 B     0x55 × 7  — synchronisation pattern
+#    7   SFD                    1 B     0xD5       — marks start of frame
+#    8   Dst MAC (multicast)    6 B     01:80:C2:00:00:01  (PAUSE reserved addr)
+#          OR unicast dest MAC  6 B     peer's MAC when sent point-to-point
+#   14   Src MAC                6 B     sender's own MAC
+#   20   EtherType              2 B     0x8808  (MAC Control)
+#   22   Opcode                 2 B     0x0001  (PAUSE opcode — only defined one)
+#   24   Pause Quanta           2 B     0x0000–0xFFFF
+#          1 quanta = 512 bit-times at the link speed
+#          @ 1 Gbps  → 1 quanta ≈ 512 ns
+#          @ 10 Gbps → 1 quanta ≈  51.2 ns
+#          Max 0xFFFF = 65535 quanta
+#   26   Pad                   42 B     0x00 × 42  — IEEE 802.3 min frame = 64 B
+#   64   FCS                    4 B     CRC-32 over bytes 8–67 (DST MAC → Pad)
+#  ────
+#  Total on wire: 8 (L1) + 42 (MAC hdr+payload) + 4 (FCS) + 10 (IFG) = 64 B frame
+#
+#  OPCODE — only ONE opcode is defined for basic Pause:
+#    0x0001 = PAUSE  (stop sending for Quanta × 512 bit-times)
+#    0x0101 = PFC PAUSE  (Priority-based Flow Control, IEEE 802.1Qbb — extended)
+#
+#  QUANTA EXAMPLES
+#  ───────────────
+#    Speed     1 quanta   0xFFFF quanta    Typical use
+#    100 Mbps  5.12 µs    335 ms           Legacy Fast Ethernet
+#    1 Gbps    512 ns     33.5 ms          GbE NICs / switches
+#    10 Gbps   51.2 ns    3.35 ms          Data-centre / storage
+#    25 Gbps   20.5 ns    1.34 ms          High-speed uplinks
+#
+#  HOW FLOW CONTROL WORKS
+#  ─────────────────────────────────────────────────────────────────────────────
+#   Receiver (buffer near full)
+#     1. Generates a Pause frame with Quanta = X
+#     2. Transmits it toward the sender on the same full-duplex link
+#
+#   Sender (receives Pause)
+#     1. Finishes current frame in progress (cannot abort mid-frame)
+#     2. Halts NEW frame transmission for X × 512 bit-times
+#     3. May re-enable early if a Pause(0) arrives
+#
+#   Receiver (buffer drained)
+#     1. Sends Pause(0) to cancel remaining pause time immediately
+#
+#  NEGOTIATION
+#  ───────────
+#  Both ends MUST advertise "Symmetric PAUSE" capability in Auto-Negotiation
+#  (Fast Link Pulses, Base Page bit C8 = PAUSE, bit C9 = ASM_DIR).
+#  If not negotiated, Pause frames are silently discarded.
+#
+#  DESTINATION MAC
+#  ───────────────
+#  IEEE 802.3x defines the reserved multicast address 01:80:C2:00:00:01.
+#  Switches do NOT forward this address (it is a "slow protocols" address).
+#  Unicast Pause to the peer MAC is also valid (some implementations use this).
+#
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def print_pause_education():
+    """Print the full educational header for Ethernet Pause Frame."""
+    print(f"""
+  {'═'*110}
+  {'ETHERNET PAUSE FRAME  —  IEEE 802.3x  (MAC Flow Control)':^110}
+  {'═'*110}
+
+  PURPOSE
+  ───────
+  A Pause Frame asks the link partner to temporarily STOP sending data.
+  Used for lossless flow control on full-duplex Ethernet links.
+  Defined in IEEE 802.3x (now IEEE 802.3-2015, Clause 31).
+
+  FIELD REFERENCE TABLE
+  ─────────────────────────────────────────────────────────────────────────────────────────
+  Byte  Field               Size    Fixed?  Value / Description
+  ────  ──────────────────  ──────  ──────  ──────────────────────────────────────────────
+     0  Preamble            7 B     Fixed   0x55 × 7   sync pattern for clock recovery
+     7  SFD                 1 B     Fixed   0xD5        start of frame delimiter
+     8  Dst MAC             6 B     Semi    01:80:C2:00:00:01  (IEEE reserved multicast)
+                                             OR peer's unicast MAC (point-to-point)
+    14  Src MAC             6 B     User    Sender's own MAC address
+    20  EtherType           2 B     Fixed   0x8808  =  MAC Control EtherType
+    22  MAC Ctrl Opcode     2 B     Fixed   0x0001  =  PAUSE  (only defined opcode)
+    24  Pause Quanta        2 B     USER    0x0000–0xFFFF  ← THIS IS WHAT YOU SET
+                                             0x0000 = resume immediately (cancel pause)
+                                             0xFFFF = maximum pause (65535 quanta)
+    26  Pad                42 B     Auto    0x00 × 42  (IEEE 802.3 minimum frame = 64 B)
+    68  FCS                 4 B     Auto    CRC-32 over Dst MAC → Pad
+  ─────────────────────────────────────────────────────────────────────────────────────────
+
+  QUANTA TIMING  (1 quanta = 512 bit-times at link speed)
+  ────────────────────────────────────────────────────────
+  Link Speed   1 Quanta    0x0001    0x00FF    0x0FFF    0xFFFF (max)
+  100 Mbps     5.120 µs    5.12 µs   1.31 ms  83.9 ms   335.5 ms
+  1 Gbps       0.512 µs  512  ns   130.6 µs   8.39 ms    33.5 ms
+  10 Gbps      0.051 µs   51.2 ns   13.1 µs   839  µs     3.35 ms
+  25 Gbps      0.020 µs   20.5 ns    5.2 µs   335  µs     1.34 ms
+
+  HOW TO USE PAUSE QUANTA
+  ───────────────────────
+  • Set quanta based on your buffer depth and link speed.
+  • Rule of thumb:  quanta = (buffer_bytes × 8) / 512 bit-times
+  • Send Pause(0xFFFF) first when buffer is critical.
+  • Send Pause(0x0000) when buffer drains — cancels the pause early.
+  • For 1 GbE switch with 32 KB buffer:  32768 × 8 / 512 = 512 quanta = 0x0200
+
+  DESTINATION MAC CHOICE
+  ──────────────────────
+  01:80:C2:00:00:01  → IEEE reserved multicast  (NOT forwarded by switches)
+  Peer unicast MAC   → Direct point-to-point pause (some NICs prefer this)
+
+  NEGOTIATION REQUIREMENT
+  ───────────────────────
+  Both endpoints MUST have negotiated PAUSE capability (Auto-Negotiation base
+  page bit C8=1).  If not negotiated, Pause frames are silently ignored.
+  {'═'*110}""")
+
+def ask_l2_pause():
+    """Collect all Pause Frame inputs with per-field explanation."""
+    section("LAYER 1  —  Physical  (Preamble + SFD)")
+    preamble = get_hex("Preamble  7 B (14 hex)", "55555555555555", 7)
+    sfd      = get_hex("SFD       1 B  (2 hex)", "d5", 1)
+
+    section("LAYER 2  —  Ethernet MAC Header")
+    print("    Dst MAC options:")
+    print("      01:80:c2:00:00:01  — IEEE 802.3x reserved multicast (recommended)")
+    print("      Peer unicast MAC   — direct point-to-point pause")
+    dst_s = get("Dst MAC", "01:80:c2:00:00:01")
+    src_s = get("Src MAC  (your interface MAC)", "00:11:22:33:44:55")
+
+    section("MAC CONTROL  —  EtherType 0x8808 + Opcode")
+    print("    EtherType : 0x8808  (fixed — MAC Control, IEEE 802.3)")
+    print("    Opcode    : 0x0001  (fixed — PAUSE, the only defined MAC Ctrl opcode)")
+
+    section("PAUSE QUANTA  —  Flow Control Value  (YOUR KEY INPUT)")
+    print("    1 quanta = 512 bit-times at the link speed.")
+    print("    Examples:")
+    print("      0x0000 ( 0) = Cancel / Resume immediately")
+    print("      0x0001 ( 1) = Minimal pause (512 bit-times)")
+    print("      0x0200 (512) = ~262 µs @ 1 GbE  [typical for 32 KB buffer]")
+    print("      0x00FF (255) = ~131 µs @ 1 GbE")
+    print("      0xFFFF (65535) = Maximum pause")
+
+    link = get("Link speed for quanta display  1=100M  2=1G  3=10G  4=25G", "2")
+    speed_map = {'1':100e6,'2':1e9,'3':10e9,'4':25e9}
+    speed_bps = speed_map.get(link, 1e9)
+    speed_label = {'1':'100 Mbps','2':'1 Gbps','3':'10 Gbps','4':'25 Gbps'}.get(link,'1 Gbps')
+
+    quanta_hex = get("Pause Quanta  (hex, 0000–FFFF)", "00ff")
+    try:
+        quanta_val = int(quanta_hex.replace("0x",""), 16) & 0xFFFF
+    except:
+        quanta_val = 0x00FF
+        print("    -> invalid, using 0x00FF")
+
+    bit_time_s = 1.0 / speed_bps
+    pause_bits  = quanta_val * 512
+    pause_us    = (pause_bits * bit_time_s) * 1e6
+    print(f"\n    ┌─────────────────────────────────────────────────────────────┐")
+    print(f"    │  Quanta : {quanta_val:5d}  (0x{quanta_val:04X})                                  │")
+    print(f"    │  Speed  : {speed_label:<10}                                     │")
+    print(f"    │  Pause  : {quanta_val} × 512 = {pause_bits:,} bit-times                    │")
+    print(f"    │  Time   : {pause_us:.3f} µs  ({pause_us/1000:.4f} ms)                       │")
+    print(f"    └─────────────────────────────────────────────────────────────┘")
+
+    section("PADDING  (auto-computed)")
+    print("    IEEE 802.3 minimum frame body = 46 bytes (14B MAC header + 32B payload).")
+    print("    Pause frame payload = opcode(2) + quanta(2) + pad(42) = 46 bytes.")
+    print("    Padding is always 0x00 × 42. (auto-filled)")
+
+    return preamble, sfd, dst_s, src_s, quanta_val
+
+def build_pause(preamble, sfd, dst_s, src_s, quanta_val):
+    """
+    Build the complete Ethernet Pause Frame.
+    Returns (full_frame_bytes, records_list).
+
+    Frame structure:
+    ─────────────────────────────────────────────────────────
+    L1  Preamble (7B) + SFD (1B)
+    L2  Dst MAC (6B) + Src MAC (6B) + EtherType 0x8808 (2B)
+        + Opcode 0x0001 (2B) + Quanta (2B) + Pad 0x00×42 (42B)
+    TR  FCS CRC-32 (4B)
+    Total: 72 bytes on wire
+    ─────────────────────────────────────────────────────────
+    """
+    et      = bytes.fromhex("8808")     # MAC Control EtherType
+    opcode  = bytes.fromhex("0001")     # PAUSE opcode
+    quanta  = struct.pack("!H", quanta_val)
+    pad     = b'\x00' * 42             # pad to 64-byte minimum
+
+    dst_mb  = mac_b(dst_s)
+    src_mb  = mac_b(src_s)
+
+    # FCS covers: Dst MAC → Pad (everything from byte 8 to end of pad)
+    fcs_input = dst_mb + src_mb + et + opcode + quanta + pad
+    fcs, fcs_note = ask_fcs_eth(fcs_input)
+
+    full_frame = preamble + sfd + fcs_input + fcs
+
+    records = [
+        # ── Layer 1 ──────────────────────────────────────────────────────────
+        {"layer":1, "name":"Preamble",
+         "raw":preamble,
+         "user_val":preamble.hex(),
+         "note":"7 × 0x55  clock sync / delimiter"},
+
+        {"layer":1, "name":"SFD  (Start Frame Delim)",
+         "raw":sfd,
+         "user_val":"0xD5",
+         "note":"0xD5  marks start of MAC frame"},
+
+        # ── Layer 2 — MAC Header ──────────────────────────────────────────────
+        {"layer":2, "name":"Dst MAC  (Pause dest)",
+         "raw":dst_mb,
+         "user_val":dst_s,
+         "note":"01:80:C2:00:00:01 = IEEE reserved multicast (not forwarded)"},
+
+        {"layer":2, "name":"Src MAC  (sender)",
+         "raw":src_mb,
+         "user_val":src_s,
+         "note":"Transmitting station's own MAC"},
+
+        {"layer":2, "name":"EtherType  (MAC Control)",
+         "raw":et,
+         "user_val":"0x8808",
+         "note":"Fixed: 0x8808 = IEEE 802.3 MAC Control"},
+
+        # ── Layer 2 — MAC Control Payload ─────────────────────────────────────
+        {"layer":2, "name":"MAC Ctrl Opcode  (PAUSE)",
+         "raw":opcode,
+         "user_val":"0x0001",
+         "note":"Fixed: 0x0001 = PAUSE  (only defined MAC Ctrl opcode)"},
+
+        {"layer":2, "name":"Pause Quanta  ← user value",
+         "raw":quanta,
+         "user_val":f"0x{quanta_val:04X}  ({quanta_val} decimal)",
+         "note":f"Sender must halt for {quanta_val} × 512 bit-times"},
+
+        {"layer":2, "name":"Pad  (min-frame filler)",
+         "raw":pad,
+         "user_val":"0x00 × 42",
+         "note":"Auto: pads frame body to 46 B (IEEE 802.3 minimum)"},
+
+        # ── Trailer ───────────────────────────────────────────────────────────
+        {"layer":0, "name":"Ethernet FCS  (CRC-32)",
+         "raw":fcs,
+         "user_val":"auto/custom",
+         "note":fcs_note},
+    ]
+    return full_frame, records
+
+def flow_eth_pause():
+    banner("ETHERNET PAUSE FRAME  —  IEEE 802.3x",
+           "L1: Preamble+SFD  |  L2: EtherType 0x8808  |  MAC Ctrl Opcode 0x0001  |  Pause Quanta")
+    print_pause_education()
+    preamble, sfd, dst_s, src_s, quanta_val = ask_l2_pause()
+    full_frame, records = build_pause(preamble, sfd, dst_s, src_s, quanta_val)
+
+    print_frame_table(records)
+
+    fcs_stored = full_frame[-4:]
+    fcs_ref    = crc32_eth(full_frame[8:-4])
+    verify_report([
+        ("Ethernet FCS (CRC-32)", fcs_stored.hex(), fcs_ref.hex(), fcs_stored==fcs_ref),
+    ])
+    print_encapsulation(records, full_frame)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  LAYER 3 MENU  (what runs inside Ethernet)
@@ -1378,6 +1851,7 @@ L3_ETH_MENU = """
   │ 6 │ DTP  – Cisco Trunking    (802.3 + SNAP)                         │
   │ 7 │ PAgP – Cisco Port Agg.   (802.3 + SNAP)                         │
   │ 8 │ LACP – 802.3ad           (EtherType 0x8809)                     │
+  │ 9 │ Pause Frame  – IEEE 802.3x  (EtherType 0x8808, flow control)    │
   └───┴─────────────────────────────────────────────────────────────────┘"""
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1391,7 +1865,7 @@ MAIN_MENU = """
 ║  SELECT LAYER 2 TECHNOLOGY FIRST                                          ║
 ╠═══╦═══════════════════════════════════════════════════════════════════════╣
 ║ 1 ║ Ethernet / 802.3  →  then choose Layer 3 protocol                    ║
-║   ║   ARP | IPv4+ICMP | IPv4+TCP | IPv4+UDP | STP | DTP | PAgP | LACP   ║
+║   ║  ARP|ICMP|TCP|UDP|STP|DTP|PAgP|LACP|Pause(802.3x)                   ║
 ╠═══╬═══════════════════════════════════════════════════════════════════════╣
 ║ 2 ║ Serial / WAN  →  then choose L2 protocol + optional L3/L4 payload    ║
 ║   ║   PPP | HDLC | SLIP | Modbus RTU | ATM AAL5 | Cisco HDLC | KISS     ║
@@ -1406,6 +1880,7 @@ L3_DISPATCH = {
     '6': flow_eth_dtp,
     '7': flow_eth_pagp,
     '8': flow_eth_lacp,
+    '9': flow_eth_pause,
 }
 
 def main():
@@ -1414,7 +1889,7 @@ def main():
 
     if top == '1':
         print(L3_ETH_MENU)
-        l3ch = input("  Choose L3 protocol (1-8): ").strip()
+        l3ch = input("  Choose L3 protocol (1-9): ").strip()
         fn = L3_DISPATCH.get(l3ch)
         if fn: fn()
         else:  print("  Invalid choice.")
