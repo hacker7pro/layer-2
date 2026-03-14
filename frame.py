@@ -168,6 +168,16 @@ def print_frame_table(records):
         prev_layer = lay
 
         sz   = len(raw)
+
+        # zero-length raw = annotation/breakdown row only
+        if sz == 0:
+            annotation = uval if uval else note
+            if uval and note and uval != note:
+                annotation = f"{uval}  ({note})"
+            tag = LAYER_TAG.get(lay, "        ")
+            print(f"  {'':10}  {tag}    {name:<28}  {'':>8}   {'':30}    {annotation}")
+            continue
+
         hexs = ' '.join(f'{b:02x}' for b in raw)
         # truncate hex display if very long
         if len(hexs) > 29: hexs = hexs[:27] + '..'
@@ -206,6 +216,8 @@ def print_encapsulation(records, frame):
     offset = 0
     for r in records:
         sz = len(r['raw'])
+        if sz == 0:
+            continue   # skip annotation-only rows
         layer_spans.append((offset, offset+sz-1, r['layer'], r['name']))
         offset += sz
     total_bytes = offset
@@ -490,22 +502,24 @@ def ask_l2_ethernet(ethertype_hint="0800"):
 # ──────────────────────────────────────────────────────────────────────────────
 
 SERIAL_TYPES = {
-    '1': "Raw",
-    '2': "SLIP",
-    '3': "PPP",
-    '4': "HDLC",
-    '5': "COBS (placeholder)",
-    '6': "KISS",
-    '7': "Modbus RTU",
-    '8': "HDLC + Bit-Stuffing",
-    '9': "ATM AAL5",
-   '10': "Cisco HDLC",
+    '1' : "Raw",
+    '2' : "SLIP",
+    '3' : "PPP",
+    '4' : "HDLC (basic — address+control+payload+FCS-16)",
+    '5' : "COBS (placeholder)",
+    '6' : "KISS",
+    '7' : "Modbus RTU",
+    '8' : "HDLC + Bit-Stuffing",
+    '9' : "ATM AAL5",
+    '10': "Cisco HDLC",
+    '11': "HDLC Full (I-frame / S-frame / U-frame — all 3 types)",
 }
 
 def ask_l2_serial():
     section("LAYER 2 — Serial / WAN  (choose protocol)")
     for k,v in SERIAL_TYPES.items():
-        print(f"      {k:>2} = {v}")
+        marker = "  ←  full 3-type builder" if k == '11' else ""
+        print(f"      {k:>2} = {v}{marker}")
     ch = input("    Select [3]: ").strip() or '3'
     if ch not in SERIAL_TYPES: ch = '3'
     return ch, SERIAL_TYPES[ch]
@@ -1450,10 +1464,536 @@ def flow_eth_ip_udp():
 
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+#  HDLC — HIGH-LEVEL DATA LINK CONTROL  (ISO 13239 / ITU-T Q.921 / Q.922)
+#  Full 3-Frame-Type Builder:  I-frame  |  S-frame  |  U-frame
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+#  WHAT IS HDLC?
+#  ─────────────
+#  HDLC is the foundational synchronous data-link protocol used in:
+#    WAN links (leased lines, X.25), ISDN (Q.921 = LAPD), Frame Relay (Q.922),
+#    PPP (uses HDLC framing), Cisco HDLC, SS7 MTP2, GSM Um interface,
+#    SDLC (IBM SNA), LAPB (X.25 layer 2), LAPF (Frame Relay).
+#
+#  FRAME STRUCTURE  (every HDLC frame)
+#  ────────────────────────────────────────────────────────────────────────────
+#  Flag     Address    Control       Information    FCS        Flag
+#  0x7E     1–N bytes  1 or 2 bytes  0+ bytes       2 or 4 B   0x7E
+#  ────────────────────────────────────────────────────────────────────────────
+#  • Flag (0x7E) : start/end of frame — same as in PPP
+#  • Address     : station or DLCI address (1 byte basic, ext with EA bit=0)
+#  • Control     : frame type + sequence numbers (THE KEY FIELD)
+#  • Information : user data payload (present only in I-frames)
+#  • FCS         : CRC-16/CCITT (2 bytes) or CRC-32 (4 bytes)
+#
+#  THE CONTROL FIELD — 3 FRAME TYPES
+#  ────────────────────────────────────────────────────────────────────────────
+#
+#  ┌─────────────────────────────────────────────────────────────────────────┐
+#  │  TYPE 1:  I-FRAME  (Information Frame)                                  │
+#  │  Carries user data.  Uses sliding-window ARQ for reliable delivery.     │
+#  │                                                                         │
+#  │  1-byte control (modulo 8):                                             │
+#  │  Bit  7  6  5  4  3  2  1  0                                            │
+#  │       N(S)3 N(S)2 N(S)1 N(S)0  P/F  N(R)2 N(R)1 N(R)0  0              │
+#  │       └──────N(S)──────┘  │   └──────N(R)──────┘  └─ 0 = I-frame      │
+#  │                            └─ P/F: Poll(cmd) / Final(resp)              │
+#  │                                                                         │
+#  │  2-byte control (modulo 128):                                           │
+#  │  Byte 0: N(S)(7 bits) + 0                                               │
+#  │  Byte 1: N(R)(7 bits) + P/F                                             │
+#  │                                                                         │
+#  │  N(S) = Send sequence number (0–7 or 0–127)                             │
+#  │  N(R) = Receive sequence number (= next expected from peer)             │
+#  └─────────────────────────────────────────────────────────────────────────┘
+#
+#  ┌─────────────────────────────────────────────────────────────────────────┐
+#  │  TYPE 2:  S-FRAME  (Supervisory Frame)                                  │
+#  │  Flow/error control.  NO information field.  4 subtypes:               │
+#  │                                                                         │
+#  │  1-byte control (modulo 8):                                             │
+#  │  Bit  7  6  5  4  3  2  1  0                                            │
+#  │       N(R)2 N(R)1 N(R)0  P/F  S1 S0  1  0                              │
+#  │       └──────N(R)──────┘  │  └──┘  └─── 10 = S-frame                  │
+#  │                            │    └─ Supervisory function bits            │
+#  │                            └─ P/F                                       │
+#  │                                                                         │
+#  │  S1 S0  Subtype  Meaning                                                │
+#  │  ─────  ───────  ──────────────────────────────────────────────────── │
+#  │   0  0   RR     Receive Ready    — ready, ACK up to N(R)-1             │
+#  │   0  1   REJ    Reject           — go-back-N retransmit from N(R)      │
+#  │   1  0   RNR    Receive Not Ready— busy, stop sending                  │
+#  │   1  1   SREJ   Selective Reject — retransmit only frame N(R)          │
+#  └─────────────────────────────────────────────────────────────────────────┘
+#
+#  ┌─────────────────────────────────────────────────────────────────────────┐
+#  │  TYPE 3:  U-FRAME  (Unnumbered Frame)                                   │
+#  │  Link management.  NO sequence numbers.  Many subtypes:                │
+#  │                                                                         │
+#  │  Control byte (always 1 byte):                                          │
+#  │  Bit  7  6  5  4  3  2  1  0                                            │
+#  │       M4 M3 M2  P/F  M1 M0  1  1                                       │
+#  │       └─────┘   │   └──┘  └─── 11 = U-frame                           │
+#  │       modifier   └─ P/F    modifier bits (M4-M0)                       │
+#  │                                                                         │
+#  │  Common U-frame commands/responses:                                     │
+#  │  M4 M3 M2 M1 M0   Mnemonic  C/R  Meaning                               │
+#  │  ─────────────    ────────  ───  ──────────────────────────────────── │
+#  │  0  0  0  0  0    UI        C/R  Unnumbered Information (datagram)     │
+#  │  0  0  1  0  0    UP        C    Unnumbered Poll                        │
+#  │  0  0  0  0  1    RR(U)     C    Disconnect Mode (DM-like)              │
+#  │  0  1  1  0  0    SABM      C    Set Async Balanced Mode (connect)      │
+#  │  0  1  1  0  1    SABME     C    SABM Extended (modulo 128)             │
+#  │  0  0  0  1  1    DM        R    Disconnect Mode (not connected)        │
+#  │  0  0  1  0  1    UA        R    Unnumbered Acknowledgment              │
+#  │  1  0  0  0  1    FRMR      R    Frame Reject (error)                   │
+#  │  1  1  0  0  0    XID       C/R  Exchange Identification                │
+#  │  1  1  1  0  0    TEST      C/R  Test frame                             │
+#  │  0  1  0  0  0    DISC      C    Disconnect                             │
+#  └─────────────────────────────────────────────────────────────────────────┘
+#
+#  ADDRESS FIELD  (EA = Extension Address bit)
+#  ────────────────────────────────────────────────────────────────────────────
+#  Basic (1 byte):  bit 0 = 1  (EA=1 = last byte of address)
+#  Extended:        byte has EA=0, next byte continues, last byte EA=1
+#  In LAPD (Q.921): address = SAPI(6b)+C/R(1b)+EA(1b)  |  TEI(7b)+EA(1b)
+#  In LAPB (X.25):  address = 0x01 (DTE command) or 0x03 (DCE command)
+#  In basic HDLC:   0xFF = broadcast (all stations)
+#
+#  FCS COVERAGE
+#  ────────────────────────────────────────────────────────────────────────────
+#  FCS covers:  Address + Control + Information  (NOT the flags)
+#  CRC-16/CCITT (default): polynomial x^16+x^12+x^5+1, init=0xFFFF
+#  CRC-32       (optional): same as Ethernet CRC-32, little-endian
+#
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ── HDLC U-frame subtype table ────────────────────────────────────────────────
+HDLC_U_SUBTYPES = {
+    # key: (M4,M3,M2,M1,M0, mnemonic, C/R, description)
+    '1' : (0,0,0,0,0, "UI",    "C/R", "Unnumbered Information — datagram (no ACK)"),
+    '2' : (0,1,1,0,0, "SABM",  "C",   "Set Async Balanced Mode — initiate connection (mod-8)"),
+    '3' : (0,1,1,0,1, "SABME", "C",   "SABM Extended — initiate connection (mod-128)"),
+    '4' : (0,1,0,0,0, "DISC",  "C",   "Disconnect — request to terminate link"),
+    '5' : (0,0,0,1,1, "DM",    "R",   "Disconnect Mode — link not established"),
+    '6' : (0,0,1,0,1, "UA",    "R",   "Unnumbered Acknowledgment — accept SABM/DISC"),
+    '7' : (1,0,0,0,1, "FRMR",  "R",   "Frame Reject — invalid frame received"),
+    '8' : (1,1,0,0,0, "XID",   "C/R", "Exchange Identification — parameter negotiation"),
+    '9' : (1,1,1,0,0, "TEST",  "C/R", "Test — link integrity test"),
+    '10': (0,0,1,0,0, "UP",    "C",   "Unnumbered Poll — poll without sequence numbers"),
+}
+
+HDLC_S_SUBTYPES = {
+    '1': (0,0, "RR",   "Receive Ready    — ACK, ready for more"),
+    '2': (0,1, "REJ",  "Reject           — go-back-N, retransmit from N(R)"),
+    '3': (1,0, "RNR",  "Receive Not Ready— busy, stop sending"),
+    '4': (1,1, "SREJ", "Selective Reject — retransmit only frame N(R)"),
+}
+
+def print_hdlc_education():
+    print(f"""
+  {'═'*110}
+  {'HDLC — HIGH-LEVEL DATA LINK CONTROL  (ISO 13239)':^110}
+  {'THREE FRAME TYPES:  I-frame (data)  |  S-frame (supervisory)  |  U-frame (management)':^110}
+  {'═'*110}
+
+  FRAME STRUCTURE
+  ────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  │ Flag(1B) │ Address(1+B) │ Control(1-2B) │ Information(0+B) │ FCS(2-4B) │ Flag(1B) │
+  │  0x7E   │  addr+EA     │  type+seq     │  user payload    │  CRC-16   │  0x7E   │
+  ────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  FCS covers: Address + Control + Information  (NOT the flags)
+
+  ══════════════════════════════════════════════════════════════════════════════════════════════════════════════
+  FRAME TYPE 1 — I-FRAME (Information)     carries USER DATA with sequence numbering
+  ══════════════════════════════════════════════════════════════════════════════════════════════════════════════
+  Purpose : Reliable data transfer using sliding-window ARQ (Go-Back-N or Selective Reject)
+  Has Info: YES — carries user payload
+  Control : 1 byte (mod-8) or 2 bytes (mod-128)
+
+  MODULO-8 Control (1 byte):
+  ┌─────┬─────┬─────┬─────┬─────┬─────┬─────┬─────┐
+  │ N(S)│ N(S)│ N(S)│ P/F │ N(R)│ N(R)│ N(R)│  0  │
+  │  b6 │  b5 │  b4 │  b3 │  b2 │  b1 │  b0 │ fix │
+  └─────┴─────┴─────┴─────┴─────┴─────┴─────┴─────┘
+  N(S) bits [6:4] = send sequence 0–7
+  P/F  bit  [3]   = Poll (command) or Final (response)
+  N(R) bits [2:0] = receive seq (= next expected from peer, implicit ACK)
+  Bit  [0]        = 0  (identifies I-frame)
+
+  MODULO-128 Control (2 bytes):
+  Byte 0:  N(S)(7 bits) + 0         Byte 1:  N(R)(7 bits) + P/F
+
+  N(S)  Send Sequence Number — counts frames we have sent
+  N(R)  Receive Sequence Number — confirms receipt of all frames up to N(R)-1
+
+  ══════════════════════════════════════════════════════════════════════════════════════════════════════════════
+  FRAME TYPE 2 — S-FRAME (Supervisory)     flow and error control, NO data
+  ══════════════════════════════════════════════════════════════════════════════════════════════════════════════
+  Purpose : ACK, NAK, flow control — no user payload
+  Has Info: NO
+  Control : 1 byte (mod-8) or 2 bytes (mod-128)
+
+  Control byte:
+  ┌─────┬─────┬─────┬─────┬─────┬─────┬─────┬─────┐
+  │ N(R)│ N(R)│ N(R)│ P/F │  S1 │  S0 │  1  │  0  │
+  │  b6 │  b5 │  b4 │  b3 │  b2 │  b1 │ fix │ fix │
+  └─────┴─────┴─────┴─────┴─────┴─────┴─────┴─────┘
+  Bits [7:5]  N(R) receive sequence number
+  Bit  [4]    P/F  Poll / Final
+  Bits [3:2]  S1 S0  supervisory function:
+              00=RR   Receive Ready       (ready + ACK up to N(R)-1)
+              01=REJ  Reject              (go-back-N retransmit from N(R))
+              10=RNR  Receive Not Ready   (busy — stop sending)
+              11=SREJ Selective Reject    (retransmit only N(R))
+
+  ══════════════════════════════════════════════════════════════════════════════════════════════════════════════
+  FRAME TYPE 3 — U-FRAME (Unnumbered)      link management and control, may carry data
+  ══════════════════════════════════════════════════════════════════════════════════════════════════════════════
+  Purpose : Link setup/teardown, error reporting, unnumbered data (UI)
+  Has Info: SOME subtypes (UI, XID, TEST, FRMR carry data)
+  Control : Always 1 byte, NO sequence numbers
+
+  Control byte:
+  ┌─────┬─────┬─────┬─────┬─────┬─────┬─────┬─────┐
+  │  M4 │  M3 │  M2 │ P/F │  M1 │  M0 │  1  │  1  │
+  │  b7 │  b6 │  b5 │  b4 │  b3 │  b2 │ fix │ fix │
+  └─────┴─────┴─────┴─────┴─────┴─────┴─────┴─────┘
+  Bits [7:5] M4..M2 + Bit[4] P/F + Bits[3:2] M1..M0
+
+  Key U-frame types:
+  Mnemonic  M4-M0    C/R  Purpose
+  ────────  ───────  ───  ──────────────────────────────────────────────────────────
+  UI        00000    C/R  Unnumbered Information — send data without numbering (UDP-like)
+  SABM      01100    C    Set ABM mod-8  — establish connection (like TCP SYN)
+  SABME     01101    C    Set ABM Extended mod-128 — establish with larger window
+  DISC      01000    C    Disconnect — tear down link (like TCP FIN)
+  UA        00101    R    Unnumbered ACK — accept SABM or DISC
+  DM        00011    R    Disconnect Mode — I am not connected
+  FRMR      10001    R    Frame Reject — peer sent an invalid frame
+  XID       11000    C/R  Exchange ID — negotiate parameters
+  TEST      11100    C/R  Test — verify link with echo
+
+  ADDRESS FIELD  (EA = Extension Address bit, bit 0)
+  ──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  0xFF  = Broadcast (all stations accept)
+  0x01  = LAPB DTE command  /  0x03 = LAPB DCE command
+  LAPD: SAPI(6b)+C/R(1b)+EA(1b)  then  TEI(7b)+EA(1b)  (2-byte address)
+  EA bit = 1 means "this is the last address byte"
+
+  FCS FIELD
+  ──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Default : CRC-16/CCITT  (2 bytes, polynomial 0x1021, init 0xFFFF)
+  Extended: CRC-32  (4 bytes, same as Ethernet)
+  Covers  : Address + Control + Information (NOT flags)
+  {'═'*110}""")
+
+
+def build_hdlc_control_i(ns, pf, nr, mod128=False):
+    """Build I-frame control field. Returns bytes."""
+    if mod128:
+        b0 = ((ns & 0x7F) << 1) | 0
+        b1 = ((nr & 0x7F) << 1) | (pf & 1)
+        return bytes([b0, b1])
+    else:
+        b = ((ns & 0x7) << 4) | ((pf & 1) << 3) | ((nr & 0x7) << 0) | 0
+        # I-frame: bit0=0
+        # layout: N(S)[6:4] P/F[3] N(R)[2:0] 0
+        b = ((ns & 0x7) << 5) | ((pf & 1) << 4) | ((nr & 0x7) << 1) | 0
+        return bytes([b])
+
+def build_hdlc_control_s(nr, pf, s1s0, mod128=False):
+    """Build S-frame control field."""
+    if mod128:
+        b0 = 0x01 | ((s1s0 & 0x3) << 2)   # bits: xx SS 0 0 0 1
+        b1 = ((nr & 0x7F) << 1) | (pf & 1)
+        return bytes([b0, b1])
+    else:
+        b = ((nr & 0x7) << 5) | ((pf & 1) << 4) | ((s1s0 & 0x3) << 2) | 0x01
+        return bytes([b])
+
+def build_hdlc_control_u(m4m3m2, pf, m1m0):
+    """Build U-frame control field (always 1 byte)."""
+    b = ((m4m3m2 & 0x7) << 5) | ((pf & 1) << 4) | ((m1m0 & 0x3) << 2) | 0x03
+    return bytes([b])
+
+def ask_hdlc_address():
+    section("HDLC ADDRESS FIELD")
+    print("    0xFF = broadcast (all stations)  0x01 = LAPB DTE  0x03 = LAPB DCE")
+    print("    For LAPD (ISDN): 2-byte address (SAPI+TEI)")
+    print("    EA bit (bit 0): 1 = last address byte, 0 = more bytes follow")
+    addr_type = get("Address type  1=1-byte  2=2-byte(LAPD)", "1")
+    if addr_type == '2':
+        print("    SAPI (6 bits 0–63), C/R bit (0/1)")
+        sapi = int(get("SAPI (0=signalling, 63=LME)", "0")) & 0x3F
+        cr   = int(get("C/R bit (0=response, 1=command)", "1")) & 1
+        ea0  = 0   # not last byte
+        byte0 = (sapi << 2) | (cr << 1) | ea0
+        print("    TEI (7 bits 0–126, 127=broadcast)")
+        tei  = int(get("TEI (Terminal Endpoint Identifier)", "0")) & 0x7F
+        ea1  = 1   # last byte
+        byte1 = (tei << 1) | ea1
+        addr_bytes = bytes([byte0, byte1])
+        addr_note  = f"SAPI={sapi} C/R={cr} TEI={tei} (LAPD 2-byte)"
+    else:
+        addr_hex = get("Address byte (hex, FF=broadcast)", "ff")
+        try:    addr_byte = int(addr_hex, 16) & 0xFF
+        except: addr_byte = 0xFF
+        addr_bytes = bytes([addr_byte])
+        addr_note  = "0xFF broadcast" if addr_byte==0xFF else f"0x{addr_byte:02X}"
+    return addr_bytes, addr_note
+
+def flow_hdlc():
+    banner("HDLC FRAME BUILDER — ISO 13239",
+           "3 Frame Types:  I-frame (data+seq)  |  S-frame (supervisory)  |  U-frame (link mgmt)")
+    print_hdlc_education()
+
+    # ── Flags ──────────────────────────────────────────────────────────────────
+    section("FLAGS  (frame delimiters)")
+    print("    Standard HDLC flag = 0x7E.  Both start and end use same value.")
+    flag_hex = get("Flag byte (hex)", "7e")
+    try:    flag_b = bytes([int(flag_hex, 16) & 0xFF])
+    except: flag_b = b'\x7E'
+
+    # ── Address ───────────────────────────────────────────────────────────────
+    addr_bytes, addr_note = ask_hdlc_address()
+
+    # ── Frame Type ────────────────────────────────────────────────────────────
+    section("HDLC FRAME TYPE")
+    print("    1 = I-frame  (Information)   — reliable data with sequence numbers")
+    print("    2 = S-frame  (Supervisory)   — ACK/NAK/flow control, no data")
+    print("    3 = U-frame  (Unnumbered)    — link setup/teardown/UI datagram")
+    ftype = get("Frame type (1/2/3)", "1")
+    if ftype not in ('1','2','3'): ftype = '1'
+
+    # ── Modulo (I and S only) ─────────────────────────────────────────────────
+    mod128 = False
+    if ftype in ('1','2'):
+        print("\n    Window size / modulo:")
+        print("      Modulo  8: N(S)/N(R) 0–7,   1-byte control  (basic HDLC)")
+        print("      Modulo 128: N(S)/N(R) 0–127, 2-byte control  (extended HDLC / ISDN)")
+        mod128 = get("Use Modulo-128 extended control? (y/n)", "n").lower().startswith("y")
+
+    # ── P/F bit ───────────────────────────────────────────────────────────────
+    section("POLL/FINAL (P/F) BIT")
+    print("    P=1 in a COMMAND means: 'respond now' (poll)")
+    print("    F=1 in a RESPONSE means: 'this is my final response'")
+    pf = int(get("P/F bit (0 or 1)", "0")) & 1
+
+    # ─────────────────────────────────────────────────────────────────────────
+    if ftype == '1':
+        # I-FRAME
+        section("I-FRAME — SEQUENCE NUMBERS")
+        print("    N(S) = Send Sequence Number (sequence of THIS frame)")
+        print("    N(R) = Receive Sequence Number (acknowledges receipt up to N(R)-1)")
+        ns_max = 127 if mod128 else 7
+        ns = int(get(f"N(S) Send Sequence  (0–{ns_max})", "0")) & (0x7F if mod128 else 0x7)
+        nr = int(get(f"N(R) Receive/ACK Seq (0–{ns_max})", "0")) & (0x7F if mod128 else 0x7)
+        ctrl_bytes = build_hdlc_control_i(ns, pf, nr, mod128)
+        ctrl_note  = f"I-frame  N(S)={ns}  P/F={pf}  N(R)={nr}  {'mod-128' if mod128 else 'mod-8'}"
+
+        section("I-FRAME — INFORMATION PAYLOAD")
+        print("    Enter the data payload in hex.")
+        print("    Examples:  PPP data: ff030021...  IP packet: 4500...")
+        payload_hex = get("Payload hex (Enter=empty)", "")
+        try:    info_bytes = bytes.fromhex(payload_hex.replace(" ",""))
+        except: info_bytes = b''
+        has_info = True
+
+    elif ftype == '2':
+        # S-FRAME
+        section("S-FRAME — SUPERVISORY FUNCTION")
+        for k,(s1,s0,mn,desc) in HDLC_S_SUBTYPES.items():
+            print(f"      {k} = {mn:<6}  {desc}")
+        s_ch = get("S-frame subtype (1-4)", "1")
+        if s_ch not in HDLC_S_SUBTYPES: s_ch = '1'
+        s1, s0, s_mn, s_desc = HDLC_S_SUBTYPES[s_ch]
+        s1s0 = (s1 << 1) | s0
+
+        nr_max = 127 if mod128 else 7
+        nr = int(get(f"N(R) Receive/ACK Sequence (0–{nr_max})", "0")) & (0x7F if mod128 else 0x7)
+        ctrl_bytes = build_hdlc_control_s(nr, pf, s1s0, mod128)
+        ctrl_note  = f"S-frame  {s_mn}({s_desc.split('—')[0].strip()})  N(R)={nr}  P/F={pf}  {'mod-128' if mod128 else 'mod-8'}"
+        info_bytes = b''
+        has_info   = False
+
+    else:
+        # U-FRAME
+        section("U-FRAME — UNNUMBERED SUBTYPE")
+        for k,(m4,m3,m2,m1,m0,mn,cr,desc) in HDLC_U_SUBTYPES.items():
+            m_str = f"{m4}{m3}{m2}-{m1}{m0}"
+            print(f"    {k:>2} = {mn:<6}  [{m_str}]  {cr:3}  {desc}")
+        u_ch = get("U-frame subtype (1-10)", "1")
+        if u_ch not in HDLC_U_SUBTYPES: u_ch = '1'
+        m4,m3,m2,m1,m0, u_mn, u_cr, u_desc = HDLC_U_SUBTYPES[u_ch]
+        m4m3m2 = (m4<<2)|(m3<<1)|m2
+        m1m0   = (m1<<1)|m0
+        ctrl_bytes = build_hdlc_control_u(m4m3m2, pf, m1m0)
+        ctrl_note  = f"U-frame  {u_mn}  P/F={pf}  M={m4}{m3}{m2}-{m1}{m0}  ({u_cr}) {u_desc}"
+
+        # Info field for UI / XID / TEST / FRMR
+        info_bytes = b''
+        has_info   = u_mn in ("UI", "XID", "TEST", "FRMR")
+        if has_info:
+            section(f"U-FRAME INFO FIELD  ({u_mn} carries optional data)")
+            if u_mn == "XID":
+                print("    XID info format: Format-ID(1B) + Group-ID(1B) + Length(1B) + params")
+                print("    Default: 81 00 00 (basic XID)")
+                xid_hex = get("XID info hex", "810000")
+            elif u_mn == "FRMR":
+                print("    FRMR info: rejected-ctrl(1-2B) + N(R)(3b)+V(S)(3b)+flags(2B)")
+                print("    Flags: W(invalid ctrl) X(info in S/U) Y(info too long) Z(invalid N(R))")
+                xid_hex = get("FRMR info hex (3 bytes)", "000000")
+            elif u_mn == "TEST":
+                print("    TEST info: echo payload (responder copies this back)")
+                xid_hex = get("TEST payload hex", "00112233")
+            else:  # UI
+                print("    UI frame carries data without sequence numbering (like UDP).")
+                xid_hex = get("UI payload hex (Enter=empty)", "")
+            try:    info_bytes = bytes.fromhex(xid_hex.replace(" ",""))
+            except: info_bytes = b''
+
+    # ── FCS ──────────────────────────────────────────────────────────────────
+    fcs_input = addr_bytes + ctrl_bytes + info_bytes
+    section("FCS  (Frame Check Sequence)")
+    print("    1 = CRC-16/CCITT  (2 bytes, standard HDLC, x^16+x^12+x^5+1)")
+    print("    2 = CRC-32        (4 bytes, extended HDLC)")
+    fcs_mode = get("FCS type (1=CRC-16  2=CRC-32)", "1")
+
+    if fcs_mode == '2':
+        crc_auto = crc32_eth(fcs_input)   # same polynomial
+        fcs_label = "CRC-32 (4B)"
+    else:
+        crc_val  = crc16_ccitt(fcs_input)
+        crc_auto = crc_val.to_bytes(2, 'little')  # HDLC FCS-16 is little-endian
+        fcs_label = "FCS-16/CCITT (2B)"
+
+    print(f"    Auto-computed {fcs_label} = 0x{crc_auto.hex()}")
+    custom = get("Use auto FCS? (y=auto  n=enter custom)", "y")
+    if custom.lower().startswith('n'):
+        fcs_hex = get("Enter FCS hex", crc_auto.hex())
+        try:
+            fcs_bytes = bytes.fromhex(fcs_hex.replace(" ",""))
+            if len(fcs_bytes) not in (2,4):
+                raise ValueError
+        except:
+            print("    -> invalid, using auto")
+            fcs_bytes = crc_auto
+    else:
+        fcs_bytes = crc_auto
+
+    # ── Bit-stuffing option ───────────────────────────────────────────────────
+    section("BIT STUFFING  (transparent operation)")
+    print("    HDLC uses bit-stuffing: after 5 consecutive 1-bits a 0 is inserted.")
+    print("    This prevents 0x7E appearing inside the frame content.")
+    do_stuff = get("Apply bit-stuffing to content? (y/n)", "n").lower().startswith("y")
+
+    # ── Assemble frame ────────────────────────────────────────────────────────
+    inner = addr_bytes + ctrl_bytes + info_bytes + fcs_bytes
+    if do_stuff:
+        inner = bit_stuff(byte_escape(inner))
+        stuff_note = "bit-stuffed + byte-escaped"
+    else:
+        stuff_note = "raw (no bit-stuffing)"
+
+    full_frame = flag_b + inner + flag_b
+
+    # ── Control field decode for display ──────────────────────────────────────
+    ctrl_hex = ctrl_bytes.hex()
+    if ftype == '1':
+        frame_type_label = "I-frame (Information)"
+    elif ftype == '2':
+        frame_type_label = f"S-frame (Supervisory) — {s_mn}"
+    else:
+        frame_type_label = f"U-frame (Unnumbered) — {u_mn}"
+
+    # ── Verify FCS ────────────────────────────────────────────────────────────
+    if fcs_mode == '2':
+        fcs_verify = crc32_eth(fcs_input)
+    else:
+        fcs_verify = crc16_ccitt(fcs_input).to_bytes(2, 'little')
+
+    # ── Build records ─────────────────────────────────────────────────────────
+    records = [
+        {"layer":1, "name":"HDLC Start Flag",
+         "raw": flag_b, "user_val": flag_b.hex(),
+         "note": "0x7E — frame delimiter (same role as Ethernet Preamble+SFD)"},
+
+        {"layer":2, "name":"HDLC Address",
+         "raw": addr_bytes, "user_val": addr_bytes.hex(),
+         "note": addr_note},
+
+        {"layer":2, "name":f"HDLC Control  ({frame_type_label})",
+         "raw": ctrl_bytes, "user_val": f"0x{ctrl_hex}",
+         "note": ctrl_note},
+    ]
+
+    # Control field sub-breakdown as individual records (display only — zero-length raw)
+    if ftype == '1':
+        if mod128:
+            records += [
+                {"layer":2,"name":"  └─ I-ctrl Byte0: N(S)+0",
+                 "raw":b"",
+                 "user_val":f"N(S)={ns}",
+                 "note":f"bits[7:1]=N(S)={ns}  bit[0]=0(I-frame)"},
+                {"layer":2,"name":"  └─ I-ctrl Byte1: N(R)+P/F",
+                 "raw":b"",
+                 "user_val":f"N(R)={nr} P/F={pf}",
+                 "note":f"bits[7:1]=N(R)={nr}  bit[0]=P/F={pf}"},
+            ]
+        else:
+            records.append({"layer":2,"name":"  └─ I-ctrl bits breakdown",
+                            "raw":b"",
+                            "user_val":f"N(S)={ns} P/F={pf} N(R)={nr}",
+                            "note":f"[7:5]N(S)={ns:03b}  [4]P/F={pf}  [3:1]N(R)={nr:03b}  [0]=0"})
+    elif ftype == '2':
+        records.append({"layer":2,"name":"  └─ S-ctrl bits breakdown",
+                        "raw":b"",
+                        "user_val":f"N(R)={nr} P/F={pf} {s_mn}",
+                        "note":f"[7:5]N(R)={nr:03b}  [4]P/F={pf}  [3:2]SS={s1}{s0}({s_mn})  [1:0]=01"})
+    else:
+        records.append({"layer":2,"name":"  └─ U-ctrl bits breakdown",
+                        "raw":b"",
+                        "user_val":f"{u_mn}  P/F={pf}",
+                        "note":f"[7:5]M={m4}{m3}{m2}  [4]P/F={pf}  [3:2]M={m1}{m0}  [1:0]=11"})
+
+    if info_bytes:
+        records.append({"layer":3,"name":"HDLC Information (payload)",
+                        "raw":info_bytes,
+                        "user_val":info_bytes.hex()[:30] if len(info_bytes)<=15 else f"{len(info_bytes)}B",
+                        "note":f"{len(info_bytes)} bytes"})
+
+    records += [
+        {"layer":0, "name":f"HDLC FCS  ({fcs_label})",
+         "raw": fcs_bytes, "user_val": fcs_bytes.hex(),
+         "note": f"Covers: Addr+Ctrl+Info={len(fcs_input)}B  {stuff_note}"},
+
+        {"layer":1, "name":"HDLC End Flag",
+         "raw": flag_b, "user_val": flag_b.hex(),
+         "note": "0x7E — frame end delimiter"},
+    ]
+
+    # ── Output ────────────────────────────────────────────────────────────────
+    banner(f"HDLC FRAME — {frame_type_label}")
+    print_frame_table(records)
+
+    fcs_ok = (fcs_bytes == fcs_verify)
+    verify_report([
+        (f"HDLC {fcs_label}", fcs_bytes.hex(), fcs_verify.hex(), fcs_ok),
+    ])
+    print_encapsulation(records, full_frame)
+
+
 def flow_serial():
     banner("SERIAL / WAN FRAME BUILDER",
            "L2: PPP | HDLC | SLIP | Modbus RTU | ATM AAL5 | Cisco HDLC | KISS | COBS")
     ch, proto_name = ask_l2_serial()
+
+    # HDLC Full builder — redirect to dedicated 3-frame-type handler
+    if ch == '11':
+        flow_hdlc()
+        return
 
     start_flag = b'\x7E'; end_flag = b'\x7E'
     if ch in ('3','4','8','10'):
@@ -2900,57 +3440,429 @@ def wifi_crc32(data: bytes) -> bytes:
 def print_wifi_education():
     print(f"""
   {'═'*110}
-  {'WiFi FRAME  —  IEEE 802.11  (Wireless LAN MAC)':^110}
+  {'WiFi FRAME  —  IEEE 802.11  (Wireless LAN MAC + PHY Preamble)':^110}
   {'═'*110}
+
+  ┌─────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+  │  QUESTION: Does WiFi have something like Ethernet's Preamble + SFD?                                     │
+  │                                                                                                         │
+  │  SHORT ANSWER: YES — but it is very different. WiFi has a PHY-layer preamble called the PLCP            │
+  │  (Physical Layer Convergence Procedure) header. The closest equivalent to Ethernet's SFD is the        │
+  │  STF (Short Training Field) + LTF (Long Training Field) + SIG field, which together tell the           │
+  │  receiver "a frame is starting, here is how to decode it."                                              │
+  │                                                                                                         │
+  │  KEY DIFFERENCE: Ethernet SFD is 1 byte (0xD5) in baseband.                                           │
+  │  WiFi PHY preamble is 20–80+ µs of OFDM/DSSS symbols transmitted BEFORE the MAC frame —               │
+  │  it carries timing sync, channel estimation, and rate/length info. It is NOT bytes in the              │
+  │  MAC layer. Most protocol analysers (Wireshark/tcpdump) strip it and show only the MPDU.               │
+  └─────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+  ETHERNET vs WiFi FRAME BOUNDARY COMPARISON
+  ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Ethernet (802.3)           WiFi (802.11)
+  ────────────────────────── ─────────────────────────────────────────────────────────────────────────────────
+  Preamble   7B  0x55×7      STF   Short Training Field  — AGC / frequency sync (8 OFDM symbols)
+  SFD        1B  0xD5    ≈   LTF   Long Training Field   — channel estimation  (2 OFDM symbols)
+  [MAC frame starts here]    SIG   Signal / PLCP Header  — rate + length info  (1 OFDM symbol)
+                             [MPDU = MAC frame starts here — after SIG is decoded]
+  ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  The STF marks the START of energy on the medium.
+  The SIG field is the functional equivalent of SFD — it signals the EXACT start and decode parameters
+  for the MPDU that follows.
+
+  PHY PREAMBLE FORMATS BY 802.11 STANDARD
+  ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Standard   PHY Mode         Preamble Structure                       Duration
+  ─────────  ───────────────  ───────────────────────────────────────  ──────────
+  802.11b    DSSS/CCK         Preamble(144b) + PLCP-Header(48b)        Long: 192µs
+             DSSS Short       Short-Preamble(72b) + PLCP-Hdr(24b)     Short: 96µs
+  802.11a    OFDM (5 GHz)     L-STF(8µs) + L-LTF(8µs) + L-SIG(4µs)  20µs
+  802.11g    ERP-OFDM (2.4G)  Same as 802.11a (L-STF+L-LTF+L-SIG)   20µs
+  802.11n    HT-Mixed(2.4/5G) L-STF+L-LTF+L-SIG + HT-SIG1+HT-SIG2   32–40µs
+                              + HT-STF + HT-LTF(s)
+  802.11ac   VHT (5 GHz)      L-STF+L-LTF+L-SIG + VHT-SIG-A(8µs)    36–76µs
+                              + VHT-STF + VHT-LTF(s) + VHT-SIG-B
+  802.11ax   HE (2.4/5/6 GHz) L-STF+L-LTF+L-SIG+RL-SIG              ~100µs
+                              + HE-SIG-A(8µs) + HE-SIG-B(opt)
+                              + HE-STF + HE-LTF(s)
+  ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+  PLCP FIELD MEANINGS
+  ────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Field      Role                      Ethernet equivalent?
+  ─────────  ────────────────────────  ─────────────────────────────────────────────────────────────────────
+  STF        Auto Gain Control (AGC)   ≈ Preamble (0x55×7) — sync, clock recovery
+             Coarse freq/time sync
+  LTF        Fine channel estimation   No Ethernet equivalent — wireless-only
+             Phase noise correction
+  L-SIG      Rate (4b) + Length(12b)  ≈ SFD (0xD5) — marks start of MPDU, gives its length
+             Parity + Tail bits        The receiver KNOWS the MPDU is coming after this
+  HT/VHT/    MCS index, BW, STBC,     No Ethernet equivalent — MIMO/OFDMA parameters
+  HE-SIG     NSS, Guard Interval,      tell the receiver how many spatial streams,
+             LDPC, beamforming info    what bandwidth (20/40/80/160MHz), etc.
+  ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+  DSSS PLCP HEADER FIELDS  (802.11b — the only standard where PLCP is byte-addressable)
+  ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Byte  Field          Size   Value / Description
+  ────  ─────────────  ─────  ────────────────────────────────────────────────────────────────────────────────
+   0    SYNC           128b   0xFF×16 bytes (long preamble)  OR  0xFF×7 bytes (short preamble)
+                               Scrambled 1s — same role as Ethernet preamble (symbol sync)
+   16   SFD            16b    0xF3A0  (long) OR  0x05CF  (short)  ← EXACT 802.11b SFD value
+                               THIS IS THE CLOSEST THING TO ETHERNET SFD IN WiFi
+                               Receiver detects this pattern to lock onto frame start
+   18   SIGNAL         8b     Data rate encoding:
+                               0x0A = 1 Mbps (DBPSK)
+                               0x14 = 2 Mbps (DQPSK)
+                               0x37 = 5.5 Mbps (CCK)
+                               0x6E = 11 Mbps (CCK)
+   19   SERVICE        8b     0x00 (reserved in long preamble, used in short)
+   20   LENGTH         16b    MPDU length in microseconds (not bytes!)
+   22   CRC            16b    CRC-16 over SIGNAL+SERVICE+LENGTH fields
+  [MPDU starts at byte 24 for long preamble]
+  ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+  OFDM L-SIG FIELD BITS  (802.11a/g/n/ac/ax legacy preamble — 24 bits total)
+  ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Bits   Field    Description
+  ─────  ───────  ──────────────────────────────────────────────────────────────────────────────────────────
+  [3:0]  RATE     MCS/rate code:
+                    0b1011=6Mbps  0b1111=9Mbps  0b1010=12Mbps  0b1110=18Mbps
+                    0b1001=24Mbps 0b1101=36Mbps 0b1000=48Mbps  0b1100=54Mbps
+  [4]    Reserved Always 0
+  [16:5] LENGTH   MPDU length in bytes (12 bits, max 4095)
+  [17]   Parity   Even parity over bits [0:16]
+  [23:18]Tail     000000 (flushes convolutional encoder)
+  ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+  SUMMARY: WiFi SFD EQUIVALENTS BY STANDARD
+  ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Standard   "SFD" Field     Value           Role
+  ─────────  ─────────────── ─────────────── ──────────────────────────────────────────────────────────────
+  802.11b    DSSS SFD        0xF3A0(long)    Exact SFD — marks frame start in baseband
+                             0x05CF(short)
+  802.11a/g  L-SIG           rate+len(24b)   Marks MPDU boundary, encodes decode params
+  802.11n    HT-SIG-1/2      MCS,BW,len      HT MPDU boundary + spatial stream params
+  802.11ac   VHT-SIG-A/B     MCS,NSS,len     VHT MPDU boundary + multi-user params
+  802.11ax   HE-SIG-A/B      MCS,NSS,RU      HE/OFDMA MPDU boundary + resource unit
+  ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
 
   THREE FRAME TYPES
   ─────────────────────────────────────────────────────────────────────────────
   Type  Name        Subtypes    Purpose
   ────  ──────────  ──────────  ────────────────────────────────────────────────
-  00    Management  0,1,2,3,4,  BSS administration: Beacon, Probe, Auth, Assoc,
-                    5,8,10-13   Disassoc, Action frames
+  00    Management  0,1,2,3,4,  BSS admin: Beacon, Probe, Auth, Assoc, Action
+                    5,8,10-13
   01    Control     8-14        Medium access: RTS, CTS, ACK, Block-Ack, PS-Poll
-  10    Data        0,4,8,12    Payload delivery: Data, Null, QoS-Data, QoS-Null
+  10    Data        0,4,8,12    Payload: Data, Null, QoS-Data, QoS-Null
 
-  FRAME CONTROL FIELD  (2 bytes — bits define everything)
+  FRAME CONTROL FIELD  (2 bytes)
   ─────────────────────────────────────────────────────────────────────────────
-  Bits   Field              Value / Meaning
-  ─────  ─────────────────  ──────────────────────────────────────────────────
-  [1:0]  Protocol Version   Always 0x00
-  [3:2]  Type               00=Mgmt  01=Ctrl  10=Data
-  [7:4]  Subtype            depends on type
-  [8]    To DS              1=frame heading to Distribution System (AP/DS)
-  [9]    From DS            1=frame from Distribution System
-  [10]   More Fragments     1=more fragments follow this one
-  [11]   Retry              1=retransmission
-  [12]   Power Management   1=STA entering power-save after this frame
-  [13]   More Data          1=AP has buffered frames for sleeping STA
-  [14]   Protected Frame    1=frame body is encrypted (CCMP/TKIP/WEP/GCMP)
-  [15]   +HTC/Order         1=HT Control field present (802.11n/ac)
+  [1:0] Protocol Version  [3:2] Type  [7:4] Subtype
+  [8] ToDS  [9] FromDS  [10] MoreFrag  [11] Retry  [12] PwrMgmt
+  [13] MoreData  [14] Protected  [15] +HTC/Order
 
-  DS-BIT ADDRESS TABLE  (Address fields change meaning with ToDS/FromDS)
+  DS-BIT ADDRESS TABLE
   ─────────────────────────────────────────────────────────────────────────────
-  ToDS  FromDS  Addr1 (RA)      Addr2 (TA)      Addr3       Addr4
-  ────  ──────  ──────────────  ──────────────  ──────────  ──────────
-    0     0     Destination STA Source STA      BSSID       (absent)  IBSS/Ad-Hoc
-    0     1     Destination STA AP BSSID        Source STA  (absent)  AP→STA (down)
-    1     0     AP BSSID        Source STA      Dest STA    (absent)  STA→AP (up)
-    1     1     RA (next hop)   TA (this AP)    DA (dest)   SA(src)   WDS/Mesh
+  ToDS  FromDS  Addr1(RA)     Addr2(TA)     Addr3       Addr4
+  ────  ──────  ────────────  ────────────  ──────────  ──────────
+    0     0     Destination   Source        BSSID       —  (IBSS/Ad-Hoc)
+    1     0     AP BSSID      Source STA    Dest STA    —  (STA→AP uplink)
+    0     1     Dest STA      AP BSSID      Source STA  —  (AP→STA downlink)
+    1     1     RA(next-hop)  TA(sender)    DA(dest)    SA(src)  (WDS/Mesh)
 
-  SEQUENCE CONTROL  (2 bytes)  =  SeqNum(12b) + FragNum(4b)
-  QoS CONTROL      (2 bytes)  =  TID(4b) + EOSP(1b) + AckPolicy(2b) + A-MSDU(1b) + TXOP(8b)
-
-  LLC/SNAP HEADER  (8 bytes — present in Data frames carrying IP/ARP)
-  ─────────────────────────────────────────────────────────────────────────────
-  AA AA 03  00 00 00  [EtherType 2B]
-  └──┴──┴─ LLC(DSAP+SSAP+Ctrl=UI)   └─────┘ SNAP OUI=0   └─ e.g. 08 00=IPv4
-
-  FCS: CRC-32 over entire MPDU (Frame Control → end of Frame Body), 4 bytes LE
+  FCS: CRC-32 over entire MPDU (FC → Frame Body), 4B little-endian
   {'═'*110}""")
+
+
+# ── PHY preamble builders ─────────────────────────────────────────────────────
+
+WIFI_PHY_MODES = {
+    '1': "802.11b  DSSS/CCK  (2.4 GHz, 1/2/5.5/11 Mbps)",
+    '2': "802.11a  OFDM      (5 GHz,   6–54 Mbps)",
+    '3': "802.11g  ERP-OFDM  (2.4 GHz, 6–54 Mbps)",
+    '4': "802.11n  HT-Mixed  (2.4/5 GHz, up to 600 Mbps)",
+    '5': "802.11ac VHT       (5 GHz,   up to 6.9 Gbps)",
+    '6': "802.11ax HE        (2.4/5/6 GHz, up to 9.6 Gbps)",
+    '7': "No PHY preamble   (MAC MPDU only — as seen in Wireshark pcap)",
+}
+
+DSSS_RATES = {
+    '1': (0x0A, "1 Mbps  DBPSK"),
+    '2': (0x14, "2 Mbps  DQPSK"),
+    '3': (0x37, "5.5 Mbps CCK"),
+    '4': (0x6E, "11 Mbps CCK"),
+}
+
+OFDM_RATE_BITS = {
+    '6' : (0b1011, "6 Mbps  BPSK  R=1/2"),
+    '9' : (0b1111, "9 Mbps  BPSK  R=3/4"),
+    '12': (0b1010, "12 Mbps QPSK  R=1/2"),
+    '18': (0b1110, "18 Mbps QPSK  R=3/4"),
+    '24': (0b1001, "24 Mbps 16-QAM R=1/2"),
+    '36': (0b1101, "36 Mbps 16-QAM R=3/4"),
+    '48': (0b1000, "48 Mbps 64-QAM R=2/3"),
+    '54': (0b1100, "54 Mbps 64-QAM R=3/4"),
+}
+
+def crc16_ibm(data: bytes) -> int:
+    """CRC-16/IBM used in DSSS PLCP header."""
+    crc = 0xFFFF
+    for byte in data:
+        crc ^= byte
+        for _ in range(8):
+            if crc & 1:
+                crc = (crc >> 1) ^ 0x8005
+            else:
+                crc >>= 1
+    return crc
+
+def build_dsss_plcp(mpdu_len_bytes, rate_byte, short_preamble=False):
+    """
+    Build 802.11b DSSS PLCP preamble.
+    Returns (plcp_bytes, records).
+    Long preamble:  SYNC(128b=16B) + SFD(2B) + SIGNAL(1B) + SERVICE(1B) + LENGTH(2B) + CRC(2B) = 24B
+    Short preamble: SYNC(56b=7B)  + SFD(2B) + SIGNAL(1B) + SERVICE(1B) + LENGTH(2B) + CRC(2B) = 15B
+    LENGTH field = MPDU duration in µs.
+    """
+    if short_preamble:
+        sync    = bytes([0xFF] * 7)
+        sfd_val = 0x05CF
+        sync_note = "56-bit SYNC (7×0xFF) — short preamble scrambled 1s"
+        sfd_note  = "0x05CF — 802.11b SHORT preamble SFD (frame boundary)"
+        mode_note = "Short preamble (96µs total PLCP)"
+    else:
+        sync    = bytes([0xFF] * 16)
+        sfd_val = 0xF3A0
+        sync_note = "128-bit SYNC (16×0xFF) — long preamble scrambled 1s"
+        sfd_note  = "0xF3A0 — 802.11b LONG preamble SFD (frame boundary)"
+        mode_note = "Long preamble (192µs total PLCP)"
+
+    sfd_b    = struct.pack("<H", sfd_val)
+    signal_b = bytes([rate_byte])
+    service_b= bytes([0x00])
+    # LENGTH = MPDU duration in µs at the signalled rate
+    # For simplicity, store MPDU byte length directly (standard uses µs but
+    # most implementations interpret length bytes at the signalled rate)
+    length_b = struct.pack("<H", mpdu_len_bytes & 0xFFFF)
+    crc_input = bytes([rate_byte, 0x00]) + length_b
+    crc_val  = crc16_ibm(crc_input)
+    crc_b    = struct.pack("<H", crc_val)
+
+    plcp = sync + sfd_b + signal_b + service_b + length_b + crc_b
+    records = [
+        {"layer":1, "name":"DSSS SYNC (preamble)",
+         "raw": sync,     "user_val": f"0xFF×{len(sync)}",
+         "note": sync_note},
+        {"layer":1, "name":"DSSS SFD  ← FRAME BOUNDARY",
+         "raw": sfd_b,    "user_val": f"0x{sfd_val:04X}",
+         "note": sfd_note},
+        {"layer":1, "name":"DSSS SIGNAL (rate)",
+         "raw": signal_b, "user_val": f"0x{rate_byte:02X}",
+         "note": f"Rate encoding — see SIGNAL table"},
+        {"layer":1, "name":"DSSS SERVICE",
+         "raw": service_b,"user_val": "0x00",
+         "note": "Reserved in long preamble"},
+        {"layer":1, "name":"DSSS LENGTH (MPDU µs/B)",
+         "raw": length_b, "user_val": str(mpdu_len_bytes),
+         "note": "MPDU length (bytes encoded as µs field)"},
+        {"layer":1, "name":"DSSS PLCP CRC-16",
+         "raw": crc_b,    "user_val": f"0x{crc_val:04X}",
+         "note": f"CRC-16/IBM over SIGNAL+SERVICE+LENGTH  {mode_note}"},
+    ]
+    return plcp, records
+
+def build_ofdm_lsig(mpdu_len_bytes, rate_bits, rate_label):
+    """
+    Build 802.11a/g L-SIG field (3 bytes / 24 bits).
+    Bits [3:0]=RATE  [4]=Reserved  [16:5]=LENGTH  [17]=Parity  [23:18]=Tail
+    Returned as 3 bytes (raw bit-packed, transmitted LSB-first in OFDM symbol).
+    """
+    length_field = mpdu_len_bytes & 0xFFF
+    word = (rate_bits & 0xF) | (0 << 4) | (length_field << 5)
+    # parity over bits 0..16
+    parity = bin(word & 0x1FFFF).count('1') % 2
+    word |= (parity << 17)
+    # tail bits [23:18] = 000000 (already 0)
+    lsig_bytes = struct.pack("<I", word)[:3]
+    records = [
+        {"layer":1, "name":"L-STF  (Short Training Field)",
+         "raw": bytes(10), "user_val": "8µs OFDM symbols",
+         "note": "10 symbols × 0.8µs — AGC + coarse freq sync  (not byte-representable)"},
+        {"layer":1, "name":"L-LTF  (Long Training Field)",
+         "raw": bytes(8),  "user_val": "8µs OFDM symbols",
+         "note": "GI(1.6µs) + 2×LTF(3.2µs each) — fine channel estimation"},
+        {"layer":1, "name":"L-SIG  ← FRAME BOUNDARY",
+         "raw": lsig_bytes,"user_val": f"RATE={rate_bits:04b} LEN={mpdu_len_bytes}",
+         "note": (f"{rate_label}  LEN={mpdu_len_bytes}B  Par={parity}  "
+                  f"4µs OFDM symbol — marks MPDU start  [closest to SFD]")},
+    ]
+    return lsig_bytes, records  # we return only L-SIG bytes (STF/LTF are analog)
+
+def build_ht_sig(mpdu_len_bytes, mcs, bw40, sgi, stbc, ldpc, rate_label):
+    """
+    Build 802.11n HT-SIG (2 × 24-bit fields = 6 bytes).
+    HT-SIG1: MCS(7b)+BW(1b)+HT-LEN(16b)
+    HT-SIG2: Smoothing+NotSounding+Reserved+Aggregation+STBC+FEC+SGI+NumExtSS+CRC+Tail
+    """
+    ht_len = mpdu_len_bytes & 0xFFFF
+    sig1_word = (mcs & 0x7F) | ((1 if bw40 else 0) << 7) | (ht_len << 8)
+    sig1 = struct.pack("<I", sig1_word)[:3]
+
+    smooth=1; not_snd=1; aggr=0
+    stbc_b=(1 if stbc else 0); fec=(1 if ldpc else 0); sgi_b=(1 if sgi else 0)
+    sig2_lo = (smooth | (not_snd<<1) | (0<<2) | (aggr<<3) |
+               (stbc_b<<4) | (fec<<5) | (sgi_b<<6) | (0<<7))
+    crc_input = sig1 + bytes([sig2_lo])
+    crc8 = 0xFF
+    for byte in crc_input:
+        for i in range(8):
+            bit = (byte >> i) & 1
+            fb  = ((crc8 >> 7) & 1) ^ bit
+            crc8= ((crc8 << 1) & 0xFF) | 0
+            if fb: crc8 ^= 0x07
+    sig2 = bytes([sig2_lo, crc8 & 0xFF, 0x00])
+
+    lsig_bytes, lsig_records = build_ofdm_lsig(mpdu_len_bytes, 0b1011, "6Mbps legacy")
+    records = lsig_records + [
+        {"layer":1, "name":"HT-SIG-1  (MCS+BW+Length)",
+         "raw": sig1, "user_val": f"MCS{mcs} BW={'40' if bw40 else '20'}MHz LEN={ht_len}",
+         "note": "8µs (2×4µs OFDM) — HT rate/length descriptor"},
+        {"layer":1, "name":"HT-SIG-2  ← HT FRAME BOUNDARY",
+         "raw": sig2, "user_val": f"SGI={int(sgi)} LDPC={int(ldpc)} STBC={int(stbc)}",
+         "note": "HT-SIG-2 + CRC8+Tail — marks HT MPDU start (≈SFD for 802.11n)"},
+        {"layer":1, "name":"HT-STF  (HT Short Training)",
+         "raw": bytes(4), "user_val": "4µs", "note": "MIMO AGC adjustment"},
+        {"layer":1, "name":"HT-LTF(s) (HT Long Training)",
+         "raw": bytes(4), "user_val": f"4µs×NSS", "note": "Per-stream channel estimation"},
+    ]
+    return sig1 + sig2, records
+
+def build_vht_sig(mpdu_len_bytes, mcs, nss, bw, sgi, ldpc):
+    """Build 802.11ac VHT-SIG-A (2×24b) summary."""
+    bw_map = {20:0, 40:1, 80:2, 160:3}
+    bw_bits = bw_map.get(bw, 0)
+    nss_b = (nss - 1) & 0x7
+    siga1 = struct.pack("<I", bw_bits | (0<<2) | (1<<3) | (nss_b<<13))[:3]
+    siga2 = struct.pack("<I", (mcs<<4) | (int(sgi)<<0) | (int(ldpc)<<2))[:3]
+    lsig_bytes, lsig_records = build_ofdm_lsig(mpdu_len_bytes, 0b1011, "6Mbps legacy")
+    records = lsig_records + [
+        {"layer":1, "name":"VHT-SIG-A1  (BW+NSS+STBC)",
+         "raw": siga1, "user_val": f"BW={bw}MHz NSS={nss}",
+         "note": "8µs — VHT rate/NSS/BW descriptor"},
+        {"layer":1, "name":"VHT-SIG-A2  ← VHT FRAME BOUNDARY",
+         "raw": siga2, "user_val": f"MCS{mcs} SGI={int(sgi)} LDPC={int(ldpc)}",
+         "note": "VHT-SIG-A2 — marks VHT MPDU start  (≈SFD for 802.11ac)"},
+        {"layer":1, "name":"VHT-STF",
+         "raw": bytes(4), "user_val": "4µs", "note": "MIMO AGC"},
+        {"layer":1, "name":"VHT-LTF(s)",
+         "raw": bytes(4), "user_val": f"4µs×{nss}", "note": "Per-stream channel est."},
+        {"layer":1, "name":"VHT-SIG-B  (length per user)",
+         "raw": bytes(3), "user_val": f"LEN={mpdu_len_bytes}", "note": "Per-user MPDU length"},
+    ]
+    return siga1 + siga2, records
+
+def build_he_sig(mpdu_len_bytes, mcs, nss, bw, gi, ldpc):
+    """Build 802.11ax HE-SIG-A summary."""
+    bw_map = {20:0, 40:1, 80:2, 160:3}
+    bw_bits = bw_map.get(bw, 0)
+    nss_b = (nss-1) & 0x7
+    hesa1 = struct.pack("<I", bw_bits | (0<<2) | (nss_b<<9))[:3]
+    hesa2 = struct.pack("<I", (mcs<<4) | (int(ldpc)<<3) | (gi & 0x3))[:3]
+    lsig_bytes, lsig_records = build_ofdm_lsig(mpdu_len_bytes, 0b1011, "6Mbps legacy")
+    gi_names = {0:"0.8µs(Normal)", 1:"1.6µs(Double)", 2:"3.2µs(Quad)"}
+    records = lsig_records + [
+        {"layer":1, "name":"RL-SIG  (Repeated L-SIG)",
+         "raw": lsig_bytes, "user_val": "repeat", "note": "Confirms HE frame to non-HE stations"},
+        {"layer":1, "name":"HE-SIG-A1  (BW+BSS-Color+NSS)",
+         "raw": hesa1, "user_val": f"BW={bw}MHz NSS={nss}",
+         "note": "8µs — HE BSS colour, UL/DL, NSS"},
+        {"layer":1, "name":"HE-SIG-A2  ← HE FRAME BOUNDARY",
+         "raw": hesa2, "user_val": f"MCS{mcs} GI={gi_names.get(gi,'?')} LDPC={int(ldpc)}",
+         "note": "HE-SIG-A2 — marks HE MPDU start  (≈SFD for 802.11ax)"},
+        {"layer":1, "name":"HE-STF",
+         "raw": bytes(4), "user_val": "4µs or 8µs", "note": "HE MIMO AGC"},
+        {"layer":1, "name":"HE-LTF(s)",
+         "raw": bytes(4), "user_val": f"4/8µs×{nss}", "note": "HE channel estimation"},
+    ]
+    return hesa1 + hesa2, records
+
+def ask_wifi_phy(phy_ch, mpdu_len):
+    """Ask PHY-specific parameters and return (phy_records)."""
+    phy_records = []
+
+    if phy_ch == '1':  # DSSS
+        section("802.11b DSSS PLCP HEADER")
+        print("    Long preamble (192µs) or Short preamble (96µs)?")
+        sp = get("Short preamble? (y/n)", "n").lower().startswith("y")
+        print("    SIGNAL (rate) byte:")
+        for k,(rb,rd) in DSSS_RATES.items():
+            print(f"      {k} = 0x{rb:02X}  {rd}")
+        rate_ch = get("Rate", "4")
+        rate_byte, rate_desc = DSSS_RATES.get(rate_ch, (0x6E, "11 Mbps CCK"))
+        print(f"    -> Rate: {rate_desc}")
+        _, phy_records = build_dsss_plcp(mpdu_len, rate_byte, sp)
+
+    elif phy_ch in ('2','3'):  # OFDM 802.11a/g
+        std = "802.11a (5GHz)" if phy_ch=='2' else "802.11g (2.4GHz)"
+        section(f"{std} OFDM L-SIG  (legacy preamble: L-STF + L-LTF + L-SIG)")
+        print("    L-SIG RATE field (MCS/rate code, 4 bits):")
+        for k,(rb,rd) in OFDM_RATE_BITS.items():
+            print(f"      {k:>2} Mbps = 0b{rb:04b}  {rd}")
+        rate_ch = get("Data rate (Mbps)", "54")
+        rate_bits, rate_label = OFDM_RATE_BITS.get(rate_ch, (0b1100, "54 Mbps"))
+        print(f"    -> {rate_label}")
+        print(f"    NOTE: L-STF (8µs) and L-LTF (8µs) are OFDM analog waveforms.")
+        print(f"    They are NOT byte-representable. Shown as placeholder bytes below.")
+        _, phy_records = build_ofdm_lsig(mpdu_len, rate_bits, rate_label)
+
+    elif phy_ch == '4':  # HT 802.11n
+        section("802.11n HT-MIXED PLCP  (L-STF + L-LTF + L-SIG + HT-SIG1 + HT-SIG2 + HT-STF + HT-LTF)")
+        print("    MCS index (0=BPSK 1/2, 7=64QAM 5/6, 8-15=2-stream ...)")
+        mcs  = int(get("MCS index (0-31)", "7")) & 0x1F
+        bw40 = get("40 MHz bandwidth? (y/n)", "n").lower().startswith("y")
+        sgi  = get("Short Guard Interval 400ns? (y/n)", "n").lower().startswith("y")
+        stbc = get("STBC? (y/n)", "n").lower().startswith("y")
+        ldpc = get("LDPC FEC? (y/n)", "n").lower().startswith("y")
+        rate_label = f"MCS{mcs} {'HT40' if bw40 else 'HT20'} {'SGI' if sgi else 'LGI'}"
+        _, phy_records = build_ht_sig(mpdu_len, mcs, bw40, sgi, stbc, ldpc, rate_label)
+
+    elif phy_ch == '5':  # VHT 802.11ac
+        section("802.11ac VHT PLCP  (L-STF+L-LTF+L-SIG+VHT-SIG-A+VHT-STF+VHT-LTF+VHT-SIG-B)")
+        mcs = int(get("MCS index (0-9)", "9")) & 0xF
+        nss = int(get("Number of Spatial Streams NSS (1-8)", "1"))
+        bw  = int(get("Bandwidth  20/40/80/160 MHz", "80"))
+        sgi = get("Short GI 400ns? (y/n)", "n").lower().startswith("y")
+        ldpc= get("LDPC FEC? (y/n)", "n").lower().startswith("y")
+        _, phy_records = build_vht_sig(mpdu_len, mcs, nss, bw, sgi, ldpc)
+
+    elif phy_ch == '6':  # HE 802.11ax
+        section("802.11ax HE PLCP  (L-STF+L-LTF+L-SIG+RL-SIG+HE-SIG-A+HE-STF+HE-LTF)")
+        mcs = int(get("MCS index (0-11)", "11")) & 0xF
+        nss = int(get("Number of Spatial Streams NSS (1-8)", "1"))
+        bw  = int(get("Bandwidth  20/40/80/160 MHz", "80"))
+        print("    Guard Interval:  0=0.8µs(Normal)  1=1.6µs  2=3.2µs")
+        gi  = int(get("GI (0/1/2)", "0")) & 0x3
+        ldpc= get("LDPC FEC? (y/n)", "n").lower().startswith("y")
+        _, phy_records = build_he_sig(mpdu_len, mcs, nss, bw, gi, ldpc)
+
+    # phy_ch == '7': no PHY, phy_records stays empty
+    return phy_records
+
 
 # ── Inputs ────────────────────────────────────────────────────────────────────
 
 def ask_wifi_frame():
+    # ── PHY mode selection ─────────────────────────────────────────────────────
+    section("WiFi PHY MODE  (determines preamble / frame boundary field)")
+    print("    NOTE: PHY preamble is transmitted BEFORE the MAC frame on air.")
+    print("    It contains the 'SFD equivalent' that marks the MPDU boundary.\n")
+    for k, v in WIFI_PHY_MODES.items():
+        print(f"    {k} = {v}")
+    phy_ch = get("PHY mode", "3")
+    if phy_ch not in WIFI_PHY_MODES: phy_ch = '3'
+    print(f"    -> Selected: {WIFI_PHY_MODES[phy_ch]}")
+
     section("WiFi FRAME TYPE")
     print("    1 = Management  (Beacon, Probe, Auth, Assoc, Disassoc ...)")
     print("    2 = Control     (RTS, CTS, ACK, Block-Ack ...)")
@@ -2974,7 +3886,7 @@ def ask_wifi_frame():
         sub_ch = get("Subtype", "13")
         if sub_ch not in WIFI_CTRL_SUBTYPES: sub_ch = '13'
         subtype_val, subtype_name, _ = WIFI_CTRL_SUBTYPES[sub_ch]
-    else:  # Data
+    else:
         for k,(sv,sn,qos,sd) in WIFI_DATA_SUBTYPES.items():
             print(f"    {k:>2} = {sn:<15}  QoS={'Yes' if qos else 'No '}  {sd}")
         sub_ch = get("Subtype", "8")
@@ -2986,7 +3898,6 @@ def ask_wifi_frame():
     print("    ToDS / FromDS determine address field roles (see table above).")
 
     if ftype_ch == '2':
-        # Control frames: ToDS=FromDS=0 always
         to_ds = 0; from_ds = 0
         print("    Control frames: ToDS=0 FromDS=0 (fixed)")
     else:
@@ -3001,9 +3912,6 @@ def ask_wifi_frame():
     protected = int(get("Protected Frame (0/1, 1=encrypted)", "0")) & 1
     htc_order = int(get("+HTC/Order     (0/1)", "0")) & 1
 
-    # Build Frame Control 2 bytes (little-endian on air)
-    # byte0: [Protocol(2b) | Type(2b) | Subtype(4b)]
-    # byte1: [ToDS|FromDS|MoreFrag|Retry|PwrMgmt|MoreData|Protected|HTC]
     fc_byte0 = (subtype_val << 4) | (type_bits << 2) | 0x00
     fc_byte1 = (to_ds | (from_ds<<1) | (more_frag<<2) | (retry<<3) |
                 (pwr_mgmt<<4) | (more_data<<5) | (protected<<6) | (htc_order<<7))
@@ -3013,7 +3921,7 @@ def ask_wifi_frame():
     section("DURATION / ID  (2 bytes)")
     print("    NAV duration in microseconds (Network Allocation Vector).")
     print("    For ACK/CTS: time for remaining exchange.  PS-Poll: AID value.")
-    dur_val = int(get("Duration µs  (0–32767) or AID for PS-Poll", "0")) & 0x7FFF
+    dur_val   = int(get("Duration µs  (0–32767) or AID for PS-Poll", "0")) & 0x7FFF
     dur_bytes = struct.pack("<H", dur_val)
 
     # ── Address fields ─────────────────────────────────────────────────────────
@@ -3024,7 +3932,6 @@ def ask_wifi_frame():
                (1,1):"WDS/Mesh     Addr1=RA  Addr2=TA  Addr3=DA  Addr4=SA"}
     print(f"    DS mode: {ds_desc.get((to_ds,from_ds), 'see table')}")
 
-    # Determine address prompts based on DS bits
     if (to_ds, from_ds) == (0,0):
         a1_lbl="Addr1  Destination STA"; a2_lbl="Addr2  Source STA"
         a3_lbl="Addr3  BSSID";           need_a4=False
@@ -3037,14 +3944,13 @@ def ask_wifi_frame():
         a1_lbl="Addr1  Destination STA"; a2_lbl="Addr2  AP BSSID"
         a3_lbl="Addr3  Source STA";      need_a4=False
         a1_def="aa:bb:cc:dd:ee:ff"; a2_def="00:11:22:33:44:55"; a3_def="cc:dd:ee:ff:00:11"
-    else:  # WDS
+    else:
         a1_lbl="Addr1  RA (receiver/next-hop AP)"; a2_lbl="Addr2  TA (transmitter/this AP)"
         a3_lbl="Addr3  DA (final destination)";     need_a4=True
         a1_def="00:11:22:33:44:55"; a2_def="aa:bb:cc:dd:ee:ff"; a3_def="ff:ff:ff:ff:ff:ff"
 
-    # Control frames only have Addr1 (RA) and optionally Addr2 (TA)
     if ftype_ch == '2':
-        subtype_has_a2 = subtype_val not in (0x0C, 0x0D)  # CTS, ACK have only Addr1
+        subtype_has_a2 = subtype_val not in (0x0C, 0x0D)
         a1_lbl = "Addr1  RA (Receiver Address)"
         a2_lbl = "Addr2  TA (Transmitter Address)"
         a1_def = "ff:ff:ff:ff:ff:ff"; a2_def = "aa:bb:cc:dd:ee:ff"
@@ -3057,136 +3963,102 @@ def ask_wifi_frame():
     else:
         addr2 = get(a2_lbl, a2_def)
 
-    if ftype_ch != '2':
-        addr3 = get(a3_lbl, a3_def)
-    else:
-        addr3 = None
-
-    addr4 = None
-    if need_a4:
-        addr4 = get("Addr4  SA (source address)", "cc:dd:ee:ff:00:11")
+    addr3 = get(a3_lbl, a3_def) if ftype_ch != '2' else None
+    addr4 = get("Addr4  SA (source address)", "cc:dd:ee:ff:00:11") if need_a4 else None
 
     # ── Sequence Control ───────────────────────────────────────────────────────
     seq_ctrl_bytes = b''
-    if ftype_ch != '2' or subtype_val in (0x08, 0x09):  # most non-control frames
+    if ftype_ch != '2' or subtype_val in (0x08, 0x09):
         section("SEQUENCE CONTROL")
         seq_num  = int(get("Sequence Number  (0–4095)", "100")) & 0xFFF
         frag_num = int(get("Fragment Number  (0=unfragmented)", "0")) & 0xF
-        seq_ctrl_val = (seq_num << 4) | frag_num
+        seq_ctrl_val   = (seq_num << 4) | frag_num
         seq_ctrl_bytes = struct.pack("<H", seq_ctrl_val)
-        print(f"    -> SeqCtrl = 0x{seq_ctrl_val:04X}  (SeqNum={seq_num} FragNum={frag_num})")
 
     # ── QoS Control ────────────────────────────────────────────────────────────
     qos_bytes = b''
     if has_qos:
-        section("QoS CONTROL  (present because QoS subtype)")
-        print("    TID maps to User Priority (UP) and Access Category (AC):")
+        section("QoS CONTROL")
         for tid,(name) in WIFI_TID_NAMES.items():
             print(f"      TID {tid} = {name}")
-        tid      = int(get("TID  Traffic ID (0–7)", "0")) & 0xF
-        eosp     = int(get("EOSP End-of-Service-Period (0/1)", "0")) & 0x1
+        tid     = int(get("TID  Traffic ID (0–7)", "0")) & 0xF
+        eosp    = int(get("EOSP (0/1)", "0")) & 0x1
         print("    Ack Policy:  0=Normal  1=No-Ack  2=No-Explicit  3=Block-Ack")
-        ack_pol  = int(get("Ack Policy (0–3)", "0")) & 0x3
-        amsdu    = int(get("A-MSDU Present (0/1)", "0")) & 0x1
-        txop     = int(get("TXOP Limit / Queue Size (0–255)", "0")) & 0xFF
-        qos_lo   = tid | (eosp<<4) | (ack_pol<<5) | (amsdu<<7)
+        ack_pol = int(get("Ack Policy (0–3)", "0")) & 0x3
+        amsdu   = int(get("A-MSDU Present (0/1)", "0")) & 0x1
+        txop    = int(get("TXOP Limit (0–255)", "0")) & 0xFF
+        qos_lo  = tid | (eosp<<4) | (ack_pol<<5) | (amsdu<<7)
         qos_bytes = bytes([qos_lo, txop])
-        print(f"    -> QoS Control = 0x{qos_lo:02X}{txop:02X}  "
-              f"TID={tid}({WIFI_TID_NAMES.get(tid,'')})  "
-              f"AckPol={WIFI_ACK_POLICY[ack_pol]}")
 
     # ── HT Control ─────────────────────────────────────────────────────────────
     htc_bytes = b''
     if htc_order:
-        section("HT CONTROL  (4 bytes, present because +HTC bit=1)")
+        section("HT CONTROL  (4 bytes)")
         htc_hex = get("HT Control (8 hex chars)", "00000000")
         try:    htc_bytes = bytes.fromhex(htc_hex.replace(" ",""))[:4]
         except: htc_bytes = b'\x00'*4
         if len(htc_bytes) < 4: htc_bytes = htc_bytes.ljust(4, b'\x00')
 
-    # ── Frame Body ────────────────────────────────────────────────────────────
+    # ── Frame Body ─────────────────────────────────────────────────────────────
     section("FRAME BODY / PAYLOAD")
     frame_body = b''
 
-    if ftype_ch == '3' and subtype_val in (0x00, 0x08):  # Data / QoS Data
-        print("    Data frame body options:")
-        print("      1 = LLC/SNAP + IPv4 payload  (typical data frame)")
-        print("      2 = LLC/SNAP + raw hex payload")
-        print("      3 = Raw hex (no LLC/SNAP)")
-        print("      4 = Empty frame body (e.g. Null frame)")
+    if ftype_ch == '3' and subtype_val in (0x00, 0x08):
+        print("    1=LLC/SNAP+IPv4  2=LLC/SNAP+raw hex  3=Raw hex  4=Empty")
         body_ch = get("Body type", "1")
         if body_ch in ('1','2'):
-            # LLC/SNAP header
             llcsnap = bytes.fromhex("aaaa03000000")
-            if body_ch == '1':
-                print("    EtherType inside LLC/SNAP:")
-                print("      0800=IPv4  0806=ARP  86DD=IPv6  8100=VLAN")
-                et_hex = get("EtherType (hex)", "0800")
-                try: et_b = hpad(et_hex, 2)
-                except: et_b = bytes.fromhex("0800")
-                llcsnap += et_b
-                print("    IPv4 payload hex (leave empty for 20B zero-pad)")
-                ip_hex = get("IPv4 payload hex", "")
-                try:    ip_data = bytes.fromhex(ip_hex.replace(" ",""))
-                except: ip_data = b''
-                frame_body = llcsnap + ip_data
-            else:
-                et_hex = get("EtherType (hex)", "0800")
-                try: et_b = hpad(et_hex, 2)
-                except: et_b = bytes.fromhex("0800")
-                llcsnap += et_b
-                raw_hex = get("Payload hex after LLC/SNAP+EtherType", "")
-                try:    raw_data = bytes.fromhex(raw_hex.replace(" ",""))
-                except: raw_data = b''
-                frame_body = llcsnap + raw_data
+            et_hex  = get("EtherType (hex)", "0800")
+            try: et_b = hpad(et_hex, 2)
+            except: et_b = bytes.fromhex("0800")
+            llcsnap += et_b
+            raw_hex = get("Payload hex after LLC/SNAP+EtherType (Enter=empty)", "")
+            try:    raw_data = bytes.fromhex(raw_hex.replace(" ",""))
+            except: raw_data = b''
+            frame_body = llcsnap + raw_data
         elif body_ch == '3':
             raw_hex = get("Raw frame body hex", "")
             try:    frame_body = bytes.fromhex(raw_hex.replace(" ",""))
             except: frame_body = b''
-        # else empty
 
-    elif ftype_ch == '1':  # Management
-        print("    Management frame body (IEs — Information Elements):")
-        print("    Leave empty for minimal frame, or enter hex bytes for IEs.")
-        print("    Beacon IE examples:  SSID(tag0), Rates(tag1), DS-Param(tag3), etc.")
-        if subtype_val == 0x08:  # Beacon — pre-fill minimal IEs
-            print("    Beacon defaults: Timestamp(8B)+BeaconInterval(2B)+CapabilityInfo(2B)+SSID IE")
+    elif ftype_ch == '1':
+        if subtype_val == 0x08:
             use_beacon = get("Use beacon template? (y/n)", "y").lower().startswith("y")
             if use_beacon:
-                ssid_str = get("SSID", "MyNetwork")
-                ts      = b'\x00'*8
-                bi      = struct.pack("<H", 100)   # 100 TU = 102.4 ms
-                cap_info= struct.pack("<H", 0x0431) # ESS+ShortPreamble+ShortSlot+PBCC
-                ssid_b  = bytes([0, len(ssid_str)]) + ssid_str.encode()
-                rates_b = bytes([0x01, 0x08, 0x82,0x84,0x8B,0x96,0x0C,0x12,0x18,0x24])
-                ds_b    = bytes([0x03, 0x01, int(get("DS Channel (1-14)", "6"))])
+                ssid_str  = get("SSID", "MyNetwork")
+                ts        = b'\x00'*8
+                bi        = struct.pack("<H", 100)
+                cap_info  = struct.pack("<H", 0x0431)
+                ssid_b    = bytes([0, len(ssid_str)]) + ssid_str.encode()
+                rates_b   = bytes([0x01,0x08,0x82,0x84,0x8B,0x96,0x0C,0x12,0x18,0x24])
+                ds_b      = bytes([0x03,0x01, int(get("DS Channel (1-14)", "6"))])
                 frame_body = ts + bi + cap_info + ssid_b + rates_b + ds_b
             else:
                 ie_hex = get("Management body hex", "")
                 try:    frame_body = bytes.fromhex(ie_hex.replace(" ",""))
                 except: frame_body = b''
-        elif subtype_val in (0x04,):  # Probe Request
-            ssid_str = get("SSID to probe (empty=broadcast scan)", "")
-            ssid_b   = bytes([0, len(ssid_str)]) + ssid_str.encode()
-            rates_b  = bytes([0x01, 0x04, 0x02,0x04,0x0B,0x16])
-            frame_body = ssid_b + rates_b
+        elif subtype_val == 0x04:
+            ssid_str  = get("SSID to probe (empty=broadcast)", "")
+            ssid_b    = bytes([0, len(ssid_str)]) + ssid_str.encode()
+            frame_body = ssid_b + bytes([0x01,0x04,0x02,0x04,0x0B,0x16])
         else:
-            ie_hex = get("Management body hex (IEs, leave empty=none)", "")
+            ie_hex = get("Management body hex (Enter=none)", "")
             try:    frame_body = bytes.fromhex(ie_hex.replace(" ",""))
             except: frame_body = b''
 
-    elif ftype_ch == '2':  # Control — most have no body
+    elif ftype_ch == '2':
         ctrl_hex = get("Control frame extra body hex (usually empty)", "")
         try:    frame_body = bytes.fromhex(ctrl_hex.replace(" ",""))
         except: frame_body = b''
 
     return {
+        'phy_ch':        phy_ch,
         'fc_bytes':      fc_bytes,
-        'fc_byte0':      fc_byte0,  'fc_byte1': fc_byte1,
-        'type_bits':     type_bits, 'type_name': type_name,
-        'subtype_val':   subtype_val,'subtype_name': subtype_name,
+        'fc_byte0':      fc_byte0,   'fc_byte1':    fc_byte1,
+        'type_bits':     type_bits,  'type_name':   type_name,
+        'subtype_val':   subtype_val,'subtype_name':subtype_name,
         'has_qos':       has_qos,
-        'to_ds':  to_ds, 'from_ds': from_ds,
+        'to_ds':  to_ds, 'from_ds':  from_ds,
         'more_frag': more_frag, 'retry': retry,
         'pwr_mgmt': pwr_mgmt,   'more_data': more_data,
         'protected': protected, 'htc_order': htc_order,
@@ -3200,29 +4072,25 @@ def ask_wifi_frame():
     }
 
 def build_wifi(d):
-    """Assemble the 802.11 MPDU and build the records list."""
+    """Assemble the 802.11 MPDU from the ask_wifi_frame dict and return
+    (full_frame, records, mpdu_bytes, fcs, fcs_computed)."""
     records = []
-
-    # ── Frame Control ──────────────────────────────────────────────────────────
     fc = d['fc_bytes']
+
     records += [
-        {"layer":2, "name":"FC Byte0 (Type+Subtype)",
-         "raw":fc[0:1],
-         "user_val":f"0x{d['fc_byte0']:02X}",
+        {"layer":2,"name":"FC Byte0 (Type+Subtype)",
+         "raw":fc[0:1], "user_val":f"0x{d['fc_byte0']:02X}",
          "note":f"Type={d['type_name']}({d['type_bits']:02b})  Sub={d['subtype_name']}(0x{d['subtype_val']:02X})"},
-        {"layer":2, "name":"FC Byte1 (Flags)",
-         "raw":fc[1:2],
-         "user_val":f"0x{d['fc_byte1']:02X}",
+        {"layer":2,"name":"FC Byte1 (Flags)",
+         "raw":fc[1:2], "user_val":f"0x{d['fc_byte1']:02X}",
          "note":(f"ToDS={d['to_ds']} FromDS={d['from_ds']} MoreFrag={d['more_frag']} "
                  f"Retry={d['retry']} PwrMgmt={d['pwr_mgmt']} MoreData={d['more_data']} "
                  f"Protect={d['protected']} HTC={d['htc_order']}")},
-        {"layer":2, "name":"Duration / NAV ID",
-         "raw":d['dur_bytes'],
-         "user_val":str(d['dur_val']),
+        {"layer":2,"name":"Duration / NAV ID",
+         "raw":d['dur_bytes'], "user_val":str(d['dur_val']),
          "note":"µs  Network Allocation Vector"},
     ]
 
-    # ── Address fields ─────────────────────────────────────────────────────────
     ds_role = {(0,0):("Destination","Source","BSSID",None),
                (1,0):("BSSID","Source STA","Dest STA",None),
                (0,1):("Destination","BSSID","Source",None),
@@ -3238,75 +4106,62 @@ def build_wifi(d):
     if d['addr3']:
         records.append({"layer":2,"name":f"Addr3 ({roles[2]})",
                         "raw":mac_b(d['addr3']),"user_val":d['addr3'],"note":""})
-    # ── Sequence Control ───────────────────────────────────────────────────────
     if d['seq_ctrl_bytes']:
         sc_val = struct.unpack("<H", d['seq_ctrl_bytes'])[0]
-        seq_n = sc_val >> 4; frag_n = sc_val & 0xF
         records.append({"layer":2,"name":"Sequence Control",
                         "raw":d['seq_ctrl_bytes'],
-                        "user_val":f"SeqNum={seq_n} FragNum={frag_n}",
+                        "user_val":f"SeqNum={sc_val>>4} FragNum={sc_val&0xF}",
                         "note":f"0x{sc_val:04X}  (LE on air)"})
-    # ── Addr4 ──────────────────────────────────────────────────────────────────
     if d['addr4']:
         records.append({"layer":2,"name":f"Addr4 ({roles[3]})",
                         "raw":mac_b(d['addr4']),"user_val":d['addr4'],"note":"WDS/Mesh SA"})
-    # ── QoS Control ───────────────────────────────────────────────────────────
     if d['qos_bytes']:
-        qos_lo = d['qos_bytes'][0]
-        tid_v  = qos_lo & 0xF
-        eosp_v = (qos_lo>>4) & 1
-        ap_v   = (qos_lo>>5) & 3
+        qlo = d['qos_bytes'][0]
         records.append({"layer":2,"name":"QoS Control",
-                        "raw":d['qos_bytes'],
-                        "user_val":f"0x{d['qos_bytes'].hex()}",
-                        "note":(f"TID={tid_v}({WIFI_TID_NAMES.get(tid_v,'')})  "
-                                f"EOSP={eosp_v}  AckPol={WIFI_ACK_POLICY[ap_v]}")})
-    # ── HT Control ─────────────────────────────────────────────────────────────
+                        "raw":d['qos_bytes'],"user_val":f"0x{d['qos_bytes'].hex()}",
+                        "note":(f"TID={qlo&0xF}({WIFI_TID_NAMES.get(qlo&0xF,'')})  "
+                                f"EOSP={(qlo>>4)&1}  AckPol={WIFI_ACK_POLICY[(qlo>>5)&3]}")})
     if d['htc_bytes']:
         records.append({"layer":2,"name":"HT Control",
-                        "raw":d['htc_bytes'],"user_val":d['htc_bytes'].hex(),"note":"802.11n/ac HTC field"})
+                        "raw":d['htc_bytes'],"user_val":d['htc_bytes'].hex(),"note":"802.11n/ac HTC"})
 
-    # ── Frame Body ─────────────────────────────────────────────────────────────
     fb = d['frame_body']
     if fb:
-        # If LLC/SNAP present, split it out for clarity
         if fb[:3] == bytes.fromhex("aaaa03"):
-            records.append({"layer":2,"name":"LLC DSAP+SSAP+Control",
-                            "raw":fb[0:3],"user_val":"AA AA 03","note":"SNAP header"})
-            records.append({"layer":2,"name":"SNAP OUI",
-                            "raw":fb[3:6],"user_val":fb[3:6].hex(),"note":"000000=Ethernet-bridged"})
-            records.append({"layer":2,"name":"SNAP EtherType",
-                            "raw":fb[6:8],"user_val":fb[6:8].hex(),"note":"Protocol identifier"})
+            records += [
+                {"layer":2,"name":"LLC DSAP+SSAP+Control","raw":fb[0:3],
+                 "user_val":"AA AA 03","note":"SNAP header"},
+                {"layer":2,"name":"SNAP OUI","raw":fb[3:6],
+                 "user_val":fb[3:6].hex(),"note":"000000=Ethernet-bridged"},
+                {"layer":2,"name":"SNAP EtherType","raw":fb[6:8],
+                 "user_val":fb[6:8].hex(),"note":"Protocol identifier"},
+            ]
             if len(fb) > 8:
                 records.append({"layer":3,"name":"Frame Body Payload",
-                                "raw":fb[8:],"user_val":f"{len(fb)-8}B","note":"IP/ARP/etc payload"})
+                                 "raw":fb[8:],"user_val":f"{len(fb)-8}B","note":"L3 payload"})
         elif d['ftype_ch'] == '1':
-            records.append({"layer":3,"name":"Management Frame Body (IEs)",
+            records.append({"layer":3,"name":"Management Body (IEs)",
                             "raw":fb,"user_val":f"{len(fb)}B","note":"Information Elements"})
         else:
             records.append({"layer":3,"name":"Frame Body",
                             "raw":fb,"user_val":f"{len(fb)}B","note":""})
 
-    # ── Assemble MPDU for FCS ─────────────────────────────────────────────────
+    # assemble MPDU
     mpdu = fc + d['dur_bytes']
     if d['addr1']: mpdu += mac_b(d['addr1'])
     if d['addr2']: mpdu += mac_b(d['addr2'])
     if d['addr3']: mpdu += mac_b(d['addr3'])
     if d['seq_ctrl_bytes']: mpdu += d['seq_ctrl_bytes']
     if d['addr4']: mpdu += mac_b(d['addr4'])
-    if d['qos_bytes']:  mpdu += d['qos_bytes']
-    if d['htc_bytes']:  mpdu += d['htc_bytes']
-    mpdu += fb
+    mpdu += d['qos_bytes'] + d['htc_bytes'] + fb
 
     section("FCS  —  CRC-32 over entire MPDU")
-    print(f"    CRC-32 will cover {len(mpdu)} bytes of MPDU (FC → end of Frame Body)")
+    print(f"    Covers {len(mpdu)} bytes (FC → end of Frame Body)")
     fcs_ch = input("    1=Auto-calculate  2=Custom  [1]: ").strip() or '1'
     if fcs_ch == '2':
-        fcs_hex = input("    Enter 8 hex chars: ").strip()
         try:
-            fcs = bytes.fromhex(fcs_hex)
-            if len(fcs)==4: pass
-            else: raise ValueError
+            fcs = bytes.fromhex(input("    Enter 8 hex chars: ").strip())
+            if len(fcs) != 4: raise ValueError
         except:
             fcs = wifi_crc32(mpdu); print("    -> invalid, using auto")
     else:
@@ -3316,25 +4171,33 @@ def build_wifi(d):
     records.append({"layer":0,"name":"FCS (CRC-32 over MPDU)",
                     "raw":fcs,"user_val":"auto/custom",
                     "note":f"0x{fcs.hex()}  ({len(mpdu)}B MPDU)"})
+    return mpdu + fcs, records, mpdu, fcs, fcs_computed
 
-    full_frame = mpdu + fcs
-    return full_frame, records, mpdu, fcs, fcs_computed
 
 def flow_wifi():
-    banner("WiFi FRAME  —  IEEE 802.11  (Wireless LAN MAC)",
-           "FC(2B) + Duration(2B) + Addr1..4(6B each) + SeqCtrl + QoS + HTC + Body + FCS(4B)")
+    banner("WiFi FRAME  —  IEEE 802.11  (PHY Preamble + MAC MPDU)",
+           "PHY: STF+LTF+SIG(≈SFD)  |  MAC: FC+Dur+Addr1-4+SeqCtrl+QoS+HTC+Body+FCS")
     print_wifi_education()
     d = ask_wifi_frame()
     full_frame, records, mpdu, fcs, fcs_computed = build_wifi(d)
 
-    print_frame_table(records)
+    # ── Now ask PHY preamble AFTER we know MPDU length ─────────────────────────
+    mpdu_len = len(mpdu) + 4  # include FCS in MPDU length for PLCP
+    phy_records = ask_wifi_phy(d['phy_ch'], mpdu_len)
 
-    # Verification
+    # Prepend PHY records to the record list
+    all_records = phy_records + records
+
+    print_frame_table(all_records)
     fcs_ok = (fcs == fcs_computed)
     verify_report([
         ("802.11 FCS (CRC-32 MPDU)", fcs.hex(), fcs_computed.hex(), fcs_ok),
     ])
-    print_encapsulation(records, full_frame)
+
+    # For encapsulation, build phy_bytes to prepend
+    phy_bytes = b''.join(r['raw'] for r in phy_records)
+    full_with_phy = phy_bytes + full_frame
+    print_encapsulation(all_records, full_with_phy)
 
 
 L3_ETH_MENU = """
@@ -3370,8 +4233,9 @@ MAIN_MENU = """
 ║   ║  ARP | ICMP | TCP | UDP | STP | DTP | PAgP | LACP                         ║
 ║   ║  Pause(802.3x) | PFC(802.1Qbb) | LLDP(802.1AB) | VLAN(802.1Q) | Jumbo    ║
 ╠═══╬════════════════════════════════════════════════════════════════════════════╣
-║ 2 ║ Serial / WAN  →  choose L2 protocol + optional L3/L4 payload              ║
-║   ║  PPP | HDLC | SLIP | Modbus RTU | ATM AAL5 | Cisco HDLC | KISS            ║
+║ 2 ║ Serial / WAN  →  choose L2 protocol (11 options)                          ║
+║   ║  Raw | SLIP | PPP | HDLC-basic | HDLC-Full(I/S/U) | KISS | Modbus        ║
+║   ║  HDLC+BitStuff | ATM AAL5 | Cisco HDLC | COBS                             ║
 ╠═══╬════════════════════════════════════════════════════════════════════════════╣
 ║ 3 ║ WiFi / 802.11  →  choose frame type (Management / Control / Data)         ║
 ║   ║  Beacon | Probe | Auth | Assoc | RTS | CTS | ACK | Data | QoS | Null      ║
