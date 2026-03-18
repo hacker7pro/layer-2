@@ -1,20 +1,39 @@
 """
-Network Frame Builder
-Layered input flow:  L1 (Physical) -> L2 (Data Link) -> L3 (Network) -> L4 (Transport/Control)
-Every field is labelled with its layer in the final output table.
+Network Frame Builder  —  Complete Protocol Suite
+==================================================
+Layer flow:  L1-PHY → L2-DL → L3-NET → L4-CTRL → TRAILER
+
+Technologies
+────────────
+ 1  Ethernet/802.3 : ARP · IPv4+ICMP/TCP/UDP · STP/RSTP · DTP · PAgP · LACP
+                     Pause(802.3x) · PFC(802.1Qbb) · LLDP(802.1AB)
+                     VLAN(802.1Q+QinQ) · Jumbo
+ 2  Serial/WAN     : Raw · SLIP · PPP · Modbus RTU · ATM AAL5 · Cisco HDLC
+                     KISS · COBS · HDLC+BitStuff
+                     HDLC Full (I-frame · S-frame · U-frame)
+ 3  WiFi/802.11    : Mgmt(Beacon/Probe/Auth/Assoc/Action)
+                     Ctrl(RTS/CTS/ACK/BlockAck/PSPoll)
+                     Data(Data/Null/QoS-Data/QoS-Null)
+                     PHY: DSSS(b) · OFDM(a/g) · HT(n) · VHT(ac) · HE(ax)
+ 4  Standalone IPv4: Full header · Options(NOP/RR/TS/custom)
+                     Checksum: auto/custom/force-zero
+                     L4: ICMP · TCP · UDP · Raw · Empty
+
+Output per build
+────────────────
+  Field table  ·  Encapsulation diagram  ·  Annotated hex dump
+  Final hex (no gaps)  ·  Checksum verification (PASS/FAIL)
+  Every prompt: ┆ what the field does  ┆ valid values  ┆ effect of wrong value
 """
 import struct, zlib, socket
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  CONSTANTS & FORMATTING
-# ═══════════════════════════════════════════════════════════════════════════════
-
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 1 — CONSTANTS  (widths, tags, lookup tables, menus)
+# ══════════════════════════════════════════════════════════════════════════════
 W   = 118           # total print width
 SEP = "═" * W
 DIV = "─" * W
 HDR = "─" * W
-
-# Layer colour tags used in the field table
 LAYER_TAG = {
     1: "[L1-PHY ]",
     2: "[L2-DL  ]",
@@ -23,10 +42,227 @@ LAYER_TAG = {
     0: "[TRAILER]",
 }
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  UTILITIES
-# ═══════════════════════════════════════════════════════════════════════════════
+# ──────────────────────────────────────────────────────────────────────────────
+#  Protocol lookup tables
+# ──────────────────────────────────────────────────────────────────────────────
+L3_PROTO_NAMES = {1:"ICMP", 6:"TCP", 17:"UDP", 41:"IPv6", 89:"OSPF", 47:"GRE"}
+ICMP_TABLE = {
+    0:  ("Echo Reply",              {0:"Echo reply"}),
+    3:  ("Destination Unreachable", {
+            0:"Net unreachable",         1:"Host unreachable",
+            2:"Protocol unreachable",    3:"Port unreachable",
+            4:"Fragmentation needed/DF", 5:"Source route failed",
+            6:"Dest network unknown",    7:"Dest host unknown",
+            9:"Net admin prohibited",   10:"Host admin prohibited",
+           13:"Comm admin prohibited"}),
+    4:  ("Source Quench",           {0:"Source quench (deprecated)"}),
+    5:  ("Redirect",                {0:"Redirect network",1:"Redirect host",
+                                     2:"Redirect TOS+net",3:"Redirect TOS+host"}),
+    8:  ("Echo Request",            {0:"Echo request"}),
+    9:  ("Router Advertisement",    {0:"Normal advertisement"}),
+   10:  ("Router Solicitation",     {0:"Router solicitation"}),
+   11:  ("Time Exceeded",           {0:"TTL exceeded in transit",
+                                     1:"Fragment reassembly exceeded"}),
+   12:  ("Parameter Problem",       {0:"Pointer error",1:"Missing option",2:"Bad length"}),
+   13:  ("Timestamp Request",       {0:"Timestamp request"}),
+   14:  ("Timestamp Reply",         {0:"Timestamp reply"}),
+   17:  ("Address Mask Request",    {0:"Address mask request"}),
+   18:  ("Address Mask Reply",      {0:"Address mask reply"}),
+   30:  ("Traceroute",              {0:"Information (deprecated)"}),
+}
+ICMP_ECHO_TYPES = {0, 8, 13, 14, 17, 18}
+WELL_KNOWN_PORTS = {
+    20: "FTP-Data",     21: "FTP-Control",  22: "SSH",
+    23: "Telnet",       25: "SMTP",         53: "DNS",
+    67: "DHCP-Server",  68: "DHCP-Client",  69: "TFTP",
+    80: "HTTP",         110:"POP3",         119:"NNTP",
+    123:"NTP",          143:"IMAP",         161:"SNMP",
+    162:"SNMP-Trap",    179:"BGP",          194:"IRC",
+    389:"LDAP",         443:"HTTPS",        445:"SMB",
+    514:"Syslog",       520:"RIP",          587:"SMTP-TLS",
+    636:"LDAPS",        993:"IMAPS",        995:"POP3S",
+   1194:"OpenVPN",     1433:"MSSQL",       1521:"Oracle",
+   3306:"MySQL",       3389:"RDP",         5060:"SIP",
+   5432:"PostgreSQL",  5900:"VNC",         6379:"Redis",
+   8080:"HTTP-Alt",    8443:"HTTPS-Alt",   9200:"Elasticsearch",
+   27017:"MongoDB",
+}
+TCP_FLAGS = {
+    'FIN':0x01, 'SYN':0x02, 'RST':0x04,
+    'PSH':0x08, 'ACK':0x10, 'URG':0x20,
+    'ECE':0x40, 'CWR':0x80,
+}
+TCP_STEPS = {
+    '1': ("SYN",     0x02, "Client → Server  (open connection request)"),
+    '2': ("SYN-ACK", 0x12, "Server → Client  (acknowledge + own SYN)"),
+    '3': ("ACK",     0x10, "Client → Server  (acknowledge server SYN)"),
+    '4': ("PSH+ACK", 0x18, "Data segment with push flag"),
+    '5': ("FIN+ACK", 0x11, "Initiating graceful close"),
+    '6': ("RST",     0x04, "Abrupt connection reset"),
+}
+UDP_COMMON = {
+    ('53','53'):   "DNS Query/Response",
+    ('67','68'):   "DHCP",
+    ('123','123'): "NTP",
+    ('161','162'): "SNMP",
+    ('514','514'): "Syslog",
+    ('520','520'): "RIP",
+    ('69','69'):   "TFTP",
+    ('5060','5060'):"SIP",
+}
+HDLC_U_SUBTYPES = {
+    # key: (M4,M3,M2,M1,M0, mnemonic, C/R, description)
+    '1' : (0,0,0,0,0, "UI",    "C/R", "Unnumbered Information — datagram (no ACK)"),
+    '2' : (0,1,1,0,0, "SABM",  "C",   "Set Async Balanced Mode — initiate connection (mod-8)"),
+    '3' : (0,1,1,0,1, "SABME", "C",   "SABM Extended — initiate connection (mod-128)"),
+    '4' : (0,1,0,0,0, "DISC",  "C",   "Disconnect — request to terminate link"),
+    '5' : (0,0,0,1,1, "DM",    "R",   "Disconnect Mode — link not established"),
+    '6' : (0,0,1,0,1, "UA",    "R",   "Unnumbered Acknowledgment — accept SABM/DISC"),
+    '7' : (1,0,0,0,1, "FRMR",  "R",   "Frame Reject — invalid frame received"),
+    '8' : (1,1,0,0,0, "XID",   "C/R", "Exchange Identification — parameter negotiation"),
+    '9' : (1,1,1,0,0, "TEST",  "C/R", "Test — link integrity test"),
+    '10': (0,0,1,0,0, "UP",    "C",   "Unnumbered Poll — poll without sequence numbers"),
+}
+HDLC_S_SUBTYPES = {
+    '1': (0,0, "RR",   "Receive Ready    — ACK, ready for more"),
+    '2': (0,1, "REJ",  "Reject           — go-back-N, retransmit from N(R)"),
+    '3': (1,0, "RNR",  "Receive Not Ready— busy, stop sending"),
+    '4': (1,1, "SREJ", "Selective Reject — retransmit only frame N(R)"),
+}
+JUMBO_PRESETS = {
+    '1': (1500,  "Standard Ethernet (baseline)"),
+    '2': (1600,  "Baby Giant  (MPLS +1 label)"),
+    '3': (4470,  "FDDI over Ethernet bridging"),
+    '4': (9000,  "Typical Jumbo (NFS/iSCSI/Ceph/HPC)"),
+    '5': (9216,  "Extended Jumbo (storage switches)"),
+    '6': (16110, "Super Jumbo (InfiniBand bridging)"),
+    '7': (0,     "Custom"),
+}
+WIFI_FRAME_TYPES = {
+    '1': (0b00, "Management"),
+    '2': (0b01, "Control"),
+    '3': (0b10, "Data"),
+}
+WIFI_MGMT_SUBTYPES = {
+    '0' : (0x00, "Association Request",    "STA→AP  join BSS"),
+    '1' : (0x01, "Association Response",   "AP→STA  grant/deny join"),
+    '2' : (0x02, "Reassociation Request",  "STA→AP  roaming"),
+    '3' : (0x03, "Reassociation Response", "AP→STA  roam reply"),
+    '4' : (0x04, "Probe Request",          "STA→all scan for APs"),
+    '5' : (0x05, "Probe Response",         "AP→STA  scan reply"),
+    '8' : (0x08, "Beacon",                 "AP→all  periodic BSS announce"),
+    '10': (0x0A, "Disassociation",         "either  end association"),
+    '11': (0x0B, "Authentication",         "either  auth exchange"),
+    '12': (0x0C, "Deauthentication",       "either  end auth"),
+    '13': (0x0D, "Action",                 "either  BA/RM/spectrum action"),
+}
+WIFI_CTRL_SUBTYPES = {
+    '8' : (0x08, "Block Ack Request", "Request aggregated ACK"),
+    '9' : (0x09, "Block Ack",        "Aggregated ACK bitmap"),
+    '10': (0x0A, "PS-Poll",          "Power-save poll for buffered data"),
+    '11': (0x0B, "RTS",              "Request To Send (CSMA/CA)"),
+    '12': (0x0C, "CTS",              "Clear To Send (RTS response)"),
+    '13': (0x0D, "ACK",              "Acknowledge received frame"),
+    '14': (0x0E, "CF-End",           "End contention-free period"),
+}
+WIFI_DATA_SUBTYPES = {
+    '0' : (0x00, "Data",     False, "Basic data, no QoS field"),
+    '4' : (0x04, "Null",     False, "No payload, power-mgmt signal"),
+    '8' : (0x08, "QoS Data", True,  "Data + QoS Control (WMM/WME)"),
+    '12': (0x0C, "QoS Null", True,  "No payload + QoS, power-mgmt"),
+}
+WIFI_ACK_POLICY = {0:"Normal ACK", 1:"No ACK", 2:"No Explicit ACK", 3:"Block ACK"}
+WIFI_TID_NAMES  = {
+    0:"BE(Best Effort)", 1:"BK(Background)", 2:"BK(Background)",
+    3:"BE(Best Effort)", 4:"VI(Video)",       5:"VI(Video)",
+    6:"VO(Voice)",       7:"VO(Voice)",
+}
+WIFI_PHY_MODES = {
+    '1': "802.11b  DSSS/CCK  (2.4 GHz, 1/2/5.5/11 Mbps)",
+    '2': "802.11a  OFDM      (5 GHz,   6–54 Mbps)",
+    '3': "802.11g  ERP-OFDM  (2.4 GHz, 6–54 Mbps)",
+    '4': "802.11n  HT-Mixed  (2.4/5 GHz, up to 600 Mbps)",
+    '5': "802.11ac VHT       (5 GHz,   up to 6.9 Gbps)",
+    '6': "802.11ax HE        (2.4/5/6 GHz, up to 9.6 Gbps)",
+    '7': "No PHY preamble   (MAC MPDU only — as seen in Wireshark pcap)",
+}
+DSSS_RATES = {
+    '1': (0x0A, "1 Mbps  DBPSK"),
+    '2': (0x14, "2 Mbps  DQPSK"),
+    '3': (0x37, "5.5 Mbps CCK"),
+    '4': (0x6E, "11 Mbps CCK"),
+}
+OFDM_RATE_BITS = {
+    '6' : (0b1011, "6 Mbps  BPSK  R=1/2"),
+    '9' : (0b1111, "9 Mbps  BPSK  R=3/4"),
+    '12': (0b1010, "12 Mbps QPSK  R=1/2"),
+    '18': (0b1110, "18 Mbps QPSK  R=3/4"),
+    '24': (0b1001, "24 Mbps 16-QAM R=1/2"),
+    '36': (0b1101, "36 Mbps 16-QAM R=3/4"),
+    '48': (0b1000, "48 Mbps 64-QAM R=2/3"),
+    '54': (0b1100, "54 Mbps 64-QAM R=3/4"),
+}
+IP_PROTO_NAMES = {
+    0:  ("HOPOPT",  "IPv6 Hop-by-Hop Options"),
+    1:  ("ICMP",    "Internet Control Message Protocol"),
+    2:  ("IGMP",    "Internet Group Management Protocol"),
+    4:  ("IP-IP",   "IP-in-IP Encapsulation"),
+    6:  ("TCP",     "Transmission Control Protocol"),
+    17: ("UDP",     "User Datagram Protocol"),
+    41: ("IPv6",    "IPv6 Encapsulation"),
+    47: ("GRE",     "Generic Routing Encapsulation"),
+    50: ("ESP",     "Encapsulating Security Payload"),
+    51: ("AH",      "Authentication Header"),
+    58: ("ICMPv6",  "ICMP for IPv6"),
+    89: ("OSPF",    "Open Shortest Path First"),
+    103:("PIM",     "Protocol Independent Multicast"),
+    112:("VRRP",    "Virtual Router Redundancy Protocol"),
+    132:("SCTP",    "Stream Control Transmission Protocol"),
+}
+DSCP_TABLE = {
+    0:  ("CS0 / BE",  "Best Effort — default"),
+    8:  ("CS1",       "Scavenger / low-priority"),
+    10: ("AF11",      "Assured Forwarding low drop"),
+    12: ("AF12",      "Assured Forwarding med drop"),
+    14: ("AF13",      "Assured Forwarding high drop"),
+    16: ("CS2",       "OAM"),
+    18: ("AF21",      "AF class 2 low drop"),
+    20: ("AF22",      "AF class 2 med drop"),
+    22: ("AF23",      "AF class 2 high drop"),
+    24: ("CS3",       "Broadcast video"),
+    26: ("AF31",      "AF class 3 low drop"),
+    28: ("AF32",      "AF class 3 med drop"),
+    30: ("AF33",      "AF class 3 high drop"),
+    32: ("CS4",       "Real-time interactive"),
+    34: ("AF41",      "AF class 4 low drop"),
+    36: ("AF42",      "AF class 4 med drop"),
+    38: ("AF43",      "AF class 4 high drop"),
+    40: ("CS5",       "Signalling"),
+    46: ("EF",        "Expedited Forwarding — VoIP"),
+    48: ("CS6",       "Network control (routing)"),
+    56: ("CS7",       "Reserved"),
+}
+SERIAL_TYPES = {
+    '1' : "Raw",
+    '2' : "SLIP",
+    '3' : "PPP",
+    '4' : "HDLC (basic — address+control+payload+FCS-16)",
+    '5' : "COBS (placeholder)",
+    '6' : "KISS",
+    '7' : "Modbus RTU",
+    '8' : "HDLC + Bit-Stuffing",
+    '9' : "ATM AAL5",
+    '10': "Cisco HDLC",
+    '11': "HDLC Full (I-frame / S-frame / U-frame — all 3 types)",
+}
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 2 — CORE UTILITIES
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  Input helpers
+# ──────────────────────────────────────────────────────────────────────────────
 def get(prompt, default="", help=""):
     """Simple prompted input with default. Optional help shown before prompt."""
     if help:
@@ -34,7 +270,6 @@ def get(prompt, default="", help=""):
             print(f"      ┆ {line}")
     val = input(f"    {prompt} [{default}]: ").strip()
     return val if val else default
-
 def get_hex(prompt, default_hex, byte_len=None, help=""):
     """Prompt for hex bytes, validate length. Optional help shown before prompt."""
     if help:
@@ -55,15 +290,15 @@ def get_hex(prompt, default_hex, byte_len=None, help=""):
         except ValueError:
             print("      -> invalid hex, try again")
 
+# ──────────────────────────────────────────────────────────────────────────────
+#  Address and byte converters
+# ──────────────────────────────────────────────────────────────────────────────
 def mac_b(s):
     c = s.replace(":","").replace("-","").replace(" ","").upper()
     if len(c) != 12: raise ValueError(f"bad MAC: {s!r}")
     return bytes.fromhex(c)
-
 def mac_s(b): return ':'.join(f'{x:02x}' for x in b)
-
 def ip_b(s): return socket.inet_aton(s)
-
 def hpad(s, n):
     c = s.lower().replace("0x","").replace(" ","")
     if len(c) % 2: c = "0"+c
@@ -72,10 +307,12 @@ def hpad(s, n):
     elif len(b) < n: b = b'\x00'*(n-len(b)) + b
     return b
 
+# ──────────────────────────────────────────────────────────────────────────────
+#  Checksum / CRC engines
+# ──────────────────────────────────────────────────────────────────────────────
 def crc32_eth(data):
     """Ethernet FCS: CRC-32 stored little-endian."""
     return (zlib.crc32(data) & 0xFFFFFFFF).to_bytes(4, 'little')
-
 def crc16_ccitt(data):
     crc = 0xFFFF
     for byte in data:
@@ -83,7 +320,17 @@ def crc16_ccitt(data):
         for _ in range(8):
             crc = (crc >> 1) ^ 0x8408 if crc & 1 else crc >> 1
     return crc ^ 0xFFFF
-
+def crc16_ibm(data: bytes) -> int:
+    """CRC-16/IBM used in DSSS PLCP header."""
+    crc = 0xFFFF
+    for byte in data:
+        crc ^= byte
+        for _ in range(8):
+            if crc & 1:
+                crc = (crc >> 1) ^ 0x8005
+            else:
+                crc >>= 1
+    return crc
 def inet_cksum(data):
     """RFC 1071 one's-complement checksum."""
     if len(data) % 2: data += b'\x00'
@@ -91,6 +338,9 @@ def inet_cksum(data):
     while s >> 16: s = (s & 0xFFFF) + (s >> 16)
     return (~s) & 0xFFFF
 
+# ──────────────────────────────────────────────────────────────────────────────
+#  Serial framing helpers
+# ──────────────────────────────────────────────────────────────────────────────
 def byte_escape(data):
     out = bytearray()
     for b in data:
@@ -98,7 +348,6 @@ def byte_escape(data):
         elif b == 0x7D: out += b'\x7D\x5D'
         else: out.append(b)
     return bytes(out)
-
 def bit_stuff(data):
     bits=[]; ones=0
     for byte in data:
@@ -115,7 +364,6 @@ def bit_stuff(data):
             byt=(byt<<1)|(bits[i+j] if i+j<len(bits) else 0)
         res.append(byt)
     return bytes(res)
-
 def slip_enc(data):
     out=bytearray(b'\xC0')
     for b in data:
@@ -124,20 +372,17 @@ def slip_enc(data):
         else: out.append(b)
     return bytes(out+b'\xC0')
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  PRINT ENGINE
-# ═══════════════════════════════════════════════════════════════════════════════
-
+# ──────────────────────────────────────────────────────────────────────────────
+#  Display / output engine
+# ──────────────────────────────────────────────────────────────────────────────
 def banner(title, subtitle=""):
     print(f"\n{SEP}")
     print(f"  {title}")
     if subtitle: print(f"  {subtitle}")
     print(SEP)
-
 def section(title):
     print(f"\n  {'▌ '+title}")
     print(f"  {DIV}")
-
 def print_frame_table(records):
     """
     records: list of dicts with keys:
@@ -206,7 +451,6 @@ def print_frame_table(records):
     print(f"  {DIV}")
     print(f"  {'Total':>5}: {offset} bytes  /  {offset*8} bits")
     print(SEP)
-
 def print_encapsulation(records, frame):
     """
     Print three things:
@@ -404,7 +648,6 @@ def print_encapsulation(records, frame):
     print(f"  Total bytes : {total_bytes}")
     print(f"  Total bits  : {total_bytes * 8}")
     print(SEP + "\n")
-
 def ask_fcs_eth(fcs_input_bytes):
     """Ask user for Ethernet FCS preference, return (fcs_bytes, fcs_note)."""
     print(f"\n  ▌ ETHERNET FCS  (CRC-32 over {len(fcs_input_bytes)} bytes: Dst MAC → end of payload)")
@@ -419,7 +662,6 @@ def ask_fcs_eth(fcs_input_bytes):
         print("    -> invalid, using auto")
     fcs = crc32_eth(fcs_input_bytes)
     return fcs, f"CRC-32 auto over {len(fcs_input_bytes)}B"
-
 def ask_serial_crc(crc_input_bytes, crc_type, byte_order='big'):
     """Ask user for serial CRC preference."""
     print(f"\n  ▌ {crc_type}  (covers {len(crc_input_bytes)} bytes)")
@@ -435,11 +677,19 @@ def ask_serial_crc(crc_input_bytes, crc_type, byte_order='big'):
         except: pass
         print("    -> invalid, using auto")
     return fcs_auto, f"{crc_type} auto over {len(crc_input_bytes)}B"
+def verify_report(checks):
+    """checks: list of (name, stored_val, verify_fn, pass_cond, pass_str)"""
+    print(f"\n  {'─'*80}")
+    print(f"  CHECKSUM / CRC VERIFICATION")
+    print(f"  {'─'*80}")
+    for name, stored, result, passed in checks:
+        status = "PASS ✓" if passed else "FAIL ✗"
+        print(f"  {name:<30}  stored={stored}   verify={result}   {status}")
+    print(f"  {'─'*80}")
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  LAYER 1  –  PHYSICAL
-# ═══════════════════════════════════════════════════════════════════════════════
-
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 3 — LAYER 1  (Physical)
+# ══════════════════════════════════════════════════════════════════════════════
 def ask_layer1_eth():
     """Preamble + SFD for Ethernet."""
     section("LAYER 1 — Physical (Preamble + SFD)")
@@ -454,14 +704,246 @@ def ask_layer1_eth():
              "Changing this means no Ethernet NIC will recognise the frame.")
     return preamble, sfd
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  LAYER 2  –  DATA LINK
-# ═══════════════════════════════════════════════════════════════════════════════
+# ──────────────────────────────────────────────────────────────────────────────
+#  WiFi PHY preamble builders
+# ──────────────────────────────────────────────────────────────────────────────
+def wifi_crc32(data: bytes) -> bytes:
+    """802.11 FCS = CRC-32 same polynomial as Ethernet, little-endian."""
+    return (zlib.crc32(data) & 0xFFFFFFFF).to_bytes(4, 'little')
+def build_dsss_plcp(mpdu_len_bytes, rate_byte, short_preamble=False):
+    """
+    Build 802.11b DSSS PLCP preamble.
+    Returns (plcp_bytes, records).
+    Long preamble:  SYNC(128b=16B) + SFD(2B) + SIGNAL(1B) + SERVICE(1B) + LENGTH(2B) + CRC(2B) = 24B
+    Short preamble: SYNC(56b=7B)  + SFD(2B) + SIGNAL(1B) + SERVICE(1B) + LENGTH(2B) + CRC(2B) = 15B
+    LENGTH field = MPDU duration in µs.
+    """
+    if short_preamble:
+        sync    = bytes([0xFF] * 7)
+        sfd_val = 0x05CF
+        sync_note = "56-bit SYNC (7×0xFF) — short preamble scrambled 1s"
+        sfd_note  = "0x05CF — 802.11b SHORT preamble SFD (frame boundary)"
+        mode_note = "Short preamble (96µs total PLCP)"
+    else:
+        sync    = bytes([0xFF] * 16)
+        sfd_val = 0xF3A0
+        sync_note = "128-bit SYNC (16×0xFF) — long preamble scrambled 1s"
+        sfd_note  = "0xF3A0 — 802.11b LONG preamble SFD (frame boundary)"
+        mode_note = "Long preamble (192µs total PLCP)"
+
+    sfd_b    = struct.pack("<H", sfd_val)
+    signal_b = bytes([rate_byte])
+    service_b= bytes([0x00])
+    # LENGTH = MPDU duration in µs at the signalled rate
+    # For simplicity, store MPDU byte length directly (standard uses µs but
+    # most implementations interpret length bytes at the signalled rate)
+    length_b = struct.pack("<H", mpdu_len_bytes & 0xFFFF)
+    crc_input = bytes([rate_byte, 0x00]) + length_b
+    crc_val  = crc16_ibm(crc_input)
+    crc_b    = struct.pack("<H", crc_val)
+
+    plcp = sync + sfd_b + signal_b + service_b + length_b + crc_b
+    records = [
+        {"layer":1, "name":"DSSS SYNC (preamble)",
+         "raw": sync,     "user_val": f"0xFF×{len(sync)}",
+         "note": sync_note},
+        {"layer":1, "name":"DSSS SFD  ← FRAME BOUNDARY",
+         "raw": sfd_b,    "user_val": f"0x{sfd_val:04X}",
+         "note": sfd_note},
+        {"layer":1, "name":"DSSS SIGNAL (rate)",
+         "raw": signal_b, "user_val": f"0x{rate_byte:02X}",
+         "note": f"Rate encoding — see SIGNAL table"},
+        {"layer":1, "name":"DSSS SERVICE",
+         "raw": service_b,"user_val": "0x00",
+         "note": "Reserved in long preamble"},
+        {"layer":1, "name":"DSSS LENGTH (MPDU µs/B)",
+         "raw": length_b, "user_val": str(mpdu_len_bytes),
+         "note": "MPDU length (bytes encoded as µs field)"},
+        {"layer":1, "name":"DSSS PLCP CRC-16",
+         "raw": crc_b,    "user_val": f"0x{crc_val:04X}",
+         "note": f"CRC-16/IBM over SIGNAL+SERVICE+LENGTH  {mode_note}"},
+    ]
+    return plcp, records
+def build_ofdm_lsig(mpdu_len_bytes, rate_bits, rate_label):
+    """
+    Build 802.11a/g L-SIG field (3 bytes / 24 bits).
+    Bits [3:0]=RATE  [4]=Reserved  [16:5]=LENGTH  [17]=Parity  [23:18]=Tail
+    Returned as 3 bytes (raw bit-packed, transmitted LSB-first in OFDM symbol).
+    """
+    length_field = mpdu_len_bytes & 0xFFF
+    word = (rate_bits & 0xF) | (0 << 4) | (length_field << 5)
+    # parity over bits 0..16
+    parity = bin(word & 0x1FFFF).count('1') % 2
+    word |= (parity << 17)
+    # tail bits [23:18] = 000000 (already 0)
+    lsig_bytes = struct.pack("<I", word)[:3]
+    records = [
+        {"layer":1, "name":"L-STF  (Short Training Field)",
+         "raw": bytes(10), "user_val": "8µs OFDM symbols",
+         "note": "10 symbols × 0.8µs — AGC + coarse freq sync  (not byte-representable)"},
+        {"layer":1, "name":"L-LTF  (Long Training Field)",
+         "raw": bytes(8),  "user_val": "8µs OFDM symbols",
+         "note": "GI(1.6µs) + 2×LTF(3.2µs each) — fine channel estimation"},
+        {"layer":1, "name":"L-SIG  ← FRAME BOUNDARY",
+         "raw": lsig_bytes,"user_val": f"RATE={rate_bits:04b} LEN={mpdu_len_bytes}",
+         "note": (f"{rate_label}  LEN={mpdu_len_bytes}B  Par={parity}  "
+                  f"4µs OFDM symbol — marks MPDU start  [closest to SFD]")},
+    ]
+    return lsig_bytes, records  # we return only L-SIG bytes (STF/LTF are analog)
+def build_ht_sig(mpdu_len_bytes, mcs, bw40, sgi, stbc, ldpc, rate_label):
+    """
+    Build 802.11n HT-SIG (2 × 24-bit fields = 6 bytes).
+    HT-SIG1: MCS(7b)+BW(1b)+HT-LEN(16b)
+    HT-SIG2: Smoothing+NotSounding+Reserved+Aggregation+STBC+FEC+SGI+NumExtSS+CRC+Tail
+    """
+    ht_len = mpdu_len_bytes & 0xFFFF
+    sig1_word = (mcs & 0x7F) | ((1 if bw40 else 0) << 7) | (ht_len << 8)
+    sig1 = struct.pack("<I", sig1_word)[:3]
+
+    smooth=1; not_snd=1; aggr=0
+    stbc_b=(1 if stbc else 0); fec=(1 if ldpc else 0); sgi_b=(1 if sgi else 0)
+    sig2_lo = (smooth | (not_snd<<1) | (0<<2) | (aggr<<3) |
+               (stbc_b<<4) | (fec<<5) | (sgi_b<<6) | (0<<7))
+    crc_input = sig1 + bytes([sig2_lo])
+    crc8 = 0xFF
+    for byte in crc_input:
+        for i in range(8):
+            bit = (byte >> i) & 1
+            fb  = ((crc8 >> 7) & 1) ^ bit
+            crc8= ((crc8 << 1) & 0xFF) | 0
+            if fb: crc8 ^= 0x07
+    sig2 = bytes([sig2_lo, crc8 & 0xFF, 0x00])
+
+    lsig_bytes, lsig_records = build_ofdm_lsig(mpdu_len_bytes, 0b1011, "6Mbps legacy")
+    records = lsig_records + [
+        {"layer":1, "name":"HT-SIG-1  (MCS+BW+Length)",
+         "raw": sig1, "user_val": f"MCS{mcs} BW={'40' if bw40 else '20'}MHz LEN={ht_len}",
+         "note": "8µs (2×4µs OFDM) — HT rate/length descriptor"},
+        {"layer":1, "name":"HT-SIG-2  ← HT FRAME BOUNDARY",
+         "raw": sig2, "user_val": f"SGI={int(sgi)} LDPC={int(ldpc)} STBC={int(stbc)}",
+         "note": "HT-SIG-2 + CRC8+Tail — marks HT MPDU start (≈SFD for 802.11n)"},
+        {"layer":1, "name":"HT-STF  (HT Short Training)",
+         "raw": bytes(4), "user_val": "4µs", "note": "MIMO AGC adjustment"},
+        {"layer":1, "name":"HT-LTF(s) (HT Long Training)",
+         "raw": bytes(4), "user_val": f"4µs×NSS", "note": "Per-stream channel estimation"},
+    ]
+    return sig1 + sig2, records
+def build_vht_sig(mpdu_len_bytes, mcs, nss, bw, sgi, ldpc):
+    """Build 802.11ac VHT-SIG-A (2×24b) summary."""
+    bw_map = {20:0, 40:1, 80:2, 160:3}
+    bw_bits = bw_map.get(bw, 0)
+    nss_b = (nss - 1) & 0x7
+    siga1 = struct.pack("<I", bw_bits | (0<<2) | (1<<3) | (nss_b<<13))[:3]
+    siga2 = struct.pack("<I", (mcs<<4) | (int(sgi)<<0) | (int(ldpc)<<2))[:3]
+    lsig_bytes, lsig_records = build_ofdm_lsig(mpdu_len_bytes, 0b1011, "6Mbps legacy")
+    records = lsig_records + [
+        {"layer":1, "name":"VHT-SIG-A1  (BW+NSS+STBC)",
+         "raw": siga1, "user_val": f"BW={bw}MHz NSS={nss}",
+         "note": "8µs — VHT rate/NSS/BW descriptor"},
+        {"layer":1, "name":"VHT-SIG-A2  ← VHT FRAME BOUNDARY",
+         "raw": siga2, "user_val": f"MCS{mcs} SGI={int(sgi)} LDPC={int(ldpc)}",
+         "note": "VHT-SIG-A2 — marks VHT MPDU start  (≈SFD for 802.11ac)"},
+        {"layer":1, "name":"VHT-STF",
+         "raw": bytes(4), "user_val": "4µs", "note": "MIMO AGC"},
+        {"layer":1, "name":"VHT-LTF(s)",
+         "raw": bytes(4), "user_val": f"4µs×{nss}", "note": "Per-stream channel est."},
+        {"layer":1, "name":"VHT-SIG-B  (length per user)",
+         "raw": bytes(3), "user_val": f"LEN={mpdu_len_bytes}", "note": "Per-user MPDU length"},
+    ]
+    return siga1 + siga2, records
+def build_he_sig(mpdu_len_bytes, mcs, nss, bw, gi, ldpc):
+    """Build 802.11ax HE-SIG-A summary."""
+    bw_map = {20:0, 40:1, 80:2, 160:3}
+    bw_bits = bw_map.get(bw, 0)
+    nss_b = (nss-1) & 0x7
+    hesa1 = struct.pack("<I", bw_bits | (0<<2) | (nss_b<<9))[:3]
+    hesa2 = struct.pack("<I", (mcs<<4) | (int(ldpc)<<3) | (gi & 0x3))[:3]
+    lsig_bytes, lsig_records = build_ofdm_lsig(mpdu_len_bytes, 0b1011, "6Mbps legacy")
+    gi_names = {0:"0.8µs(Normal)", 1:"1.6µs(Double)", 2:"3.2µs(Quad)"}
+    records = lsig_records + [
+        {"layer":1, "name":"RL-SIG  (Repeated L-SIG)",
+         "raw": lsig_bytes, "user_val": "repeat", "note": "Confirms HE frame to non-HE stations"},
+        {"layer":1, "name":"HE-SIG-A1  (BW+BSS-Color+NSS)",
+         "raw": hesa1, "user_val": f"BW={bw}MHz NSS={nss}",
+         "note": "8µs — HE BSS colour, UL/DL, NSS"},
+        {"layer":1, "name":"HE-SIG-A2  ← HE FRAME BOUNDARY",
+         "raw": hesa2, "user_val": f"MCS{mcs} GI={gi_names.get(gi,'?')} LDPC={int(ldpc)}",
+         "note": "HE-SIG-A2 — marks HE MPDU start  (≈SFD for 802.11ax)"},
+        {"layer":1, "name":"HE-STF",
+         "raw": bytes(4), "user_val": "4µs or 8µs", "note": "HE MIMO AGC"},
+        {"layer":1, "name":"HE-LTF(s)",
+         "raw": bytes(4), "user_val": f"4/8µs×{nss}", "note": "HE channel estimation"},
+    ]
+    return hesa1 + hesa2, records
+def ask_wifi_phy(phy_ch, mpdu_len):
+    """Ask PHY-specific parameters and return (phy_records)."""
+    phy_records = []
+
+    if phy_ch == '1':  # DSSS
+        section("802.11b DSSS PLCP HEADER")
+        print("    Long preamble (192µs) or Short preamble (96µs)?")
+        sp = get("Short preamble? (y/n)", "n").lower().startswith("y")
+        print("    SIGNAL (rate) byte:")
+        for k,(rb,rd) in DSSS_RATES.items():
+            print(f"      {k} = 0x{rb:02X}  {rd}")
+        rate_ch = get("Rate", "4")
+        rate_byte, rate_desc = DSSS_RATES.get(rate_ch, (0x6E, "11 Mbps CCK"))
+        print(f"    -> Rate: {rate_desc}")
+        _, phy_records = build_dsss_plcp(mpdu_len, rate_byte, sp)
+
+    elif phy_ch in ('2','3'):  # OFDM 802.11a/g
+        std = "802.11a (5GHz)" if phy_ch=='2' else "802.11g (2.4GHz)"
+        section(f"{std} OFDM L-SIG  (legacy preamble: L-STF + L-LTF + L-SIG)")
+        print("    L-SIG RATE field (MCS/rate code, 4 bits):")
+        for k,(rb,rd) in OFDM_RATE_BITS.items():
+            print(f"      {k:>2} Mbps = 0b{rb:04b}  {rd}")
+        rate_ch = get("Data rate (Mbps)", "54")
+        rate_bits, rate_label = OFDM_RATE_BITS.get(rate_ch, (0b1100, "54 Mbps"))
+        print(f"    -> {rate_label}")
+        print(f"    NOTE: L-STF (8µs) and L-LTF (8µs) are OFDM analog waveforms.")
+        print(f"    They are NOT byte-representable. Shown as placeholder bytes below.")
+        _, phy_records = build_ofdm_lsig(mpdu_len, rate_bits, rate_label)
+
+    elif phy_ch == '4':  # HT 802.11n
+        section("802.11n HT-MIXED PLCP  (L-STF + L-LTF + L-SIG + HT-SIG1 + HT-SIG2 + HT-STF + HT-LTF)")
+        print("    MCS index (0=BPSK 1/2, 7=64QAM 5/6, 8-15=2-stream ...)")
+        mcs  = int(get("MCS index (0-31)", "7")) & 0x1F
+        bw40 = get("40 MHz bandwidth? (y/n)", "n").lower().startswith("y")
+        sgi  = get("Short Guard Interval 400ns? (y/n)", "n").lower().startswith("y")
+        stbc = get("STBC? (y/n)", "n").lower().startswith("y")
+        ldpc = get("LDPC FEC? (y/n)", "n").lower().startswith("y")
+        rate_label = f"MCS{mcs} {'HT40' if bw40 else 'HT20'} {'SGI' if sgi else 'LGI'}"
+        _, phy_records = build_ht_sig(mpdu_len, mcs, bw40, sgi, stbc, ldpc, rate_label)
+
+    elif phy_ch == '5':  # VHT 802.11ac
+        section("802.11ac VHT PLCP  (L-STF+L-LTF+L-SIG+VHT-SIG-A+VHT-STF+VHT-LTF+VHT-SIG-B)")
+        mcs = int(get("MCS index (0-9)", "9")) & 0xF
+        nss = int(get("Number of Spatial Streams NSS (1-8)", "1"))
+        bw  = int(get("Bandwidth  20/40/80/160 MHz", "80"))
+        sgi = get("Short GI 400ns? (y/n)", "n").lower().startswith("y")
+        ldpc= get("LDPC FEC? (y/n)", "n").lower().startswith("y")
+        _, phy_records = build_vht_sig(mpdu_len, mcs, nss, bw, sgi, ldpc)
+
+    elif phy_ch == '6':  # HE 802.11ax
+        section("802.11ax HE PLCP  (L-STF+L-LTF+L-SIG+RL-SIG+HE-SIG-A+HE-STF+HE-LTF)")
+        mcs = int(get("MCS index (0-11)", "11")) & 0xF
+        nss = int(get("Number of Spatial Streams NSS (1-8)", "1"))
+        bw  = int(get("Bandwidth  20/40/80/160 MHz", "80"))
+        print("    Guard Interval:  0=0.8µs(Normal)  1=1.6µs  2=3.2µs")
+        gi  = int(get("GI (0/1/2)", "0")) & 0x3
+        ldpc= get("LDPC FEC? (y/n)", "n").lower().startswith("y")
+        _, phy_records = build_he_sig(mpdu_len, mcs, nss, bw, gi, ldpc)
+
+    # phy_ch == '7': no PHY, phy_records stays empty
+    return phy_records
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 4 — LAYER 2  (Data Link)
+# ══════════════════════════════════════════════════════════════════════════════
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  L2-A  Ethernet II / 802.3
+#  Ethernet MAC
 # ──────────────────────────────────────────────────────────────────────────────
-
 def ask_l2_ethernet(ethertype_hint="0800"):
     """Returns (dst_mac, src_mac, ethertype_bytes, llc_bytes, snap_bytes, variant_name)."""
     section("LAYER 2 — Ethernet / 802.3  (MAC Header)")
@@ -544,800 +1026,6 @@ def ask_l2_ethernet(ethertype_hint="0800"):
         type_len_b = et
 
     return mac_b(dst), mac_b(src), type_len_b, llc_b, snap_b, variant_name, dst, src, v
-
-# ──────────────────────────────────────────────────────────────────────────────
-#  L2-B  Serial / WAN protocols
-# ──────────────────────────────────────────────────────────────────────────────
-
-SERIAL_TYPES = {
-    '1' : "Raw",
-    '2' : "SLIP",
-    '3' : "PPP",
-    '4' : "HDLC (basic — address+control+payload+FCS-16)",
-    '5' : "COBS (placeholder)",
-    '6' : "KISS",
-    '7' : "Modbus RTU",
-    '8' : "HDLC + Bit-Stuffing",
-    '9' : "ATM AAL5",
-    '10': "Cisco HDLC",
-    '11': "HDLC Full (I-frame / S-frame / U-frame — all 3 types)",
-}
-
-def ask_l2_serial():
-    section("LAYER 2 — Serial / WAN  (choose protocol)")
-    for k,v in SERIAL_TYPES.items():
-        marker = "  ←  full 3-type builder" if k == '11' else ""
-        print(f"      {k:>2} = {v}{marker}")
-    ch = input("    Select [3]: ").strip() or '3'
-    if ch not in SERIAL_TYPES: ch = '3'
-    return ch, SERIAL_TYPES[ch]
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  LAYER 3  –  NETWORK
-# ═══════════════════════════════════════════════════════════════════════════════
-
-# ──────────────────────────────────────────────────────────────────────────────
-#  ARP
-# ──────────────────────────────────────────────────────────────────────────────
-
-def ask_l3_arp():
-    section("LAYER 3 — ARP")
-    hw_type    = get("Hardware Type (1=Ethernet)", "1",
-        help="Identifies the link-layer (hardware) address type.\n"
-             "1 = Ethernet (most common)   6 = IEEE 802 networks   15 = Frame Relay\n"
-             "Wrong value: receiver discards the ARP or misinterprets addresses.")
-    proto_type = get("Protocol Type hex (0800=IPv4)", "0800",
-        help="Same as EtherType — identifies the network-layer protocol.\n"
-             "0800 = IPv4 (standard)   86DD = IPv6   8100 = VLAN\n"
-             "This tells ARP what kind of network address (IP) is being resolved.")
-    hw_len     = get("HW Address Length", "6",
-        help="Length of hardware (MAC) addresses in this packet, in bytes.\n"
-             "6 = Ethernet MAC address (always 6 for Ethernet).\n"
-             "Wrong value: receiver won't know where sender/target MACs end.")
-    proto_len  = get("Protocol Address Length", "4",
-        help="Length of network (IP) addresses in this packet, in bytes.\n"
-             "4 = IPv4 address (always 4 for IPv4).   16 = IPv6 address.\n"
-             "Wrong value: receiver reads wrong bytes as the IP address.")
-    opcode     = get("Opcode  1=Request  2=Reply", "1",
-        help="ARP operation code.\n"
-             "1 = Request  — 'Who has IP X? Tell IP Y' (broadcast, target MAC = 00:00..)\n"
-             "2 = Reply    — 'IP X is at MAC AA:BB:CC:DD:EE:FF' (unicast reply)\n"
-             "3 = RARP Request   4 = RARP Reply (reverse ARP, rarely used today)")
-    sender_ha  = get("Sender MAC", "00:11:22:33:44:55",
-        help="MAC address of the device SENDING this ARP frame.\n"
-             "In a Request: your own MAC.   In a Reply: your own MAC.\n"
-             "Receiver uses this to update its ARP cache (IP→MAC mapping).")
-    sender_pa  = get("Sender IP",  "192.168.1.10",
-        help="IP address of the device SENDING this ARP frame (your IP).\n"
-             "In a Request: your own IP.   In a Reply: your own IP.\n"
-             "Gratuitous ARP: sender IP = target IP (announces your own IP).")
-    target_ha  = get("Target MAC", "00:00:00:00:00:00",
-        help="MAC address of the TARGET device.\n"
-             "In a Request: 00:00:00:00:00:00 (unknown — that's why we're asking!).\n"
-             "In a Reply: the MAC of the device that sent the original request.")
-    target_pa  = get("Target IP",  "192.168.1.100",
-        help="IP address you want to resolve to a MAC address.\n"
-             "In a Request: the IP whose MAC you want to find.\n"
-             "In a Reply: the IP of the original requester.\n"
-             "Must match the IP being queried — receiver ignores non-matching replies.")
-    return (hw_type, proto_type, hw_len, proto_len, opcode,
-            sender_ha, sender_pa, target_ha, target_pa)
-
-def build_arp(inputs):
-    hw_type, proto_type, hw_len, proto_len, opcode, sha, spa, tha, tpa = inputs
-    hdr  = struct.pack("!HHBBH",
-               int(hw_type), int(proto_type, 16),
-               int(hw_len), int(proto_len), int(opcode))
-    body = mac_b(sha) + ip_b(spa) + mac_b(tha) + ip_b(tpa)
-    raw  = hdr + body
-    op_s = "Request" if opcode=="1" else "Reply" if opcode=="2" else opcode
-    fields = [
-        {"layer":3,"name":"ARP HW Type",       "raw":hdr[0:2],   "user_val":hw_type,    "note":"1=Ethernet"},
-        {"layer":3,"name":"ARP Protocol Type", "raw":hdr[2:4],   "user_val":proto_type, "note":"0800=IPv4"},
-        {"layer":3,"name":"ARP HW Addr Len",   "raw":hdr[4:5],   "user_val":hw_len,     "note":"bytes"},
-        {"layer":3,"name":"ARP Proto Addr Len","raw":hdr[5:6],   "user_val":proto_len,  "note":"bytes"},
-        {"layer":3,"name":"ARP Opcode",        "raw":hdr[6:8],   "user_val":opcode,     "note":op_s},
-        {"layer":3,"name":"ARP Sender MAC",    "raw":body[0:6],  "user_val":sha,        "note":""},
-        {"layer":3,"name":"ARP Sender IP",     "raw":body[6:10], "user_val":spa,        "note":""},
-        {"layer":3,"name":"ARP Target MAC",    "raw":body[10:16],"user_val":tha,        "note":""},
-        {"layer":3,"name":"ARP Target IP",     "raw":body[16:20],"user_val":tpa,        "note":""},
-    ]
-    return raw, fields
-
-# ──────────────────────────────────────────────────────────────────────────────
-#  IPv4
-# ──────────────────────────────────────────────────────────────────────────────
-
-L3_PROTO_NAMES = {1:"ICMP", 6:"TCP", 17:"UDP", 41:"IPv6", 89:"OSPF", 47:"GRE"}
-
-def ask_l3_ipv4():
-    section("LAYER 3 — IPv4")
-    src_ip  = get("Source IP", "192.168.1.10",
-        help="IPv4 address of the SENDER of this packet.\n"
-             "Must be your interface's IP address (or spoofed for testing).\n"
-             "Used by receiver to send replies back to you.\n"
-             "Private ranges: 10.x.x.x / 172.16-31.x.x / 192.168.x.x")
-    dst_ip  = get("Destination IP", "192.168.1.20",
-        help="IPv4 address of the intended RECEIVER.\n"
-             "For unicast: target host's IP.   255.255.255.255 = limited broadcast.\n"
-             "Network broadcast: e.g. 192.168.1.255 (host bits all 1).\n"
-             "224.0.0.0–239.255.255.255 = multicast range.")
-    ttl     = get("TTL", "64",
-        help="Time To Live — decremented by 1 at each router hop.\n"
-             "Packet discarded when TTL reaches 0 (prevents routing loops).\n"
-             "64 = Linux/Mac default.   128 = Windows default.   255 = maximum.\n"
-             "Low TTL (e.g. 1) = traceroute trick to get ICMP Time Exceeded back.")
-    ip_id   = get("Identification (decimal)", "4660",
-        help="16-bit identifier for this packet (0–65535).\n"
-             "All fragments of the same original packet share the same ID.\n"
-             "Used with Fragment Offset to reassemble fragmented packets.\n"
-             "For non-fragmented packets, value is arbitrary (OS usually increments it).")
-    dscp    = get("DSCP/ECN (decimal, usu. 0)", "0",
-        help="Differentiated Services Code Point + ECN (6+2 bits = 1 byte).\n"
-             "DSCP controls QoS queuing priority in routers:\n"
-             "0=Best Effort  8=CS1(low)  40=CS5  46=EF(voice/VoIP)  48=CS6(routing)\n"
-             "ECN bits (low 2): 0=non-ECN  1/2=ECN-capable  3=Congestion Experienced")
-    df      = get("DF flag? (y/n)", "y",
-        help="Don't Fragment bit in the IP Flags field.\n"
-             "y = DF=1: routers MUST NOT fragment this packet.\n"
-             "    If packet is too large, router drops it and sends ICMP type 3 code 4.\n"
-             "    Required for Path MTU Discovery (PMTUD) to work correctly.\n"
-             "n = DF=0: routers may fragment if needed (legacy behaviour).")
-    return src_ip, dst_ip, int(ttl), int(ip_id), int(dscp), df.lower().startswith('y'), 0
-
-def build_ipv4(l4_payload, src_ip, dst_ip, ttl, ip_id, dscp, df, proto_num):
-    flags_frag = 0x4000 if df else 0x0000
-    ver_ihl    = (4 << 4) | 5
-    tot_len    = 20 + len(l4_payload)
-    hdr0 = struct.pack("!BBHHHBBH4s4s",
-               ver_ihl, dscp, tot_len, ip_id, flags_frag,
-               ttl, proto_num, 0, ip_b(src_ip), ip_b(dst_ip))
-    ck = inet_cksum(hdr0)
-    hdr = struct.pack("!BBHHHBBH4s4s",
-               ver_ihl, dscp, tot_len, ip_id, flags_frag,
-               ttl, proto_num, ck, ip_b(src_ip), ip_b(dst_ip))
-
-    flag_s = ("DF" if flags_frag & 0x4000 else "") + ("MF" if flags_frag & 0x2000 else "")
-    proto_s = L3_PROTO_NAMES.get(proto_num, str(proto_num))
-
-    fields = [
-        {"layer":3,"name":"IP Version + IHL",    "raw":hdr[0:1],  "user_val":"4 / 5",    "note":"IPv4, 20B header"},
-        {"layer":3,"name":"IP DSCP/ECN",          "raw":hdr[1:2],  "user_val":str(dscp),  "note":""},
-        {"layer":3,"name":"IP Total Length",      "raw":hdr[2:4],  "user_val":"auto",     "note":f"{tot_len}B (20+{len(l4_payload)})"},
-        {"layer":3,"name":"IP Identification",    "raw":hdr[4:6],  "user_val":str(ip_id), "note":f"0x{ip_id:04x}"},
-        {"layer":3,"name":"IP Flags + FragOffset","raw":hdr[6:8],  "user_val":flag_s or "none", "note":"frag offset=0"},
-        {"layer":3,"name":"IP TTL",               "raw":hdr[8:9],  "user_val":str(ttl),   "note":"hops"},
-        {"layer":3,"name":"IP Protocol",          "raw":hdr[9:10], "user_val":str(proto_num), "note":proto_s},
-        {"layer":3,"name":"IP Header Checksum",   "raw":hdr[10:12],"user_val":"auto",     "note":f"0x{ck:04x} RFC791"},
-        {"layer":3,"name":"IP Source Address",    "raw":hdr[12:16],"user_val":src_ip,     "note":""},
-        {"layer":3,"name":"IP Destination Addr",  "raw":hdr[16:20],"user_val":dst_ip,     "note":""},
-    ]
-    return hdr, fields, ck
-
-# ──────────────────────────────────────────────────────────────────────────────
-#  STP / RSTP BPDU   (L2/L3 hybrid – uses 802.3 + LLC wrapper)
-# ──────────────────────────────────────────────────────────────────────────────
-
-def ask_l3_stp():
-    section("LAYER 3 — STP / RSTP BPDU")
-    version   = get("Version  0=STP  2=RSTP", "2",
-        help="BPDU protocol version.\n"
-             "0 = STP (802.1D original) — slow convergence, 30–50 seconds.\n"
-             "2 = RSTP (802.1w/802.1D-2004) — fast convergence, <1 second.\n"
-             "3 = MSTP (802.1s) — multiple spanning tree instances.")
-    bpdu_type = get("BPDU Type  00=Config  80=TCN", "00",
-        help="Type of BPDU message.\n"
-             "00 = Configuration BPDU — normal periodic hello from root/designated bridge.\n"
-             "80 = Topology Change Notification — alert that topology has changed.\n"
-             "02 = RSTP BPDU (used when version=2).")
-    flags     = get("Flags (hex)", "00",
-        help="8-bit flags field (more important in RSTP).\n"
-             "Bit 0: Topology Change   Bit 7: Topology Change Acknowledgment\n"
-             "RSTP adds bits 1-6: Proposal, Port Role (2b), Learning, Forwarding, Agreement.\n"
-             "0x00 = no flags set.   0x3C = RSTP Designated port, Learning+Forwarding.")
-    root_prio = get("Root Priority", "32768",
-        help="Priority component of the Root Bridge ID (0–61440, steps of 4096).\n"
-             "Bridge with LOWEST Bridge ID becomes Root Bridge.\n"
-             "Bridge ID = Priority(2B) + MAC(6B).  Lower priority = more likely to be root.\n"
-             "Default: 32768.   Set 4096 to force a switch to become root.")
-    root_mac  = get("Root MAC", "00:00:00:00:00:00",
-        help="MAC address component of the Root Bridge ID.\n"
-             "Together with Root Priority, uniquely identifies the root bridge.\n"
-             "Lower MAC wins ties in priority.  Set to the actual root switch's MAC.")
-    path_cost = get("Root Path Cost", "0",
-        help="Total accumulated cost of the path from THIS bridge to the Root Bridge.\n"
-             "0 = this bridge IS the root (or directly connected to root with 0 cost).\n"
-             "Cost depends on link speed: 100Mbps=19  1Gbps=4  10Gbps=2  100Gbps=1\n"
-             "Bridges use lowest path cost to choose which port faces the root.")
-    br_prio   = get("Bridge Priority", "32768",
-        help="Priority component of THIS bridge's own Bridge ID.\n"
-             "Used to elect Designated Bridge on each segment.\n"
-             "Same encoding as Root Priority (steps of 4096, default 32768).")
-    br_mac    = get("Bridge MAC", "00:11:22:33:44:55",
-        help="MAC address of THIS bridge (the switch sending this BPDU).\n"
-             "Together with Bridge Priority, forms the Bridge ID of the sender.")
-    port_id   = get("Port ID (hex)", "8001",
-        help="2-byte Port ID: Priority(1B, default 0x80) + Port Number(1B).\n"
-             "0x8001 = priority 128, port 1.   0x8002 = priority 128, port 2.\n"
-             "Used to break ties when two ports of same bridge connect to same segment.")
-    msg_age   = get("Message Age (sec)", "0",
-        help="Age of this BPDU since it was generated by the root bridge.\n"
-             "0 = generated by the root itself.   Incremented by 1 at each bridge hop.\n"
-             "When Message Age >= Max Age (20s), BPDU is discarded as stale.")
-    max_age   = get("Max Age (sec)", "20",
-        help="Maximum time a bridge stores a BPDU before discarding it (default 20s).\n"
-             "If no BPDU received within Max Age, bridge assumes root has failed.\n"
-             "Increasing this slows failover.  Decreasing speeds it up but risks instability.")
-    hello     = get("Hello Time (sec)", "2",
-        help="Interval between Configuration BPDUs sent by the Root Bridge (default 2s).\n"
-             "Root sends a hello every 2 seconds to prove it's still alive.\n"
-             "Reducing this speeds up failure detection but increases traffic.")
-    fwd_delay = get("Forward Delay (sec)", "15",
-        help="Time spent in Listening and Learning states before moving to Forwarding (default 15s).\n"
-             "Total transition time = 2 × Forward Delay = 30 seconds for classic STP.\n"
-             "Prevents temporary loops during topology changes.\n"
-             "RSTP replaces this with handshake-based fast transition (ignores this field).")
-    return (version, bpdu_type, flags, root_prio, root_mac, path_cost,
-            br_prio, br_mac, port_id, msg_age, max_age, hello, fwd_delay)
-
-def build_stp(inputs):
-    (version, bpdu_type, flags, root_prio, root_mac, path_cost,
-     br_prio, br_mac, port_id, msg_age, max_age, hello, fwd_delay) = inputs
-
-    root_id = struct.pack("!H", int(root_prio)) + mac_b(root_mac)
-    br_id   = struct.pack("!H", int(br_prio))   + mac_b(br_mac)
-    bpdu = (bytes.fromhex("0000") +
-            hpad(version,1) + hpad(bpdu_type,1) + hpad(flags,1) +
-            root_id + struct.pack("!I", int(path_cost)) + br_id +
-            hpad(port_id,2) +
-            struct.pack("!HHHH",
-                int(msg_age)*256, int(max_age)*256,
-                int(hello)*256,   int(fwd_delay)*256))
-    fields = [
-        {"layer":3,"name":"BPDU Protocol ID",  "raw":bpdu[0:2],  "user_val":"0x0000","note":"always 0"},
-        {"layer":3,"name":"BPDU Version",       "raw":bpdu[2:3],  "user_val":version, "note":"0=STP 2=RSTP"},
-        {"layer":3,"name":"BPDU Type",          "raw":bpdu[3:4],  "user_val":bpdu_type,"note":"00=Config 80=TCN"},
-        {"layer":3,"name":"BPDU Flags",         "raw":bpdu[4:5],  "user_val":flags,   "note":""},
-        {"layer":3,"name":"BPDU Root ID",       "raw":bpdu[5:13], "user_val":f"prio={root_prio} mac={root_mac}","note":"8B"},
-        {"layer":3,"name":"BPDU Root Path Cost","raw":bpdu[13:17],"user_val":path_cost,"note":""},
-        {"layer":3,"name":"BPDU Bridge ID",     "raw":bpdu[17:25],"user_val":f"prio={br_prio} mac={br_mac}","note":"8B"},
-        {"layer":3,"name":"BPDU Port ID",       "raw":bpdu[25:27],"user_val":port_id, "note":""},
-        {"layer":3,"name":"BPDU Message Age",   "raw":bpdu[27:29],"user_val":msg_age, "note":"sec"},
-        {"layer":3,"name":"BPDU Max Age",       "raw":bpdu[29:31],"user_val":max_age, "note":"sec"},
-        {"layer":3,"name":"BPDU Hello Time",    "raw":bpdu[31:33],"user_val":hello,   "note":"sec"},
-        {"layer":3,"name":"BPDU Forward Delay", "raw":bpdu[33:35],"user_val":fwd_delay,"note":"sec"},
-    ]
-    return bpdu, fields
-
-# ──────────────────────────────────────────────────────────────────────────────
-#  DTP  (Cisco proprietary – carried in 802.3+SNAP frame)
-# ──────────────────────────────────────────────────────────────────────────────
-
-def ask_l3_dtp():
-    section("LAYER 3 — DTP  (Dynamic Trunking Protocol)")
-    print("    Modes:  02=desirable  03=auto  04=on  05=off")
-    mode = get("DTP Mode (hex)", "02",
-        help="DTP (Dynamic Trunking Protocol) port trunking mode.\n"
-             "02=desirable: actively tries to form a trunk with the other end.\n"
-             "03=auto: will become a trunk only if the other end is desirable/on.\n"
-             "04=on: unconditionally trunks (regardless of other end's mode).\n"
-             "05=off: unconditionally access port (no trunking).\n"
-             "Cisco proprietary — disable with 'switchport nonegotiate' for security.")
-    return mode
-
-def build_dtp(mode):
-    snap    = bytes.fromhex("00000c0104")
-    payload = b"\x01\x03\x01" + hpad(mode,1) + b"\x00"*26
-    mode_s  = {"02":"desirable","03":"auto","04":"on","05":"off"}.get(mode, f"0x{mode}")
-    fields  = [
-        {"layer":3,"name":"DTP SNAP OUI",  "raw":snap[0:3],    "user_val":"00000c","note":"Cisco"},
-        {"layer":3,"name":"DTP SNAP PID",  "raw":snap[3:5],    "user_val":"0104",  "note":"DTP"},
-        {"layer":3,"name":"DTP Version",   "raw":payload[0:1], "user_val":"1",     "note":""},
-        {"layer":3,"name":"DTP Flags",     "raw":payload[1:2], "user_val":"03",    "note":""},
-        {"layer":3,"name":"DTP Domain",    "raw":payload[2:3], "user_val":"01",    "note":""},
-        {"layer":3,"name":"DTP Mode",      "raw":payload[3:4], "user_val":mode,    "note":mode_s},
-        {"layer":3,"name":"DTP Pad",       "raw":payload[4:],  "user_val":"0x00*26","note":""},
-    ]
-    return snap + payload, fields
-
-# ──────────────────────────────────────────────────────────────────────────────
-#  PAgP  (Cisco proprietary)
-# ──────────────────────────────────────────────────────────────────────────────
-
-def ask_l3_pagp():
-    section("LAYER 3 — PAgP  (Port Aggregation Protocol)")
-    print("    Port State flags: 0x01=Active 0x04=Consistent 0x05=Active+Consistent")
-    state = get("Port State (hex)", "05",
-        help="PAgP (Port Aggregation Protocol) port state bitmask.\n"
-             "0x01=Active: port is willing to form a channel.\n"
-             "0x04=Consistent: port parameters match the group.\n"
-             "0x05=Active+Consistent: normal operating state for channel member.\n"
-             "0x00=Inactive: port not participating in channel aggregation.\n"
-             "Cisco proprietary — IEEE equivalent is LACP (option 8).")
-    return state
-
-def build_pagp(state):
-    snap    = bytes.fromhex("00000c0104")
-    payload = (b"\x01\x01" + bytes.fromhex("8001") +
-               bytes.fromhex("00000001") + hpad(state,1) + b"\x00"*25)
-    fields = [
-        {"layer":3,"name":"PAgP SNAP OUI",    "raw":snap[0:3],    "user_val":"00000c","note":"Cisco"},
-        {"layer":3,"name":"PAgP SNAP PID",    "raw":snap[3:5],    "user_val":"0104",  "note":"PAgP"},
-        {"layer":3,"name":"PAgP Version",     "raw":payload[0:1], "user_val":"1",     "note":""},
-        {"layer":3,"name":"PAgP Flags",       "raw":payload[1:2], "user_val":"01",    "note":""},
-        {"layer":3,"name":"PAgP Port ID",     "raw":payload[2:4], "user_val":"8001",  "note":""},
-        {"layer":3,"name":"PAgP System ID",   "raw":payload[4:8], "user_val":"00000001","note":""},
-        {"layer":3,"name":"PAgP Port State",  "raw":payload[8:9], "user_val":state,   "note":""},
-        {"layer":3,"name":"PAgP Pad",         "raw":payload[9:],  "user_val":"0x00*25","note":""},
-    ]
-    return snap + payload, fields
-
-# ──────────────────────────────────────────────────────────────────────────────
-#  LACP  (IEEE 802.3ad)
-# ──────────────────────────────────────────────────────────────────────────────
-
-def ask_l3_lacp():
-    section("LAYER 3 — LACP  (802.3ad Link Aggregation)")
-    actor_mac   = get("Actor System MAC",  "00:11:22:33:44:55",
-        help="MAC address of THIS switch/NIC participating in LACP.\n"
-             "Forms part of the Actor System ID (Priority + MAC).\n"
-             "Used by the peer to uniquely identify this LACP participant.")
-    actor_key   = get("Actor Key (hex)",   "0001",
-        help="2-byte operational key — identifies which ports can be aggregated together.\n"
-             "Ports with the same key on the same system can form one LAG (bundle).\n"
-             "0x0001 = first aggregation group.   Different keys = different bundles.")
-    actor_state = get("Actor State (hex)  [3d=Active+Short+Aggregating+Sync+Col+Dist]", "3d",
-        help="8-bit LACP state flags for this actor port.\n"
-             "Bit 0: LACP Activity (1=Active, sends PDUs periodically)\n"
-             "Bit 1: LACP Timeout (1=Short 1s, 0=Long 30s)\n"
-             "Bit 2: Aggregation (1=can aggregate, 0=individual)\n"
-             "Bit 3: Synchronisation (1=in sync with partner)\n"
-             "Bit 4: Collecting (1=receiving frames from partner)\n"
-             "Bit 5: Distributing (1=sending frames to partner)\n"
-             "Bit 6: Defaulted (1=using default partner info)\n"
-             "Bit 7: Expired (1=partner info has expired)\n"
-             "0x3D = 00111101 = Active+Short+Aggregating+Sync+Collecting+Distributing")
-    return actor_mac, actor_key, actor_state
-
-def build_lacp(actor_mac, actor_key, actor_state):
-    subtype_ver = b"\x01\x01"   # subtype=LACP, version=1
-    tlv = (b"\x01\x14" +
-           bytes.fromhex("8000") + mac_b(actor_mac) +
-           hpad(actor_key,2) + bytes.fromhex("80008001") +
-           hpad(actor_state,1) + b"\x00\x00\x00")
-    terminator = b"\x00\x00"
-    raw = subtype_ver + tlv + terminator
-    # offsets into raw
-    fields = [
-        {"layer":3,"name":"LACP Subtype",       "raw":raw[0:1],  "user_val":"1",       "note":"LACP"},
-        {"layer":3,"name":"LACP Version",        "raw":raw[1:2],  "user_val":"1",       "note":""},
-        {"layer":3,"name":"LACP Actor TLV Type", "raw":raw[2:3],  "user_val":"01",      "note":"Actor Info"},
-        {"layer":3,"name":"LACP Actor TLV Len",  "raw":raw[3:4],  "user_val":"20",      "note":"bytes=20"},
-        {"layer":3,"name":"LACP Actor Sys Prio", "raw":raw[4:6],  "user_val":"8000",    "note":"32768"},
-        {"layer":3,"name":"LACP Actor Sys MAC",  "raw":raw[6:12], "user_val":actor_mac, "note":""},
-        {"layer":3,"name":"LACP Actor Key",      "raw":raw[12:14],"user_val":actor_key, "note":""},
-        {"layer":3,"name":"LACP Actor Port Prio","raw":raw[14:16],"user_val":"8000",    "note":""},
-        {"layer":3,"name":"LACP Actor Port",     "raw":raw[16:18],"user_val":"8001",    "note":""},
-        {"layer":3,"name":"LACP Actor State",    "raw":raw[18:19],"user_val":actor_state,"note":"0x3d=Active+Sync+Agg"},
-        {"layer":3,"name":"LACP Actor Reserved", "raw":raw[19:22],"user_val":"000000",  "note":""},
-        {"layer":3,"name":"LACP Terminator",     "raw":raw[22:24],"user_val":"0000",    "note":""},
-    ]
-    return raw, fields
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  LAYER 4  –  TRANSPORT / CONTROL
-# ═══════════════════════════════════════════════════════════════════════════════
-
-# ──────────────────────────────────────────────────────────────────────────────
-#  ICMP
-# ──────────────────────────────────────────────────────────────────────────────
-
-ICMP_TABLE = {
-    0:  ("Echo Reply",              {0:"Echo reply"}),
-    3:  ("Destination Unreachable", {
-            0:"Net unreachable",         1:"Host unreachable",
-            2:"Protocol unreachable",    3:"Port unreachable",
-            4:"Fragmentation needed/DF", 5:"Source route failed",
-            6:"Dest network unknown",    7:"Dest host unknown",
-            9:"Net admin prohibited",   10:"Host admin prohibited",
-           13:"Comm admin prohibited"}),
-    4:  ("Source Quench",           {0:"Source quench (deprecated)"}),
-    5:  ("Redirect",                {0:"Redirect network",1:"Redirect host",
-                                     2:"Redirect TOS+net",3:"Redirect TOS+host"}),
-    8:  ("Echo Request",            {0:"Echo request"}),
-    9:  ("Router Advertisement",    {0:"Normal advertisement"}),
-   10:  ("Router Solicitation",     {0:"Router solicitation"}),
-   11:  ("Time Exceeded",           {0:"TTL exceeded in transit",
-                                     1:"Fragment reassembly exceeded"}),
-   12:  ("Parameter Problem",       {0:"Pointer error",1:"Missing option",2:"Bad length"}),
-   13:  ("Timestamp Request",       {0:"Timestamp request"}),
-   14:  ("Timestamp Reply",         {0:"Timestamp reply"}),
-   17:  ("Address Mask Request",    {0:"Address mask request"}),
-   18:  ("Address Mask Reply",      {0:"Address mask reply"}),
-   30:  ("Traceroute",              {0:"Information (deprecated)"}),
-}
-ICMP_ECHO_TYPES = {0, 8, 13, 14, 17, 18}
-
-def print_icmp_table():
-    print(f"\n  {'─'*100}")
-    print(f"  {'ICMP TYPE / CODE REFERENCE TABLE':^100}")
-    print(f"  {'─'*100}")
-    print(f"  {'Type':>5}  {'Type Name':<28}  {'Code':>5}  Code Description")
-    print(f"  {'─'*100}")
-    for t, (tname, codes) in sorted(ICMP_TABLE.items()):
-        first = True
-        for c, cdesc in sorted(codes.items()):
-            if first:
-                print(f"  {t:5d}  {tname:<28}  {c:5d}  {cdesc}")
-                first = False
-            else:
-                print(f"  {'':5}  {'':28}  {c:5d}  {cdesc}")
-    print(f"  {'─'*100}")
-
-def ask_l4_icmp():
-    print_icmp_table()
-    section("LAYER 4 — ICMP")
-    icmp_type = int(get("ICMP Type  (default=8 Echo Request)", "8",
-        help="ICMP message type — defines what kind of ICMP message this is.\n"
-             "8 = Echo Request (ping sent)   0 = Echo Reply (ping response)\n"
-             "3 = Destination Unreachable    11 = Time Exceeded (TTL expired)\n"
-             "5 = Redirect   12 = Parameter Problem\n"
-             "See the table above for all types and their codes."))
-    if icmp_type in ICMP_TABLE:
-        codes = ICMP_TABLE[icmp_type][1]
-        code_hint = "  ".join(f"{c}={d}" for c,d in sorted(codes.items()))
-        print(f"    Valid codes: {code_hint}")
-    icmp_code = int(get("ICMP Code", "0",
-        help="ICMP sub-code — gives more detail about the type.\n"
-             "For Echo Request/Reply (type 8/0): always 0 (only one code).\n"
-             "For Destination Unreachable (type 3): 0=net  1=host  3=port  4=frag-needed\n"
-             "For Time Exceeded (type 11): 0=TTL in transit  1=reassembly timeout"))
-    icmp_id   = int(get("ICMP Identifier (decimal)", "1",
-        help="16-bit identifier used to match Echo Requests with Echo Replies.\n"
-             "The ping tool usually sets this to the process ID (PID).\n"
-             "Receiver copies this value unchanged into the Echo Reply.\n"
-             "Allows multiple ping sessions to run simultaneously without confusion."))
-    icmp_seq  = int(get("ICMP Sequence   (decimal)", "1",
-        help="16-bit sequence number — incremented with each ping request sent.\n"
-             "Starts at 1, goes up: 1, 2, 3, ...\n"
-             "Receiver copies this into the Reply — sender matches reply to request.\n"
-             "Gaps in sequence numbers indicate lost packets."))
-    print("    ICMP data payload hex  (default = ping pattern 'abcdefgh')")
-    data_hex  = get("ICMP payload hex", "6162636465666768")
-    try:
-        icmp_data = bytes.fromhex(data_hex.replace(" ",""))
-    except ValueError:
-        print("    -> invalid hex, using default"); icmp_data = bytes.fromhex("6162636465666768")
-    return icmp_type, icmp_code, icmp_id, icmp_seq, icmp_data, data_hex
-
-def build_icmp(icmp_type, icmp_code, icmp_id, icmp_seq, icmp_data, data_hex_repr=""):
-    rest = struct.pack("!HH", icmp_id, icmp_seq) if icmp_type in ICMP_ECHO_TYPES else b'\x00\x00\x00\x00'
-    msg0 = struct.pack("!BBH", icmp_type, icmp_code, 0) + rest + icmp_data
-    ck   = inet_cksum(msg0)
-    msg  = struct.pack("!BBH", icmp_type, icmp_code, ck) + rest + icmp_data
-
-    tname = ICMP_TABLE.get(icmp_type, (f"Type {icmp_type}",{}))[0]
-    cname = ICMP_TABLE.get(icmp_type,("",{}))[1].get(icmp_code, f"Code {icmp_code}")
-
-    fields = [
-        {"layer":4,"name":"ICMP Type",     "raw":msg[0:1], "user_val":str(icmp_type), "note":tname},
-        {"layer":4,"name":"ICMP Code",     "raw":msg[1:2], "user_val":str(icmp_code), "note":cname},
-        {"layer":4,"name":"ICMP Checksum", "raw":msg[2:4], "user_val":"auto",         "note":f"0x{ck:04x} RFC792 over full ICMP"},
-    ]
-    if icmp_type in ICMP_ECHO_TYPES:
-        fields += [
-            {"layer":4,"name":"ICMP Identifier","raw":msg[4:6],"user_val":str(icmp_id), "note":f"0x{icmp_id:04x}"},
-            {"layer":4,"name":"ICMP Sequence",  "raw":msg[6:8],"user_val":str(icmp_seq),"note":""},
-        ]
-    else:
-        fields.append({"layer":4,"name":"ICMP Rest-of-Header","raw":msg[4:8],"user_val":"0","note":"type-specific"})
-    if icmp_data:
-        fields.append({"layer":4,"name":"ICMP Data Payload","raw":icmp_data,
-                       "user_val":data_hex_repr[:20] if data_hex_repr else icmp_data.hex()[:20],
-                       "note":f"{len(icmp_data)}B"})
-    return msg, fields, ck
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  WELL-KNOWN PORT TABLE
-# ═══════════════════════════════════════════════════════════════════════════════
-
-WELL_KNOWN_PORTS = {
-    20: "FTP-Data",     21: "FTP-Control",  22: "SSH",
-    23: "Telnet",       25: "SMTP",         53: "DNS",
-    67: "DHCP-Server",  68: "DHCP-Client",  69: "TFTP",
-    80: "HTTP",         110:"POP3",         119:"NNTP",
-    123:"NTP",          143:"IMAP",         161:"SNMP",
-    162:"SNMP-Trap",    179:"BGP",          194:"IRC",
-    389:"LDAP",         443:"HTTPS",        445:"SMB",
-    514:"Syslog",       520:"RIP",          587:"SMTP-TLS",
-    636:"LDAPS",        993:"IMAPS",        995:"POP3S",
-   1194:"OpenVPN",     1433:"MSSQL",       1521:"Oracle",
-   3306:"MySQL",       3389:"RDP",         5060:"SIP",
-   5432:"PostgreSQL",  5900:"VNC",         6379:"Redis",
-   8080:"HTTP-Alt",    8443:"HTTPS-Alt",   9200:"Elasticsearch",
-   27017:"MongoDB",
-}
-
-def port_note(port):
-    return WELL_KNOWN_PORTS.get(port, "")
-
-def print_port_table():
-    print(f"\n  {'─'*100}")
-    print(f"  {'WELL-KNOWN PORT REFERENCE  (TCP & UDP)':^100}")
-    print(f"  {'─'*100}")
-    ports = sorted(WELL_KNOWN_PORTS.items())
-    # print in 3 columns
-    cols = 3
-    rows = (len(ports) + cols - 1) // cols
-    for r in range(rows):
-        line = "  "
-        for c in range(cols):
-            idx = r + c * rows
-            if idx < len(ports):
-                p, n = ports[idx]
-                line += f"  {p:>5} = {n:<18}"
-        print(line)
-    print(f"  {'─'*100}")
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  TCP PSEUDO-HEADER CHECKSUM  (RFC 793)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def tcp_checksum(src_ip, dst_ip, tcp_segment):
-    """RFC 793: checksum over pseudo-header + TCP segment."""
-    pseudo = (ip_b(src_ip) + ip_b(dst_ip) +
-              b'\x00' + b'\x06' +
-              struct.pack("!H", len(tcp_segment)))
-    return inet_cksum(pseudo + tcp_segment)
-
-def udp_checksum(src_ip, dst_ip, udp_datagram):
-    """RFC 768: checksum over pseudo-header + UDP datagram."""
-    pseudo = (ip_b(src_ip) + ip_b(dst_ip) +
-              b'\x00' + b'\x11' +
-              struct.pack("!H", len(udp_datagram)))
-    return inet_cksum(pseudo + udp_datagram)
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  TCP  –  3-WAY HANDSHAKE BUILDER
-# ═══════════════════════════════════════════════════════════════════════════════
-
-TCP_FLAGS = {
-    'FIN':0x01, 'SYN':0x02, 'RST':0x04,
-    'PSH':0x08, 'ACK':0x10, 'URG':0x20,
-    'ECE':0x40, 'CWR':0x80,
-}
-
-TCP_STEPS = {
-    '1': ("SYN",     0x02, "Client → Server  (open connection request)"),
-    '2': ("SYN-ACK", 0x12, "Server → Client  (acknowledge + own SYN)"),
-    '3': ("ACK",     0x10, "Client → Server  (acknowledge server SYN)"),
-    '4': ("PSH+ACK", 0x18, "Data segment with push flag"),
-    '5': ("FIN+ACK", 0x11, "Initiating graceful close"),
-    '6': ("RST",     0x04, "Abrupt connection reset"),
-}
-
-def print_tcp_handshake_diagram():
-    print("""
-  ┌──────────────────────────────────────────────────────────────────────┐
-  │                 TCP 3-WAY HANDSHAKE FLOW                             │
-  │                                                                      │
-  │   CLIENT                                          SERVER             │
-  │     │                                               │                │
-  │     │  ── STEP 1: SYN ──────────────────────────>  │  SEQ=x         │
-  │     │             SYN=1  ACK=0                      │                │
-  │     │                                               │                │
-  │     │  <─ STEP 2: SYN-ACK ───────────────────────  │  SEQ=y ACK=x+1 │
-  │     │             SYN=1  ACK=1                      │                │
-  │     │                                               │                │
-  │     │  ── STEP 3: ACK ──────────────────────────>  │  SEQ=x+1       │
-  │     │             SYN=0  ACK=1  ACK_NUM=y+1         │                │
-  │     │                                               │                │
-  │     │  ── STEP 4: PSH+ACK (data) ───────────────>  │                │
-  │     │                                               │                │
-  │     │  ── STEP 5: FIN+ACK (close) ──────────────>  │                │
-  │     │                                               │                │
-  │     │  ── STEP 6: RST (reset) ──────────────────>  │                │
-  │                                                                      │
-  │  Flags:  SYN=0x02  ACK=0x10  SYN+ACK=0x12  PSH=0x08  FIN=0x01     │
-  │          RST=0x04  URG=0x20  ECE=0x40  CWR=0x80                     │
-  └──────────────────────────────────────────────────────────────────────┘""")
-
-def ask_l4_tcp(src_ip, dst_ip):
-    print_tcp_handshake_diagram()
-    print_port_table()
-    section("LAYER 4 — TCP")
-
-    print("    Handshake step:")
-    for k,(name,_,desc) in TCP_STEPS.items():
-        print(f"      {k} = {name:<10}  {desc}")
-    step = get("Choose step", "1")
-    if step not in TCP_STEPS: step = '1'
-    step_name, default_flags, step_desc = TCP_STEPS[step]
-
-    print(f"\n    Building: {step_name}  —  {step_desc}")
-
-    src_port = int(get("Source Port", "49152",
-        help="TCP port number on the SENDER side (0–65535).\n"
-             "Ports 0–1023 = well-known (HTTP=80, HTTPS=443, SSH=22, DNS=53).\n"
-             "Ports 1024–49151 = registered.   49152–65535 = ephemeral (client picks random).\n"
-             "For a client connecting to a server, use a random ephemeral port (>49152)."))
-    dst_port = int(get("Destination Port", "80",
-        help="TCP port number on the RECEIVER side — identifies which service to reach.\n"
-             "80=HTTP  443=HTTPS  22=SSH  21=FTP  25=SMTP  53=DNS  3306=MySQL  5432=PG\n"
-             "Wrong port: connection refused (RST) or no response (firewall drop)."))
-    pn = port_note(dst_port) or port_note(src_port)
-    if pn: print(f"    -> Port note: {pn}")
-
-    seq_num  = int(get("Sequence Number  (ISN for SYN, else continuation)", "1000",
-        help="32-bit number identifying the position of this segment in the byte stream.\n"
-             "SYN (step 1): use a random ISN (Initial Sequence Number) — e.g. 1000.\n"
-             "After SYN: each segment's SeqNum = previous SeqNum + bytes sent.\n"
-             "Receiver uses this to reassemble data in order and detect duplicates."))
-    ack_num  = int(get("Acknowledgement Number  (0 if SYN, else peer_seq+1)",
-        "0" if step=='1' else "1001",
-        help="32-bit number = next SeqNum the sender EXPECTS from the peer.\n"
-             "Meaning: 'I have received everything up to ACK_NUM - 1.'\n"
-             "SYN (step 1): 0 (ACK flag not set, no data acknowledged yet).\n"
-             "SYN-ACK (step 2): peer_ISN + 1.   ACK (step 3): peer_ISN + 1.\n"
-             "Only valid when ACK flag is set in the flags field."))
-    data_off = 5
-    flags_val = default_flags
-    print(f"    TCP Flags (hex, default={default_flags:#04x} = {step_name})")
-    flags_in = get("Flags hex (Enter=default)", f"{default_flags:02x}",
-        help="8-bit field where each bit enables a TCP control flag.\n"
-             "SYN=0x02  ACK=0x10  SYN+ACK=0x12  PSH=0x08  FIN=0x01  RST=0x04\n"
-             "URG=0x20  ECE=0x40  CWR=0x80\n"
-             "SYN: initiate connection.   ACK: acknowledge data.   FIN: close gracefully.\n"
-             "RST: abort connection immediately.   PSH: deliver data to app right away.\n"
-             "URG: urgent data present (pointer field matters).   ECE/CWR: congestion.")
-    try:    flags_val = int(flags_in, 16)
-    except: flags_val = default_flags
-
-    window   = int(get("Window Size (bytes)", "65535",
-        help="16-bit receive buffer size — how many bytes the sender can send before waiting for ACK.\n"
-             "65535 = maximum without window scaling (RFC 7323 extends this).\n"
-             "Smaller value: receiver is telling sender to slow down (flow control).\n"
-             "0 = zero window — stop sending (receiver buffer is full)."))
-    urg_ptr  = int(get("Urgent Pointer      (0 unless URG set)", "0",
-        help="16-bit offset from SeqNum to the end of urgent data.\n"
-             "Only meaningful when URG flag is set — points to last urgent byte.\n"
-             "Almost never used in modern protocols. Keep 0 for normal frames."))
-
-    # Optional data payload (for PSH+ACK)
-    tcp_data = b''
-    if step in ('4',):
-        print("    TCP data payload hex  (default = 'GET / HTTP/1.0\\r\\n')")
-        dhex = get("Data hex", "474554202f20485454502f312e300d0a")
-        try:    tcp_data = bytes.fromhex(dhex.replace(" ",""))
-        except: tcp_data = b''
-
-    return (step, step_name, src_port, dst_port, seq_num, ack_num,
-            data_off, flags_val, window, urg_ptr, tcp_data, src_ip, dst_ip)
-
-def build_tcp(step, step_name, src_port, dst_port, seq_num, ack_num,
-              data_off, flags_val, window, urg_ptr, tcp_data,
-              src_ip, dst_ip):
-    # Build with checksum=0
-    hdr_no_ck = struct.pack("!HHIIBBHHH",
-        src_port, dst_port,
-        seq_num, ack_num,
-        (data_off << 4),   # data offset in high nibble
-        flags_val,
-        window, 0, urg_ptr)
-    seg_no_ck = hdr_no_ck + tcp_data
-    ck = tcp_checksum(src_ip, dst_ip, seg_no_ck)
-    hdr = struct.pack("!HHIIBBHHH",
-        src_port, dst_port,
-        seq_num, ack_num,
-        (data_off << 4),
-        flags_val,
-        window, ck, urg_ptr)
-    seg = hdr + tcp_data
-
-    # Decode flags for display
-    flag_names = [n for n,v in TCP_FLAGS.items() if flags_val & v]
-    flag_str   = '+'.join(flag_names) if flag_names else "none"
-    pn_src = port_note(src_port); pn_dst = port_note(dst_port)
-
-    fields = [
-        {"layer":4,"name":"TCP Source Port",     "raw":seg[0:2],  "user_val":str(src_port),
-         "note":pn_src or "ephemeral"},
-        {"layer":4,"name":"TCP Dest Port",       "raw":seg[2:4],  "user_val":str(dst_port),
-         "note":pn_dst or ""},
-        {"layer":4,"name":"TCP Sequence Num",    "raw":seg[4:8],  "user_val":str(seq_num),
-         "note":f"0x{seq_num:08x}"},
-        {"layer":4,"name":"TCP Ack Number",      "raw":seg[8:12], "user_val":str(ack_num),
-         "note":f"0x{ack_num:08x}"},
-        {"layer":4,"name":"TCP Data Offset+Res", "raw":seg[12:13],"user_val":str(data_off),
-         "note":f"{data_off*4}B header, reserved=0"},
-        {"layer":4,"name":"TCP Flags",           "raw":seg[13:14],"user_val":f"0x{flags_val:02x}",
-         "note":f"{flag_str}  [{step_name}]"},
-        {"layer":4,"name":"TCP Window Size",     "raw":seg[14:16],"user_val":str(window),
-         "note":"bytes"},
-        {"layer":4,"name":"TCP Checksum",        "raw":seg[16:18],"user_val":"auto",
-         "note":f"0x{ck:04x}  RFC793 pseudo-hdr+segment"},
-        {"layer":4,"name":"TCP Urgent Pointer",  "raw":seg[18:20],"user_val":str(urg_ptr),
-         "note":"0 unless URG flag set"},
-    ]
-    if tcp_data:
-        fields.append({"layer":4,"name":"TCP Data Payload","raw":tcp_data,
-                       "user_val":tcp_data.hex()[:24],"note":f"{len(tcp_data)}B"})
-    return seg, fields, ck
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  UDP  –  DATAGRAM BUILDER
-# ═══════════════════════════════════════════════════════════════════════════════
-
-UDP_COMMON = {
-    ('53','53'):   "DNS Query/Response",
-    ('67','68'):   "DHCP",
-    ('123','123'): "NTP",
-    ('161','162'): "SNMP",
-    ('514','514'): "Syslog",
-    ('520','520'): "RIP",
-    ('69','69'):   "TFTP",
-    ('5060','5060'):"SIP",
-}
-
-def ask_l4_udp(src_ip, dst_ip):
-    print_port_table()
-    section("LAYER 4 — UDP")
-    print("    UDP is connectionless – single datagram, no handshake.")
-    print("    Common uses: DNS (53), DHCP (67/68), NTP (123), SNMP (161), TFTP (69)")
-
-    src_port = int(get("Source Port", "49152",
-        help="UDP port number on the SENDER side (0–65535).\n"
-             "Ephemeral range 49152–65535 for clients.  Well-known: 53=DNS 67/68=DHCP.\n"
-             "Unlike TCP, UDP has no connection — port just identifies the sending socket."))
-    dst_port = int(get("Destination Port", "53",
-        help="UDP port number on the RECEIVER — identifies which service to reach.\n"
-             "53=DNS  67=DHCP server  68=DHCP client  69=TFTP  123=NTP  161=SNMP\n"
-             "514=Syslog  520=RIP  1194=OpenVPN  5060=SIP"))
-    pn = port_note(dst_port) or port_note(src_port)
-    if pn: print(f"    -> Port note: {pn}")
-
-    print("    UDP data payload hex")
-    print("      DNS query example : 0001010000010000000000000377777703636f6d00000100 01")
-    print("      NTP request       : e300000000000000000000000000000000000000000000000000000000000000000000000000000000000000")
-    print("      Syslog example    : 3c31343e4a756c2031352030303a30303a303020686f73 74206d657373616765")
-    dhex = get("Data hex  (Enter=empty datagram)", "")
-    try:    udp_data = bytes.fromhex(dhex.replace(" ",""))
-    except: udp_data = b''
-
-    return src_port, dst_port, udp_data, src_ip, dst_ip
-
-def build_udp(src_port, dst_port, udp_data, src_ip, dst_ip):
-    length = 8 + len(udp_data)
-    # Build with checksum=0
-    hdr_no_ck = struct.pack("!HHHH", src_port, dst_port, length, 0)
-    dgram_no_ck = hdr_no_ck + udp_data
-    ck = udp_checksum(src_ip, dst_ip, dgram_no_ck)
-    # RFC 768: if computed checksum is 0, transmit 0xFFFF
-    if ck == 0: ck = 0xFFFF
-    hdr  = struct.pack("!HHHH", src_port, dst_port, length, ck)
-    dgram = hdr + udp_data
-
-    pn_src = port_note(src_port); pn_dst = port_note(dst_port)
-
-    fields = [
-        {"layer":4,"name":"UDP Source Port",  "raw":dgram[0:2],"user_val":str(src_port),
-         "note":pn_src or "ephemeral"},
-        {"layer":4,"name":"UDP Dest Port",    "raw":dgram[2:4],"user_val":str(dst_port),
-         "note":pn_dst or ""},
-        {"layer":4,"name":"UDP Length",       "raw":dgram[4:6],"user_val":"auto",
-         "note":f"{length}B (8 hdr + {len(udp_data)} data)"},
-        {"layer":4,"name":"UDP Checksum",     "raw":dgram[6:8],"user_val":"auto",
-         "note":f"0x{ck:04x}  RFC768 pseudo-hdr+datagram"},
-    ]
-    if udp_data:
-        fields.append({"layer":4,"name":"UDP Data Payload","raw":udp_data,
-                       "user_val":udp_data.hex()[:24],"note":f"{len(udp_data)}B"})
-    return dgram, fields, ck
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  FRAME ASSEMBLERS
-# ═══════════════════════════════════════════════════════════════════════════════
-
 def assemble_eth_frame(l3_payload, l3_fields,
                        dst_mb, src_mb, type_len_b,
                        llc_b, snap_b, variant,
@@ -1387,437 +1075,21 @@ def assemble_eth_frame(l3_payload, l3_fields,
     records.append({"layer":0,"name":"Ethernet FCS (CRC-32)","raw":fcs,"user_val":"auto/custom","note":fcs_note})
     return full_frame, records
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  CHECKSUM VERIFY REPORT
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def verify_report(checks):
-    """checks: list of (name, stored_val, verify_fn, pass_cond, pass_str)"""
-    print(f"\n  {'─'*80}")
-    print(f"  CHECKSUM / CRC VERIFICATION")
-    print(f"  {'─'*80}")
-    for name, stored, result, passed in checks:
-        status = "PASS ✓" if passed else "FAIL ✗"
-        print(f"  {name:<30}  stored={stored}   verify={result}   {status}")
-    print(f"  {'─'*80}")
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  TOP-LEVEL FLOW CONTROLLERS
-# ═══════════════════════════════════════════════════════════════════════════════
+# ──────────────────────────────────────────────────────────────────────────────
+#  Serial / WAN selector
+# ──────────────────────────────────────────────────────────────────────────────
+def ask_l2_serial():
+    section("LAYER 2 — Serial / WAN  (choose protocol)")
+    for k,v in SERIAL_TYPES.items():
+        marker = "  ←  full 3-type builder" if k == '11' else ""
+        print(f"      {k:>2} = {v}{marker}")
+    ch = input("    Select [3]: ").strip() or '3'
+    if ch not in SERIAL_TYPES: ch = '3'
+    return ch, SERIAL_TYPES[ch]
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  FLOW: Ethernet + ARP
+#  HDLC control field builders + address
 # ──────────────────────────────────────────────────────────────────────────────
-
-def flow_eth_arp():
-    banner("ETHERNET  +  ARP",
-           "L1: Preamble+SFD  |  L2: Ethernet II (0x0806)  |  L3: ARP")
-    preamble, sfd = ask_layer1_eth()
-    (dst_mb, src_mb, type_len_b, llc_b, snap_b,
-     variant, dst_s, src_s, v) = ask_l2_ethernet("0806")
-    arp_inputs    = ask_l3_arp()
-    arp_raw, arp_fields = build_arp(arp_inputs)
-    full_frame, records = assemble_eth_frame(
-        arp_raw, arp_fields, dst_mb, src_mb, type_len_b,
-        llc_b, snap_b, variant, dst_s, src_s, v, preamble, sfd)
-    print_frame_table(records)
-    # verify FCS
-    fcs_stored = full_frame[-4:]
-    fcs_ref    = crc32_eth(full_frame[8:-4])
-    verify_report([
-        ("Ethernet FCS (CRC-32)", fcs_stored.hex(), fcs_ref.hex(), fcs_stored==fcs_ref),
-    ])
-    print_encapsulation(records, full_frame)
-
-# ──────────────────────────────────────────────────────────────────────────────
-#  FLOW: Ethernet + IPv4 + ICMP
-# ──────────────────────────────────────────────────────────────────────────────
-
-def flow_eth_ip_icmp():
-    banner("ETHERNET  +  IPv4  +  ICMP",
-           "L1: Preamble+SFD  |  L2: Ethernet II (0x0800)  |  L3: IPv4  |  L4: ICMP")
-    preamble, sfd = ask_layer1_eth()
-    (dst_mb, src_mb, type_len_b, llc_b, snap_b,
-     variant, dst_s, src_s, v) = ask_l2_ethernet("0800")
-    (src_ip, dst_ip, ttl, ip_id, dscp,
-     df, _) = ask_l3_ipv4()
-    # L4
-    icmp_type, icmp_code, icmp_id, icmp_seq, icmp_data, data_hex = ask_l4_icmp()
-    icmp_msg, icmp_fields, icmp_ck = build_icmp(icmp_type, icmp_code, icmp_id, icmp_seq, icmp_data, data_hex)
-    ip_hdr, ip_fields, ip_ck = build_ipv4(icmp_msg, src_ip, dst_ip, ttl, ip_id, dscp, df, 1)
-    l3_payload = ip_hdr + icmp_msg
-    all_upper  = ip_fields + icmp_fields
-
-    full_frame, records = assemble_eth_frame(
-        l3_payload, all_upper, dst_mb, src_mb, type_len_b,
-        llc_b, snap_b, variant, dst_s, src_s, v, preamble, sfd)
-
-    print_frame_table(records)
-    fcs_stored = full_frame[-4:]
-    fcs_ref    = crc32_eth(full_frame[8:-4])
-    ip_ver     = inet_cksum(ip_hdr)
-    icmp_ver   = inet_cksum(icmp_msg)
-    verify_report([
-        ("IP Header Checksum",    f"0x{ip_ck:04x}",  f"0x{ip_ver:04x}",   ip_ver==0),
-        ("ICMP Checksum",         f"0x{icmp_ck:04x}",f"0x{icmp_ver:04x}", icmp_ver==0),
-        ("Ethernet FCS (CRC-32)", fcs_stored.hex(),  fcs_ref.hex(),        fcs_stored==fcs_ref),
-    ])
-    print_encapsulation(records, full_frame)
-
-# ──────────────────────────────────────────────────────────────────────────────
-#  FLOW: Ethernet + STP/RSTP
-# ──────────────────────────────────────────────────────────────────────────────
-
-def flow_eth_stp():
-    banner("ETHERNET (802.3 + LLC)  +  STP / RSTP BPDU",
-           "L1: Preamble+SFD  |  L2: 802.3+LLC  |  L3: BPDU")
-    preamble, sfd = ask_layer1_eth()
-    stp_inputs = ask_l3_stp()
-    bpdu_raw, bpdu_fields = build_stp(stp_inputs)
-
-    # STP always uses 802.3+LLC, fixed MACs
-    section("LAYER 2 — 802.3 + LLC  (STP uses fixed multicast)")
-    dst_s = get("Destination MAC", "01:80:c2:00:00:00")
-    src_s = get("Source MAC",      "00:11:22:33:44:55")
-    llc_b = bytes.fromhex("424203")   # DSAP=0x42 SSAP=0x42 Ctrl=0x03
-    length_val = len(llc_b) + len(bpdu_raw)
-    tl    = struct.pack('>H', length_val)
-    dst_mb, src_mb = mac_b(dst_s), mac_b(src_s)
-
-    mac_content = dst_mb + src_mb + tl + llc_b + bpdu_raw
-    fcs, fcs_note = ask_fcs_eth(mac_content)
-    full_frame = preamble + sfd + mac_content + fcs
-
-    records = [
-        {"layer":1,"name":"Preamble",        "raw":preamble,"user_val":preamble.hex(),"note":"7×0x55"},
-        {"layer":1,"name":"SFD",             "raw":sfd,     "user_val":sfd.hex(),     "note":"0xD5"},
-        {"layer":2,"name":"Dst MAC",         "raw":dst_mb,  "user_val":dst_s,         "note":"STP multicast"},
-        {"layer":2,"name":"Src MAC",         "raw":src_mb,  "user_val":src_s,         "note":"bridge MAC"},
-        {"layer":2,"name":"802.3 Length",    "raw":tl,      "user_val":str(length_val),"note":"bytes"},
-        {"layer":2,"name":"LLC DSAP",        "raw":llc_b[0:1],"user_val":"42",        "note":"STP SAP"},
-        {"layer":2,"name":"LLC SSAP",        "raw":llc_b[1:2],"user_val":"42",        "note":"STP SAP"},
-        {"layer":2,"name":"LLC Control",     "raw":llc_b[2:3],"user_val":"03",        "note":"UI frame"},
-    ] + bpdu_fields + [
-        {"layer":0,"name":"Ethernet FCS","raw":fcs,"user_val":"auto/custom","note":fcs_note},
-    ]
-    print_frame_table(records)
-    fcs_stored = full_frame[-4:]
-    fcs_ref    = crc32_eth(full_frame[8:-4])
-    verify_report([("Ethernet FCS (CRC-32)", fcs_stored.hex(), fcs_ref.hex(), fcs_stored==fcs_ref)])
-    print_encapsulation(records, full_frame)
-
-# ──────────────────────────────────────────────────────────────────────────────
-#  FLOW: Ethernet + DTP
-# ──────────────────────────────────────────────────────────────────────────────
-
-def flow_eth_dtp():
-    banner("ETHERNET (802.3 + SNAP)  +  DTP",
-           "L1: Preamble+SFD  |  L2: 802.3+SNAP  |  L3: DTP")
-    preamble, sfd = ask_layer1_eth()
-    section("LAYER 2 — Ethernet 802.3")
-    dst_s = get("Destination MAC", "01:00:0c:cc:cc:cc")
-    src_s = get("Source MAC",      "00:11:22:33:44:55")
-    mode  = ask_l3_dtp()
-    dtp_raw, dtp_fields = build_dtp(mode)
-    dst_mb, src_mb = mac_b(dst_s), mac_b(src_s)
-    length_val = len(dtp_raw)
-    tl = struct.pack('>H', length_val)
-    mac_content = dst_mb + src_mb + tl + dtp_raw
-    fcs, fcs_note = ask_fcs_eth(mac_content)
-    full_frame = preamble + sfd + mac_content + fcs
-    records = [
-        {"layer":1,"name":"Preamble","raw":preamble,"user_val":preamble.hex(),"note":"7×0x55"},
-        {"layer":1,"name":"SFD",     "raw":sfd,     "user_val":sfd.hex(),     "note":"0xD5"},
-        {"layer":2,"name":"Dst MAC", "raw":dst_mb,  "user_val":dst_s,         "note":"Cisco multicast"},
-        {"layer":2,"name":"Src MAC", "raw":src_mb,  "user_val":src_s,         "note":""},
-        {"layer":2,"name":"802.3 Length","raw":tl,  "user_val":str(length_val),"note":"bytes"},
-    ] + dtp_fields + [
-        {"layer":0,"name":"Ethernet FCS","raw":fcs,"user_val":"auto/custom","note":fcs_note},
-    ]
-    print_frame_table(records)
-    fcs_stored = full_frame[-4:]
-    fcs_ref    = crc32_eth(full_frame[8:-4])
-    verify_report([("Ethernet FCS (CRC-32)", fcs_stored.hex(), fcs_ref.hex(), fcs_stored==fcs_ref)])
-    print_encapsulation(records, full_frame)
-
-# ──────────────────────────────────────────────────────────────────────────────
-#  FLOW: Ethernet + PAgP
-# ──────────────────────────────────────────────────────────────────────────────
-
-def flow_eth_pagp():
-    banner("ETHERNET (802.3 + SNAP)  +  PAgP",
-           "L1: Preamble+SFD  |  L2: 802.3+SNAP  |  L3: PAgP")
-    preamble, sfd = ask_layer1_eth()
-    section("LAYER 2 — Ethernet 802.3")
-    dst_s = get("Destination MAC", "01:00:0c:cc:cc:cc")
-    src_s = get("Source MAC",      "00:11:22:33:44:55")
-    state = ask_l3_pagp()
-    pagp_raw, pagp_fields = build_pagp(state)
-    dst_mb, src_mb = mac_b(dst_s), mac_b(src_s)
-    length_val = len(pagp_raw)
-    tl = struct.pack('>H', length_val)
-    mac_content = dst_mb + src_mb + tl + pagp_raw
-    fcs, fcs_note = ask_fcs_eth(mac_content)
-    full_frame = preamble + sfd + mac_content + fcs
-    records = [
-        {"layer":1,"name":"Preamble","raw":preamble,"user_val":preamble.hex(),"note":"7×0x55"},
-        {"layer":1,"name":"SFD",     "raw":sfd,     "user_val":sfd.hex(),     "note":"0xD5"},
-        {"layer":2,"name":"Dst MAC", "raw":dst_mb,  "user_val":dst_s,         "note":"Cisco multicast"},
-        {"layer":2,"name":"Src MAC", "raw":src_mb,  "user_val":src_s,         "note":""},
-        {"layer":2,"name":"802.3 Length","raw":tl,  "user_val":str(length_val),"note":"bytes"},
-    ] + pagp_fields + [
-        {"layer":0,"name":"Ethernet FCS","raw":fcs,"user_val":"auto/custom","note":fcs_note},
-    ]
-    print_frame_table(records)
-    fcs_stored = full_frame[-4:]
-    fcs_ref    = crc32_eth(full_frame[8:-4])
-    verify_report([("Ethernet FCS (CRC-32)", fcs_stored.hex(), fcs_ref.hex(), fcs_stored==fcs_ref)])
-    print_encapsulation(records, full_frame)
-
-# ──────────────────────────────────────────────────────────────────────────────
-#  FLOW: Ethernet + LACP
-# ──────────────────────────────────────────────────────────────────────────────
-
-def flow_eth_lacp():
-    banner("ETHERNET II (0x8809)  +  LACP",
-           "L1: Preamble+SFD  |  L2: Ethernet II  |  L3: LACP")
-    preamble, sfd = ask_layer1_eth()
-    section("LAYER 2 — Ethernet II")
-    dst_s = get("Destination MAC", "01:80:c2:00:00:02")
-    src_s = get("Source MAC",      "00:11:22:33:44:55")
-    actor_mac, actor_key, actor_state = ask_l3_lacp()
-    lacp_raw, lacp_fields = build_lacp(actor_mac, actor_key, actor_state)
-    dst_mb, src_mb = mac_b(dst_s), mac_b(src_s)
-    et = bytes.fromhex("8809")
-    mac_content = dst_mb + src_mb + et + lacp_raw
-    fcs, fcs_note = ask_fcs_eth(mac_content)
-    full_frame = preamble + sfd + mac_content + fcs
-    records = [
-        {"layer":1,"name":"Preamble",  "raw":preamble,"user_val":preamble.hex(),"note":"7×0x55"},
-        {"layer":1,"name":"SFD",       "raw":sfd,     "user_val":sfd.hex(),     "note":"0xD5"},
-        {"layer":2,"name":"Dst MAC",   "raw":dst_mb,  "user_val":dst_s,         "note":"Slow Protocol multicast"},
-        {"layer":2,"name":"Src MAC",   "raw":src_mb,  "user_val":src_s,         "note":""},
-        {"layer":2,"name":"EtherType", "raw":et,      "user_val":"0x8809",      "note":"Slow Protocols"},
-    ] + lacp_fields + [
-        {"layer":0,"name":"Ethernet FCS","raw":fcs,"user_val":"auto/custom","note":fcs_note},
-    ]
-    print_frame_table(records)
-    fcs_stored = full_frame[-4:]
-    fcs_ref    = crc32_eth(full_frame[8:-4])
-    verify_report([("Ethernet FCS (CRC-32)", fcs_stored.hex(), fcs_ref.hex(), fcs_stored==fcs_ref)])
-    print_encapsulation(records, full_frame)
-
-# ──────────────────────────────────────────────────────────────────────────────
-#  FLOW: Ethernet + IPv4 + TCP
-# ──────────────────────────────────────────────────────────────────────────────
-
-def flow_eth_ip_tcp():
-    banner("ETHERNET  +  IPv4  +  TCP",
-           "L1: Preamble+SFD  |  L2: Ethernet II (0x0800)  |  L3: IPv4  |  L4: TCP")
-    preamble, sfd = ask_layer1_eth()
-    (dst_mb, src_mb, type_len_b, llc_b, snap_b,
-     variant, dst_s, src_s, v) = ask_l2_ethernet("0800")
-    (src_ip, dst_ip, ttl, ip_id, dscp, df, _) = ask_l3_ipv4()
-    # Force protocol=6 (TCP) regardless of user proto input
-    (step, step_name, src_port, dst_port, seq_num, ack_num,
-     data_off, flags_val, window, urg_ptr, tcp_data,
-     sip, dip) = ask_l4_tcp(src_ip, dst_ip)
-
-    tcp_seg, tcp_fields, tcp_ck = build_tcp(
-        step, step_name, src_port, dst_port, seq_num, ack_num,
-        data_off, flags_val, window, urg_ptr, tcp_data, src_ip, dst_ip)
-
-    ip_hdr, ip_fields, ip_ck = build_ipv4(
-        tcp_seg, src_ip, dst_ip, ttl, ip_id, dscp, df, 6)
-
-    l3_payload = ip_hdr + tcp_seg
-    all_upper  = ip_fields + tcp_fields
-
-    full_frame, records = assemble_eth_frame(
-        l3_payload, all_upper, dst_mb, src_mb, type_len_b,
-        llc_b, snap_b, variant, dst_s, src_s, v, preamble, sfd)
-
-    print_frame_table(records)
-    fcs_stored = full_frame[-4:]
-    fcs_ref    = crc32_eth(full_frame[8:-4])
-    ip_ver     = inet_cksum(ip_hdr)
-    tcp_ver    = tcp_checksum(src_ip, dst_ip, tcp_seg)
-    verify_report([
-        ("IP Header Checksum",    f"0x{ip_ck:04x}",  f"0x{ip_ver:04x}",  ip_ver==0),
-        ("TCP Checksum",          f"0x{tcp_ck:04x}", f"0x{tcp_ver:04x}", tcp_ver==0),
-        ("Ethernet FCS (CRC-32)", fcs_stored.hex(),  fcs_ref.hex(),       fcs_stored==fcs_ref),
-    ])
-    print_encapsulation(records, full_frame)
-
-# ──────────────────────────────────────────────────────────────────────────────
-#  FLOW: Ethernet + IPv4 + UDP
-# ──────────────────────────────────────────────────────────────────────────────
-
-def flow_eth_ip_udp():
-    banner("ETHERNET  +  IPv4  +  UDP",
-           "L1: Preamble+SFD  |  L2: Ethernet II (0x0800)  |  L3: IPv4  |  L4: UDP")
-    preamble, sfd = ask_layer1_eth()
-    (dst_mb, src_mb, type_len_b, llc_b, snap_b,
-     variant, dst_s, src_s, v) = ask_l2_ethernet("0800")
-    (src_ip, dst_ip, ttl, ip_id, dscp, df, _) = ask_l3_ipv4()
-
-    (src_port, dst_port, udp_data,
-     sip, dip) = ask_l4_udp(src_ip, dst_ip)
-
-    udp_dgram, udp_fields, udp_ck = build_udp(
-        src_port, dst_port, udp_data, src_ip, dst_ip)
-
-    ip_hdr, ip_fields, ip_ck = build_ipv4(
-        udp_dgram, src_ip, dst_ip, ttl, ip_id, dscp, df, 17)
-
-    l3_payload = ip_hdr + udp_dgram
-    all_upper  = ip_fields + udp_fields
-
-    full_frame, records = assemble_eth_frame(
-        l3_payload, all_upper, dst_mb, src_mb, type_len_b,
-        llc_b, snap_b, variant, dst_s, src_s, v, preamble, sfd)
-
-    print_frame_table(records)
-    fcs_stored = full_frame[-4:]
-    fcs_ref    = crc32_eth(full_frame[8:-4])
-    ip_ver     = inet_cksum(ip_hdr)
-    udp_ver    = udp_checksum(src_ip, dst_ip, udp_dgram)
-    verify_report([
-        ("IP Header Checksum",    f"0x{ip_ck:04x}",  f"0x{ip_ver:04x}",  ip_ver==0),
-        ("UDP Checksum",          f"0x{udp_ck:04x}", f"0x{udp_ver:04x}", udp_ver==0),
-        ("Ethernet FCS (CRC-32)", fcs_stored.hex(),  fcs_ref.hex(),       fcs_stored==fcs_ref),
-    ])
-    print_encapsulation(records, full_frame)
-
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  HDLC — HIGH-LEVEL DATA LINK CONTROL  (ISO 13239 / ITU-T Q.921 / Q.922)
-#  Full 3-Frame-Type Builder:  I-frame  |  S-frame  |  U-frame
-# ═══════════════════════════════════════════════════════════════════════════════
-#
-#  WHAT IS HDLC?
-#  ─────────────
-#  HDLC is the foundational synchronous data-link protocol used in:
-#    WAN links (leased lines, X.25), ISDN (Q.921 = LAPD), Frame Relay (Q.922),
-#    PPP (uses HDLC framing), Cisco HDLC, SS7 MTP2, GSM Um interface,
-#    SDLC (IBM SNA), LAPB (X.25 layer 2), LAPF (Frame Relay).
-#
-#  FRAME STRUCTURE  (every HDLC frame)
-#  ────────────────────────────────────────────────────────────────────────────
-#  Flag     Address    Control       Information    FCS        Flag
-#  0x7E     1–N bytes  1 or 2 bytes  0+ bytes       2 or 4 B   0x7E
-#  ────────────────────────────────────────────────────────────────────────────
-#  • Flag (0x7E) : start/end of frame — same as in PPP
-#  • Address     : station or DLCI address (1 byte basic, ext with EA bit=0)
-#  • Control     : frame type + sequence numbers (THE KEY FIELD)
-#  • Information : user data payload (present only in I-frames)
-#  • FCS         : CRC-16/CCITT (2 bytes) or CRC-32 (4 bytes)
-#
-#  THE CONTROL FIELD — 3 FRAME TYPES
-#  ────────────────────────────────────────────────────────────────────────────
-#
-#  ┌─────────────────────────────────────────────────────────────────────────┐
-#  │  TYPE 1:  I-FRAME  (Information Frame)                                  │
-#  │  Carries user data.  Uses sliding-window ARQ for reliable delivery.     │
-#  │                                                                         │
-#  │  1-byte control (modulo 8):                                             │
-#  │  Bit  7  6  5  4  3  2  1  0                                            │
-#  │       N(S)3 N(S)2 N(S)1 N(S)0  P/F  N(R)2 N(R)1 N(R)0  0              │
-#  │       └──────N(S)──────┘  │   └──────N(R)──────┘  └─ 0 = I-frame      │
-#  │                            └─ P/F: Poll(cmd) / Final(resp)              │
-#  │                                                                         │
-#  │  2-byte control (modulo 128):                                           │
-#  │  Byte 0: N(S)(7 bits) + 0                                               │
-#  │  Byte 1: N(R)(7 bits) + P/F                                             │
-#  │                                                                         │
-#  │  N(S) = Send sequence number (0–7 or 0–127)                             │
-#  │  N(R) = Receive sequence number (= next expected from peer)             │
-#  └─────────────────────────────────────────────────────────────────────────┘
-#
-#  ┌─────────────────────────────────────────────────────────────────────────┐
-#  │  TYPE 2:  S-FRAME  (Supervisory Frame)                                  │
-#  │  Flow/error control.  NO information field.  4 subtypes:               │
-#  │                                                                         │
-#  │  1-byte control (modulo 8):                                             │
-#  │  Bit  7  6  5  4  3  2  1  0                                            │
-#  │       N(R)2 N(R)1 N(R)0  P/F  S1 S0  1  0                              │
-#  │       └──────N(R)──────┘  │  └──┘  └─── 10 = S-frame                  │
-#  │                            │    └─ Supervisory function bits            │
-#  │                            └─ P/F                                       │
-#  │                                                                         │
-#  │  S1 S0  Subtype  Meaning                                                │
-#  │  ─────  ───────  ──────────────────────────────────────────────────── │
-#  │   0  0   RR     Receive Ready    — ready, ACK up to N(R)-1             │
-#  │   0  1   REJ    Reject           — go-back-N retransmit from N(R)      │
-#  │   1  0   RNR    Receive Not Ready— busy, stop sending                  │
-#  │   1  1   SREJ   Selective Reject — retransmit only frame N(R)          │
-#  └─────────────────────────────────────────────────────────────────────────┘
-#
-#  ┌─────────────────────────────────────────────────────────────────────────┐
-#  │  TYPE 3:  U-FRAME  (Unnumbered Frame)                                   │
-#  │  Link management.  NO sequence numbers.  Many subtypes:                │
-#  │                                                                         │
-#  │  Control byte (always 1 byte):                                          │
-#  │  Bit  7  6  5  4  3  2  1  0                                            │
-#  │       M4 M3 M2  P/F  M1 M0  1  1                                       │
-#  │       └─────┘   │   └──┘  └─── 11 = U-frame                           │
-#  │       modifier   └─ P/F    modifier bits (M4-M0)                       │
-#  │                                                                         │
-#  │  Common U-frame commands/responses:                                     │
-#  │  M4 M3 M2 M1 M0   Mnemonic  C/R  Meaning                               │
-#  │  ─────────────    ────────  ───  ──────────────────────────────────── │
-#  │  0  0  0  0  0    UI        C/R  Unnumbered Information (datagram)     │
-#  │  0  0  1  0  0    UP        C    Unnumbered Poll                        │
-#  │  0  0  0  0  1    RR(U)     C    Disconnect Mode (DM-like)              │
-#  │  0  1  1  0  0    SABM      C    Set Async Balanced Mode (connect)      │
-#  │  0  1  1  0  1    SABME     C    SABM Extended (modulo 128)             │
-#  │  0  0  0  1  1    DM        R    Disconnect Mode (not connected)        │
-#  │  0  0  1  0  1    UA        R    Unnumbered Acknowledgment              │
-#  │  1  0  0  0  1    FRMR      R    Frame Reject (error)                   │
-#  │  1  1  0  0  0    XID       C/R  Exchange Identification                │
-#  │  1  1  1  0  0    TEST      C/R  Test frame                             │
-#  │  0  1  0  0  0    DISC      C    Disconnect                             │
-#  └─────────────────────────────────────────────────────────────────────────┘
-#
-#  ADDRESS FIELD  (EA = Extension Address bit)
-#  ────────────────────────────────────────────────────────────────────────────
-#  Basic (1 byte):  bit 0 = 1  (EA=1 = last byte of address)
-#  Extended:        byte has EA=0, next byte continues, last byte EA=1
-#  In LAPD (Q.921): address = SAPI(6b)+C/R(1b)+EA(1b)  |  TEI(7b)+EA(1b)
-#  In LAPB (X.25):  address = 0x01 (DTE command) or 0x03 (DCE command)
-#  In basic HDLC:   0xFF = broadcast (all stations)
-#
-#  FCS COVERAGE
-#  ────────────────────────────────────────────────────────────────────────────
-#  FCS covers:  Address + Control + Information  (NOT the flags)
-#  CRC-16/CCITT (default): polynomial x^16+x^12+x^5+1, init=0xFFFF
-#  CRC-32       (optional): same as Ethernet CRC-32, little-endian
-#
-# ═══════════════════════════════════════════════════════════════════════════════
-
-# ── HDLC U-frame subtype table ────────────────────────────────────────────────
-HDLC_U_SUBTYPES = {
-    # key: (M4,M3,M2,M1,M0, mnemonic, C/R, description)
-    '1' : (0,0,0,0,0, "UI",    "C/R", "Unnumbered Information — datagram (no ACK)"),
-    '2' : (0,1,1,0,0, "SABM",  "C",   "Set Async Balanced Mode — initiate connection (mod-8)"),
-    '3' : (0,1,1,0,1, "SABME", "C",   "SABM Extended — initiate connection (mod-128)"),
-    '4' : (0,1,0,0,0, "DISC",  "C",   "Disconnect — request to terminate link"),
-    '5' : (0,0,0,1,1, "DM",    "R",   "Disconnect Mode — link not established"),
-    '6' : (0,0,1,0,1, "UA",    "R",   "Unnumbered Acknowledgment — accept SABM/DISC"),
-    '7' : (1,0,0,0,1, "FRMR",  "R",   "Frame Reject — invalid frame received"),
-    '8' : (1,1,0,0,0, "XID",   "C/R", "Exchange Identification — parameter negotiation"),
-    '9' : (1,1,1,0,0, "TEST",  "C/R", "Test — link integrity test"),
-    '10': (0,0,1,0,0, "UP",    "C",   "Unnumbered Poll — poll without sequence numbers"),
-}
-
-HDLC_S_SUBTYPES = {
-    '1': (0,0, "RR",   "Receive Ready    — ACK, ready for more"),
-    '2': (0,1, "REJ",  "Reject           — go-back-N, retransmit from N(R)"),
-    '3': (1,0, "RNR",  "Receive Not Ready— busy, stop sending"),
-    '4': (1,1, "SREJ", "Selective Reject — retransmit only frame N(R)"),
-}
-
 def print_hdlc_education():
     print(f"""
   {'═'*110}
@@ -1915,8 +1187,6 @@ def print_hdlc_education():
   Extended: CRC-32  (4 bytes, same as Ethernet)
   Covers  : Address + Control + Information (NOT flags)
   {'═'*110}""")
-
-
 def build_hdlc_control_i(ns, pf, nr, mod128=False):
     """Build I-frame control field. Returns bytes."""
     if mod128:
@@ -1929,7 +1199,6 @@ def build_hdlc_control_i(ns, pf, nr, mod128=False):
         # layout: N(S)[6:4] P/F[3] N(R)[2:0] 0
         b = ((ns & 0x7) << 5) | ((pf & 1) << 4) | ((nr & 0x7) << 1) | 0
         return bytes([b])
-
 def build_hdlc_control_s(nr, pf, s1s0, mod128=False):
     """Build S-frame control field."""
     if mod128:
@@ -1939,12 +1208,10 @@ def build_hdlc_control_s(nr, pf, s1s0, mod128=False):
     else:
         b = ((nr & 0x7) << 5) | ((pf & 1) << 4) | ((s1s0 & 0x3) << 2) | 0x01
         return bytes([b])
-
 def build_hdlc_control_u(m4m3m2, pf, m1m0):
     """Build U-frame control field (always 1 byte)."""
     b = ((m4m3m2 & 0x7) << 5) | ((pf & 1) << 4) | ((m1m0 & 0x3) << 2) | 0x03
     return bytes([b])
-
 def ask_hdlc_address():
     section("HDLC ADDRESS FIELD")
     print("    0xFF = broadcast (all stations)  0x01 = LAPB DTE  0x03 = LAPB DCE")
@@ -1971,471 +1238,9 @@ def ask_hdlc_address():
         addr_note  = "0xFF broadcast" if addr_byte==0xFF else f"0x{addr_byte:02X}"
     return addr_bytes, addr_note
 
-def flow_hdlc():
-    banner("HDLC FRAME BUILDER — ISO 13239",
-           "3 Frame Types:  I-frame (data+seq)  |  S-frame (supervisory)  |  U-frame (link mgmt)")
-    print_hdlc_education()
-
-    # ── Flags ──────────────────────────────────────────────────────────────────
-    section("FLAGS  (frame delimiters)")
-    print("    Standard HDLC flag = 0x7E.  Both start and end use same value.")
-    flag_hex = get("Flag byte (hex)", "7e",
-        help="Frame delimiter — 1 byte, marks the start and end of every HDLC frame.\n"
-             "0x7E = 01111110 in binary — the standard HDLC flag.\n"
-             "Bit-stuffing inserts a 0 after every 5 consecutive 1-bits inside the frame\n"
-             "to prevent 0x7E appearing in the frame content.\n"
-             "Keep 0x7E unless working with a non-standard implementation.")
-    try:    flag_b = bytes([int(flag_hex, 16) & 0xFF])
-    except: flag_b = b'\x7E'
-
-    # ── Address ───────────────────────────────────────────────────────────────
-    addr_bytes, addr_note = ask_hdlc_address()
-
-    # ── Frame Type ────────────────────────────────────────────────────────────
-    section("HDLC FRAME TYPE")
-    print("    1 = I-frame  (Information)   — reliable data with sequence numbers")
-    print("    2 = S-frame  (Supervisory)   — ACK/NAK/flow control, no data")
-    print("    3 = U-frame  (Unnumbered)    — link setup/teardown/UI datagram")
-    ftype = get("Frame type (1/2/3)", "1")
-    if ftype not in ('1','2','3'): ftype = '1'
-
-    # ── Modulo (I and S only) ─────────────────────────────────────────────────
-    mod128 = False
-    if ftype in ('1','2'):
-        print("\n    Window size / modulo:")
-        print("      Modulo  8: N(S)/N(R) 0–7,   1-byte control  (basic HDLC)")
-        print("      Modulo 128: N(S)/N(R) 0–127, 2-byte control  (extended HDLC / ISDN)")
-        mod128 = get("Use Modulo-128 extended control? (y/n)", "n",
-            help="Modulo controls the sequence number range and control field size.\n"
-                 "Modulo-8:   1-byte control, window size up to 7 frames in flight.\n"
-                 "            Used in basic HDLC, Cisco HDLC, simple WAN links.\n"
-                 "Modulo-128: 2-byte control, window size up to 127 frames in flight.\n"
-                 "            Used in ISDN (LAPD/Q.921), X.25 (LAPB), high-throughput links.\n"
-                 "Choose 128 when you need large send windows or are building LAPD frames.").lower().startswith("y")
-
-    # ── P/F bit ───────────────────────────────────────────────────────────────
-    section("POLL/FINAL (P/F) BIT")
-    print("    P=1 in a COMMAND means: 'respond now' (poll)")
-    print("    F=1 in a RESPONSE means: 'this is my final response'")
-    pf = int(get("P/F bit (0 or 1)", "0",
-        help="Poll/Final bit — 1 bit in the control field.\n"
-             "In a COMMAND frame: P=1 = Poll — instructs the peer to respond immediately.\n"
-             "In a RESPONSE frame: F=1 = Final — this is the last response to a poll.\n"
-             "P=0 / F=0 = normal unsolicited frame (no immediate response required).\n"
-             "Example: Primary sends RR with P=1 (poll), Secondary responds with RR+F=1.")) & 1
-
-    # ─────────────────────────────────────────────────────────────────────────
-    if ftype == '1':
-        # I-FRAME
-        section("I-FRAME — SEQUENCE NUMBERS")
-        print("    N(S) = Send Sequence Number (sequence of THIS frame)")
-        print("    N(R) = Receive Sequence Number (acknowledges receipt up to N(R)-1)")
-        ns_max = 127 if mod128 else 7
-        ns = int(get(f"N(S) Send Sequence  (0–{ns_max})", "0",
-            help=f"N(S) — Send Sequence Number of THIS I-frame (0–{ns_max}).\n"
-                 "Identifies this frame's position in the outgoing sequence.\n"
-                 "Receiver checks N(S) matches what it expects; rejects out-of-order frames.\n"
-                 "After sending N(S)=7 (mod-8), next frame has N(S)=0 (wraps around).")) & (0x7F if mod128 else 0x7)
-        nr = int(get(f"N(R) Receive/ACK Seq (0–{ns_max})", "0",
-            help=f"N(R) — Receive Sequence Number / ACK (0–{ns_max}).\n"
-                 "Meaning: 'I have correctly received all frames up to N(R)-1.'\n"
-                 "Implicitly acknowledges the peer's frames — piggybacked ACK.\n"
-                 "Set to the SeqNum of the NEXT frame you expect from the peer.\n"
-                 "Example: peer sent frames 0,1,2 → set N(R)=3 to ACK all three.")) & (0x7F if mod128 else 0x7)
-        ctrl_bytes = build_hdlc_control_i(ns, pf, nr, mod128)
-        ctrl_note  = f"I-frame  N(S)={ns}  P/F={pf}  N(R)={nr}  {'mod-128' if mod128 else 'mod-8'}"
-
-        section("I-FRAME — INFORMATION PAYLOAD")
-        print("    Enter the data payload in hex.")
-        print("    Examples:  PPP data: ff030021...  IP packet: 4500...")
-        payload_hex = get("Payload hex (Enter=empty)", "")
-        try:    info_bytes = bytes.fromhex(payload_hex.replace(" ",""))
-        except: info_bytes = b''
-        has_info = True
-
-    elif ftype == '2':
-        # S-FRAME
-        section("S-FRAME — SUPERVISORY FUNCTION")
-        for k,(s1,s0,mn,desc) in HDLC_S_SUBTYPES.items():
-            print(f"      {k} = {mn:<6}  {desc}")
-        s_ch = get("S-frame subtype (1-4)", "1")
-        if s_ch not in HDLC_S_SUBTYPES: s_ch = '1'
-        s1, s0, s_mn, s_desc = HDLC_S_SUBTYPES[s_ch]
-        s1s0 = (s1 << 1) | s0
-
-        nr_max = 127 if mod128 else 7
-        nr = int(get(f"N(R) Receive/ACK Sequence (0–{nr_max})", "0",
-            help=f"N(R) — Receive/ACK sequence number for this S-frame (0–{nr_max}).\n"
-                 "Meaning: 'I have received everything up to N(R)-1 correctly.'\n"
-                 "RR with N(R)=5: ACKs frames 0–4, ready to receive frame 5.\n"
-                 "REJ with N(R)=3: frames 0–2 OK, retransmit from frame 3 onward.\n"
-                 "RNR with N(R)=5: ACKs 0–4, but STOP sending — buffer full.\n"
-                 "SREJ with N(R)=3: retransmit only frame 3 (everything else fine).")) & (0x7F if mod128 else 0x7)
-        ctrl_bytes = build_hdlc_control_s(nr, pf, s1s0, mod128)
-        ctrl_note  = f"S-frame  {s_mn}({s_desc.split('—')[0].strip()})  N(R)={nr}  P/F={pf}  {'mod-128' if mod128 else 'mod-8'}"
-        info_bytes = b''
-        has_info   = False
-
-    else:
-        # U-FRAME
-        section("U-FRAME — UNNUMBERED SUBTYPE")
-        for k,(m4,m3,m2,m1,m0,mn,cr,desc) in HDLC_U_SUBTYPES.items():
-            m_str = f"{m4}{m3}{m2}-{m1}{m0}"
-            print(f"    {k:>2} = {mn:<6}  [{m_str}]  {cr:3}  {desc}")
-        u_ch = get("U-frame subtype (1-10)", "1")
-        if u_ch not in HDLC_U_SUBTYPES: u_ch = '1'
-        m4,m3,m2,m1,m0, u_mn, u_cr, u_desc = HDLC_U_SUBTYPES[u_ch]
-        m4m3m2 = (m4<<2)|(m3<<1)|m2
-        m1m0   = (m1<<1)|m0
-        ctrl_bytes = build_hdlc_control_u(m4m3m2, pf, m1m0)
-        ctrl_note  = f"U-frame  {u_mn}  P/F={pf}  M={m4}{m3}{m2}-{m1}{m0}  ({u_cr}) {u_desc}"
-
-        # Info field for UI / XID / TEST / FRMR
-        info_bytes = b''
-        has_info   = u_mn in ("UI", "XID", "TEST", "FRMR")
-        if has_info:
-            section(f"U-FRAME INFO FIELD  ({u_mn} carries optional data)")
-            if u_mn == "XID":
-                print("    XID info format: Format-ID(1B) + Group-ID(1B) + Length(1B) + params")
-                print("    Default: 81 00 00 (basic XID)")
-                xid_hex = get("XID info hex", "810000")
-            elif u_mn == "FRMR":
-                print("    FRMR info: rejected-ctrl(1-2B) + N(R)(3b)+V(S)(3b)+flags(2B)")
-                print("    Flags: W(invalid ctrl) X(info in S/U) Y(info too long) Z(invalid N(R))")
-                xid_hex = get("FRMR info hex (3 bytes)", "000000")
-            elif u_mn == "TEST":
-                print("    TEST info: echo payload (responder copies this back)")
-                xid_hex = get("TEST payload hex", "00112233")
-            else:  # UI
-                print("    UI frame carries data without sequence numbering (like UDP).")
-                xid_hex = get("UI payload hex (Enter=empty)", "")
-            try:    info_bytes = bytes.fromhex(xid_hex.replace(" ",""))
-            except: info_bytes = b''
-
-    # ── FCS ──────────────────────────────────────────────────────────────────
-    fcs_input = addr_bytes + ctrl_bytes + info_bytes
-    section("FCS  (Frame Check Sequence)")
-    print("    1 = CRC-16/CCITT  (2 bytes, standard HDLC, x^16+x^12+x^5+1)")
-    print("    2 = CRC-32        (4 bytes, extended HDLC)")
-    fcs_mode = get("FCS type (1=CRC-16  2=CRC-32)", "1",
-        help="Frame Check Sequence type — detects transmission errors.\n"
-             "1 = CRC-16/CCITT (2 bytes): standard HDLC, PPP, X.25, ISDN LAPD.\n"
-             "    Polynomial x^16+x^12+x^5+1 (0x1021), init=0xFFFF, stored LE.\n"
-             "    Covers: Address + Control + Information fields.\n"
-             "2 = CRC-32 (4 bytes): extended HDLC for high-reliability links.\n"
-             "    Same polynomial as Ethernet CRC-32 — stronger error detection.\n"
-             "    Used when payload > a few KB or when link quality is poor.")
-
-    if fcs_mode == '2':
-        crc_auto = crc32_eth(fcs_input)   # same polynomial
-        fcs_label = "CRC-32 (4B)"
-    else:
-        crc_val  = crc16_ccitt(fcs_input)
-        crc_auto = crc_val.to_bytes(2, 'little')  # HDLC FCS-16 is little-endian
-        fcs_label = "FCS-16/CCITT (2B)"
-
-    print(f"    Auto-computed {fcs_label} = 0x{crc_auto.hex()}")
-    custom = get("Use auto FCS? (y=auto  n=enter custom)", "y")
-    if custom.lower().startswith('n'):
-        fcs_hex = get("Enter FCS hex", crc_auto.hex())
-        try:
-            fcs_bytes = bytes.fromhex(fcs_hex.replace(" ",""))
-            if len(fcs_bytes) not in (2,4):
-                raise ValueError
-        except:
-            print("    -> invalid, using auto")
-            fcs_bytes = crc_auto
-    else:
-        fcs_bytes = crc_auto
-
-    # ── Bit-stuffing option ───────────────────────────────────────────────────
-    section("BIT STUFFING  (transparent operation)")
-    print("    HDLC uses bit-stuffing: after 5 consecutive 1-bits a 0 is inserted.")
-    print("    This prevents 0x7E appearing inside the frame content.")
-    do_stuff = get("Apply bit-stuffing to content? (y/n)", "n",
-        help="Bit-stuffing ensures 0x7E never appears inside the frame content.\n"
-             "How it works: after every 5 consecutive 1-bits, insert a 0-bit.\n"
-             "The receiver removes the stuffed 0 — transparent to upper layers.\n"
-             "y = apply (correct for synchronous HDLC on physical serial lines).\n"
-             "n = skip (correct for async links, or when framing is done by the OS driver).").lower().startswith("y")
-
-    # ── Assemble frame ────────────────────────────────────────────────────────
-    inner = addr_bytes + ctrl_bytes + info_bytes + fcs_bytes
-    if do_stuff:
-        inner = bit_stuff(byte_escape(inner))
-        stuff_note = "bit-stuffed + byte-escaped"
-    else:
-        stuff_note = "raw (no bit-stuffing)"
-
-    full_frame = flag_b + inner + flag_b
-
-    # ── Control field decode for display ──────────────────────────────────────
-    ctrl_hex = ctrl_bytes.hex()
-    if ftype == '1':
-        frame_type_label = "I-frame (Information)"
-    elif ftype == '2':
-        frame_type_label = f"S-frame (Supervisory) — {s_mn}"
-    else:
-        frame_type_label = f"U-frame (Unnumbered) — {u_mn}"
-
-    # ── Verify FCS ────────────────────────────────────────────────────────────
-    if fcs_mode == '2':
-        fcs_verify = crc32_eth(fcs_input)
-    else:
-        fcs_verify = crc16_ccitt(fcs_input).to_bytes(2, 'little')
-
-    # ── Build records ─────────────────────────────────────────────────────────
-    records = [
-        {"layer":1, "name":"HDLC Start Flag",
-         "raw": flag_b, "user_val": flag_b.hex(),
-         "note": "0x7E — frame delimiter (same role as Ethernet Preamble+SFD)"},
-
-        {"layer":2, "name":"HDLC Address",
-         "raw": addr_bytes, "user_val": addr_bytes.hex(),
-         "note": addr_note},
-
-        {"layer":2, "name":f"HDLC Control  ({frame_type_label})",
-         "raw": ctrl_bytes, "user_val": f"0x{ctrl_hex}",
-         "note": ctrl_note},
-    ]
-
-    # Control field sub-breakdown as individual records (display only — zero-length raw)
-    if ftype == '1':
-        if mod128:
-            records += [
-                {"layer":2,"name":"  └─ I-ctrl Byte0: N(S)+0",
-                 "raw":b"",
-                 "user_val":f"N(S)={ns}",
-                 "note":f"bits[7:1]=N(S)={ns}  bit[0]=0(I-frame)"},
-                {"layer":2,"name":"  └─ I-ctrl Byte1: N(R)+P/F",
-                 "raw":b"",
-                 "user_val":f"N(R)={nr} P/F={pf}",
-                 "note":f"bits[7:1]=N(R)={nr}  bit[0]=P/F={pf}"},
-            ]
-        else:
-            records.append({"layer":2,"name":"  └─ I-ctrl bits breakdown",
-                            "raw":b"",
-                            "user_val":f"N(S)={ns} P/F={pf} N(R)={nr}",
-                            "note":f"[7:5]N(S)={ns:03b}  [4]P/F={pf}  [3:1]N(R)={nr:03b}  [0]=0"})
-    elif ftype == '2':
-        records.append({"layer":2,"name":"  └─ S-ctrl bits breakdown",
-                        "raw":b"",
-                        "user_val":f"N(R)={nr} P/F={pf} {s_mn}",
-                        "note":f"[7:5]N(R)={nr:03b}  [4]P/F={pf}  [3:2]SS={s1}{s0}({s_mn})  [1:0]=01"})
-    else:
-        records.append({"layer":2,"name":"  └─ U-ctrl bits breakdown",
-                        "raw":b"",
-                        "user_val":f"{u_mn}  P/F={pf}",
-                        "note":f"[7:5]M={m4}{m3}{m2}  [4]P/F={pf}  [3:2]M={m1}{m0}  [1:0]=11"})
-
-    if info_bytes:
-        records.append({"layer":3,"name":"HDLC Information (payload)",
-                        "raw":info_bytes,
-                        "user_val":info_bytes.hex()[:30] if len(info_bytes)<=15 else f"{len(info_bytes)}B",
-                        "note":f"{len(info_bytes)} bytes"})
-
-    records += [
-        {"layer":0, "name":f"HDLC FCS  ({fcs_label})",
-         "raw": fcs_bytes, "user_val": fcs_bytes.hex(),
-         "note": f"Covers: Addr+Ctrl+Info={len(fcs_input)}B  {stuff_note}"},
-
-        {"layer":1, "name":"HDLC End Flag",
-         "raw": flag_b, "user_val": flag_b.hex(),
-         "note": "0x7E — frame end delimiter"},
-    ]
-
-    # ── Output ────────────────────────────────────────────────────────────────
-    banner(f"HDLC FRAME — {frame_type_label}")
-    print_frame_table(records)
-
-    fcs_ok = (fcs_bytes == fcs_verify)
-    verify_report([
-        (f"HDLC {fcs_label}", fcs_bytes.hex(), fcs_verify.hex(), fcs_ok),
-    ])
-    print_encapsulation(records, full_frame)
-
-
-def flow_serial():
-    banner("SERIAL / WAN FRAME BUILDER",
-           "L2: PPP | HDLC | SLIP | Modbus RTU | ATM AAL5 | Cisco HDLC | KISS | COBS")
-    ch, proto_name = ask_l2_serial()
-
-    # HDLC Full builder — redirect to dedicated 3-frame-type handler
-    if ch == '11':
-        flow_hdlc()
-        return
-
-    start_flag = b'\x7E'; end_flag = b'\x7E'
-    if ch in ('3','4','8','10'):
-        start_flag = get_hex("Start Flag (2 hex)", "7e", 1)
-        end_flag   = get_hex("End   Flag (2 hex)", "7e", 1)
-
-    addr_map = {'3':'ff','4':'ff','8':'ff','10':'0f','7':'01'}
-    address = b''
-    if ch in addr_map:
-        address = get_hex(f"Address/Slave (2 hex)", addr_map[ch], 1)
-
-    control = b''
-    if ch in ('3','4','8','10'):
-        control = get_hex("Control field (2 hex)", "03", 1)
-
-    # L3 inside serial
-    l3_payload = b''
-    l3_fields  = []
-    if ch in ('3','4','8','10'):
-        section("LAYER 3 — Payload inside Serial frame")
-        print("    Options:  1=None (empty)   2=Raw hex   3=IPv4+ICMP")
-        l3ch = input("    Choose [1]: ").strip() or '1'
-        if l3ch == '2':
-            phex = get("Payload hex", "")
-            try:    l3_payload = bytes.fromhex(phex.replace(" ",""))
-            except: l3_payload = b''
-        elif l3ch == '3':
-            (src_ip, dst_ip, ttl, ip_id, dscp, df, _) = ask_l3_ipv4()
-            icmp_type, icmp_code, icmp_id, icmp_seq, icmp_data, data_hex = ask_l4_icmp()
-            icmp_msg, icmp_flds, icmp_ck = build_icmp(icmp_type, icmp_code, icmp_id, icmp_seq, icmp_data, data_hex)
-            ip_hdr, ip_flds, ip_ck = build_ipv4(icmp_msg, src_ip, dst_ip, ttl, ip_id, dscp, df, 1)
-            l3_payload = ip_hdr + icmp_msg
-            l3_fields  = ip_flds + icmp_flds
-
-    header    = address + control
-    crc_input = header + l3_payload
-
-    # CRC selection
-    fcs = b''; fcs_desc = "none"
-    if ch in ('3','4','8','10'):
-        fcs, fcs_desc = ask_serial_crc(crc_input, "FCS-16 CCITT", 'big')
-    elif ch == '7':
-        fcs, fcs_desc = ask_serial_crc(crc_input, "Modbus CRC-16", 'little')
-    elif ch == '9':
-        crc_val = zlib.crc32(crc_input) & 0xFFFFFFFF
-        section("ATM AAL5 CRC-32")
-        cx = input("    1=Auto  2=Custom  [1]: ").strip() or '1'
-        if cx == '2':
-            fh = input("    Enter 8 hex digits: ").strip()
-            try:
-                cf = bytes.fromhex(fh)
-                if len(cf)==4: fcs=cf; fcs_desc="AAL5 CRC-32 custom"
-                else: raise ValueError
-            except:
-                fcs = crc_val.to_bytes(4,'big'); fcs_desc=f"AAL5 CRC-32 auto over {len(crc_input)}B"
-        else:
-            fcs = crc_val.to_bytes(4,'big'); fcs_desc=f"AAL5 CRC-32 auto over {len(crc_input)}B"
-
-    content = header + l3_payload + fcs
-
-    # Apply framing
-    if ch == '2':
-        full_frame = slip_enc(content)
-    elif ch in ('3','4','10'):
-        full_frame = start_flag + byte_escape(content) + end_flag
-    elif ch == '8':
-        full_frame = start_flag + bit_stuff(byte_escape(content)) + end_flag
-    elif ch == '9':
-        pad_len = (48 - (len(content)+8) % 48) % 48
-        full_frame = content + b'\x00'*pad_len + fcs
-    else:
-        full_frame = content
-
-    # Build records
-    records = []
-    if ch in ('3','4','8','10'):
-        records.append({"layer":1,"name":"Start Flag","raw":start_flag,"user_val":start_flag.hex(),"note":""})
-    if address:
-        records.append({"layer":2,"name":"Address","raw":address,"user_val":address.hex(),"note":""})
-    if control:
-        records.append({"layer":2,"name":"Control","raw":control,"user_val":control.hex(),"note":""})
-    records += l3_fields
-    if fcs:
-        records.append({"layer":0,"name":f"CRC/FCS","raw":fcs,"user_val":"auto/custom","note":fcs_desc})
-    if ch in ('3','4','8','10'):
-        records.append({"layer":1,"name":"End Flag","raw":end_flag,"user_val":end_flag.hex(),"note":""})
-
-    banner(f"SERIAL FRAME — {proto_name}")
-    print_frame_table(records)
-    print_encapsulation(records, full_frame)
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  LAYER 3 MENU  (what runs inside Ethernet)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  ETHERNET PAUSE FRAME  (IEEE 802.3x / 802.3-2015 Clause 31)
-# ═══════════════════════════════════════════════════════════════════════════════
-#
-#  PURPOSE
-#  ───────
-#  An Ethernet Pause Frame is a MAC Control frame defined in IEEE 802.3x (now
-#  part of IEEE 802.3-2015, Clause 31).  It implements *symmetric* (link-level)
-#  flow control between two directly connected full-duplex Ethernet stations
-#  (usually a NIC and a switch port, or two switch ports).
-#
-#  When a receiver's buffer is filling up it transmits a Pause frame toward the
-#  sender, asking it to STOP sending for a given time quantum.  The sender MUST
-#  honour the request and halt its transmission for that many quanta, after which
-#  it may resume.  A Pause value of 0 means "resume immediately".
-#
-#  FIELD MAP  (64-byte minimum frame on the wire)
-#  ──────────────────────────────────────────────
-#  Byte  Field                  Size    Value / Notes
-#  ────  ─────────────────────  ──────  ──────────────────────────────────────
-#    0   Preamble               7 B     0x55 × 7  — synchronisation pattern
-#    7   SFD                    1 B     0xD5       — marks start of frame
-#    8   Dst MAC (multicast)    6 B     01:80:C2:00:00:01  (PAUSE reserved addr)
-#          OR unicast dest MAC  6 B     peer's MAC when sent point-to-point
-#   14   Src MAC                6 B     sender's own MAC
-#   20   EtherType              2 B     0x8808  (MAC Control)
-#   22   Opcode                 2 B     0x0001  (PAUSE opcode — only defined one)
-#   24   Pause Quanta           2 B     0x0000–0xFFFF
-#          1 quanta = 512 bit-times at the link speed
-#          @ 1 Gbps  → 1 quanta ≈ 512 ns
-#          @ 10 Gbps → 1 quanta ≈  51.2 ns
-#          Max 0xFFFF = 65535 quanta
-#   26   Pad                   42 B     0x00 × 42  — IEEE 802.3 min frame = 64 B
-#   64   FCS                    4 B     CRC-32 over bytes 8–67 (DST MAC → Pad)
-#  ────
-#  Total on wire: 8 (L1) + 42 (MAC hdr+payload) + 4 (FCS) + 10 (IFG) = 64 B frame
-#
-#  OPCODE — only ONE opcode is defined for basic Pause:
-#    0x0001 = PAUSE  (stop sending for Quanta × 512 bit-times)
-#    0x0101 = PFC PAUSE  (Priority-based Flow Control, IEEE 802.1Qbb — extended)
-#
-#  QUANTA EXAMPLES
-#  ───────────────
-#    Speed     1 quanta   0xFFFF quanta    Typical use
-#    100 Mbps  5.12 µs    335 ms           Legacy Fast Ethernet
-#    1 Gbps    512 ns     33.5 ms          GbE NICs / switches
-#    10 Gbps   51.2 ns    3.35 ms          Data-centre / storage
-#    25 Gbps   20.5 ns    1.34 ms          High-speed uplinks
-#
-#  HOW FLOW CONTROL WORKS
-#  ─────────────────────────────────────────────────────────────────────────────
-#   Receiver (buffer near full)
-#     1. Generates a Pause frame with Quanta = X
-#     2. Transmits it toward the sender on the same full-duplex link
-#
-#   Sender (receives Pause)
-#     1. Finishes current frame in progress (cannot abort mid-frame)
-#     2. Halts NEW frame transmission for X × 512 bit-times
-#     3. May re-enable early if a Pause(0) arrives
-#
-#   Receiver (buffer drained)
-#     1. Sends Pause(0) to cancel remaining pause time immediately
-#
-#  NEGOTIATION
-#  ───────────
-#  Both ends MUST advertise "Symmetric PAUSE" capability in Auto-Negotiation
-#  (Fast Link Pulses, Base Page bit C8 = PAUSE, bit C9 = ASM_DIR).
-#  If not negotiated, Pause frames are silently discarded.
-#
-#  DESTINATION MAC
-#  ───────────────
-#  IEEE 802.3x defines the reserved multicast address 01:80:C2:00:00:01.
-#  Switches do NOT forward this address (it is a "slow protocols" address).
-#  Unicast Pause to the peer MAC is also valid (some implementations use this).
-#
-# ═══════════════════════════════════════════════════════════════════════════════
-
+# ──────────────────────────────────────────────────────────────────────────────
+#  Pause Frame  (IEEE 802.3x)
+# ──────────────────────────────────────────────────────────────────────────────
 def print_pause_education():
     """Print the full educational header for Ethernet Pause Frame."""
     print(f"""
@@ -2493,7 +1298,6 @@ def print_pause_education():
   Both endpoints MUST have negotiated PAUSE capability (Auto-Negotiation base
   page bit C8=1).  If not negotiated, Pause frames are silently ignored.
   {'═'*110}""")
-
 def ask_l2_pause():
     """Collect all Pause Frame inputs with per-field explanation."""
     section("LAYER 1  —  Physical  (Preamble + SFD)")
@@ -2562,7 +1366,6 @@ def ask_l2_pause():
     print("    Padding is always 0x00 × 42. (auto-filled)")
 
     return preamble, sfd, dst_s, src_s, quanta_val
-
 def build_pause(preamble, sfd, dst_s, src_s, quanta_val):
     """
     Build the complete Ethernet Pause Frame.
@@ -2643,88 +1446,9 @@ def build_pause(preamble, sfd, dst_s, src_s, quanta_val):
     ]
     return full_frame, records
 
-def flow_eth_pause():
-    banner("ETHERNET PAUSE FRAME  —  IEEE 802.3x",
-           "L1: Preamble+SFD  |  L2: EtherType 0x8808  |  MAC Ctrl Opcode 0x0001  |  Pause Quanta")
-    print_pause_education()
-    preamble, sfd, dst_s, src_s, quanta_val = ask_l2_pause()
-    full_frame, records = build_pause(preamble, sfd, dst_s, src_s, quanta_val)
-
-    print_frame_table(records)
-
-    fcs_stored = full_frame[-4:]
-    fcs_ref    = crc32_eth(full_frame[8:-4])
-    verify_report([
-        ("Ethernet FCS (CRC-32)", fcs_stored.hex(), fcs_ref.hex(), fcs_stored==fcs_ref),
-    ])
-    print_encapsulation(records, full_frame)
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  LAYER 3 MENU  (what runs inside Ethernet)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  PFC — PRIORITY FLOW CONTROL  (IEEE 802.1Qbb)
-# ═══════════════════════════════════════════════════════════════════════════════
-#
-#  WHAT IS PFC?
-#  ────────────
-#  Priority Flow Control extends the basic Pause frame (802.3x) to support
-#  per-priority (per-CoS class) flow control instead of pausing ALL traffic.
-#  Defined in IEEE 802.1Qbb (merged into 802.1Q-2018).
-#  Used heavily in Data Centre Bridging (DCB) for RoCE, iSCSI, FCoE.
-#
-#  KEY DIFFERENCE FROM BASIC PAUSE
-#  ────────────────────────────────
-#  Basic Pause (0x0001) : pauses ALL 8 priorities simultaneously
-#  PFC       (0x0101)   : per-priority bitmask — pause only specific CoS queues
-#
-#  PFC FRAME STRUCTURE
-#  ───────────────────
-#  Byte  Field                   Size   Fixed?  Value / Notes
-#  ────  ──────────────────────  ─────  ──────  ────────────────────────────────
-#    0   Preamble                7 B    Fixed   0x55 × 7
-#    7   SFD                     1 B    Fixed   0xD5
-#    8   Dst MAC                 6 B    Semi    01:80:C2:00:00:01  (MAC Ctrl mcast)
-#   14   Src MAC                 6 B    User    Sender MAC
-#   20   EtherType               2 B    Fixed   0x8808  (MAC Control)
-#   22   Opcode                  2 B    Fixed   0x0101  (PFC opcode)
-#   24   Priority Enable Vector  2 B    USER    Bitmask: bit N = 1 means pause P(N)
-#                                                bit 0 = Priority 0 (Best Effort)
-#                                                bit 1 = Priority 1
-#                                                ...
-#                                                bit 7 = Priority 7 (Network Control)
-#   26   Quanta[0]               2 B    USER    Pause time for Priority 0
-#   28   Quanta[1]               2 B    USER    Pause time for Priority 1
-#   30   Quanta[2]               2 B    USER    ...
-#   32   Quanta[3]               2 B    USER    ...
-#   34   Quanta[4]               2 B    USER    Commonly mapped to FCoE
-#   36   Quanta[5]               2 B    USER    Commonly mapped to iSCSI / RoCE
-#   38   Quanta[6]               2 B    USER    ...
-#   40   Quanta[7]               2 B    USER    0x0000 = not pausing this priority
-#   42   Pad                    26 B    Auto    0x00 × 26  (pad to 64 B minimum)
-#   68   FCS                     4 B    Auto    CRC-32
-#
-#  PRIORITY → TRAFFIC CLASS TYPICAL MAPPING (DCB / RoCE)
-#  ──────────────────────────────────────────────────────
-#  Priority 0  Best Effort (default)        → most TCP/IP traffic
-#  Priority 1  Background / Scavenger       → bulk backup, low-priority
-#  Priority 2  Spare / Video                → video streaming
-#  Priority 3  Critical Apps / Call Signal  → VoIP signalling
-#  Priority 4  Video Conferencing           → interactive video
-#  Priority 5  Voice / iSCSI / RoCE        → lossless storage/RDMA
-#  Priority 6  Internetwork Control         → routing protocols (OSPF/BGP)
-#  Priority 7  Network Control              → spanning-tree, LLDP
-#
-#  ENABLE VECTOR EXAMPLES
-#  ──────────────────────
-#  0x0020 = 0b00100000 → pause only Priority 5  (RoCE / iSCSI)
-#  0x00E0 = 0b11100000 → pause Priority 5,6,7
-#  0x00FF = 0b11111111 → pause all 8 priorities (same effect as basic Pause)
-#  0x0001 = 0b00000001 → pause only Priority 0
-#
-# ═══════════════════════════════════════════════════════════════════════════════
-
+# ──────────────────────────────────────────────────────────────────────────────
+#  PFC — Priority Flow Control  (IEEE 802.1Qbb)
+# ──────────────────────────────────────────────────────────────────────────────
 def print_pfc_education():
     print(f"""
   {'═'*110}
@@ -2774,7 +1498,6 @@ def print_pfc_education():
 
   Common examples:  0x0020=pause P5 only   0x00E0=pause P5+P6+P7   0x00FF=pause all
   {'═'*110}""")
-
 def ask_l2_pfc():
     section("LAYER 1  —  Physical")
     preamble = get_hex("Preamble  7 B", "55555555555555", 7)
@@ -2816,7 +1539,6 @@ def ask_l2_pfc():
         quanta.append(q_val)
 
     return preamble, sfd, dst_s, src_s, vec_val, quanta
-
 def build_pfc(preamble, sfd, dst_s, src_s, vec_val, quanta):
     et     = bytes.fromhex("8808")
     opcode = bytes.fromhex("0101")
@@ -2858,83 +1580,9 @@ def build_pfc(preamble, sfd, dst_s, src_s, vec_val, quanta):
     ]
     return full_frame, records
 
-def flow_eth_pfc():
-    banner("PFC — PRIORITY FLOW CONTROL  IEEE 802.1Qbb",
-           "L1: Preamble+SFD  |  L2: EtherType 0x8808  |  Opcode 0x0101  |  8×Priority Quanta")
-    print_pfc_education()
-    preamble, sfd, dst_s, src_s, vec_val, quanta = ask_l2_pfc()
-    full_frame, records = build_pfc(preamble, sfd, dst_s, src_s, vec_val, quanta)
-    print_frame_table(records)
-    fcs_stored = full_frame[-4:]
-    fcs_ref    = crc32_eth(full_frame[8:-4])
-    verify_report([("Ethernet FCS (CRC-32)", fcs_stored.hex(), fcs_ref.hex(), fcs_stored==fcs_ref)])
-    print_encapsulation(records, full_frame)
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  LLDP — LINK LAYER DISCOVERY PROTOCOL  (IEEE 802.1AB)
-# ═══════════════════════════════════════════════════════════════════════════════
-#
-#  WHAT IS LLDP?
-#  ─────────────
-#  LLDP is a vendor-neutral L2 discovery protocol.  Devices advertise their
-#  identity, capabilities, and management addresses to directly connected
-#  neighbours.  Neighbours store the info in an MIB (LLDP-MIB, RFC 2922).
-#  Sent to the multicast address 01:80:C2:00:00:0E every 30s (default).
-#  NOT forwarded by bridges/switches (link-local multicast).
-#
-#  TLV STRUCTURE (Type-Length-Value)
-#  ───────────────────────────────────────────────────────────────────────────
-#  Every LLDP PDU is a sequence of TLVs.  Each TLV:
-#    Bits 15-9 : Type  (7 bits)
-#    Bits  8-0 : Length (9 bits) — number of value bytes following
-#    Bytes  …  : Value (0–511 bytes)
-#
-#  MANDATORY TLVs (must appear, in this order)
-#  ────────────────────────────────────────────────────────────────────────────
-#  Type  Name                    Description
-#  ────  ──────────────────────  ──────────────────────────────────────────────
-#    0   End of LLDPDU           Length=0, marks end of PDU. MUST be last TLV.
-#    1   Chassis ID              Identifies the sending chassis.
-#                                  Subtype 4 = MAC address  (6 B value)
-#                                  Subtype 5 = Network Address
-#                                  Subtype 7 = Locally Assigned (string)
-#    2   Port ID                 Identifies the sending port.
-#                                  Subtype 3 = MAC address  (6 B value)
-#                                  Subtype 5 = Interface Name (string)
-#                                  Subtype 7 = Locally Assigned (string)
-#    3   TTL                     Seconds neighbours should retain this info.
-#                                  0 = remove immediately (device leaving)
-#                                  120 = default; max 65535
-#
-#  OPTIONAL TLVs
-#  ─────────────────────────────────────────────────────────────────────────────
-#  Type  Name                    Description
-#  ────  ──────────────────────  ──────────────────────────────────────────────
-#    4   Port Description        Human-readable port description string
-#    5   System Name             sysName MIB object (hostname)
-#    6   System Description      sysDescr MIB object (OS, version, platform)
-#    7   System Capabilities     2-byte bitmask + 2-byte enabled bitmask
-#                                  bit 0=Other  bit 1=Repeater  bit 2=Bridge
-#                                  bit 3=WLAN   bit 4=Router    bit 5=Telephone
-#                                  bit 6=DOCSIS bit 7=Station
-#    8   Management Address      IP or MAC address for SNMP/mgmt access
-#  127   Org-Specific (OUID+Sub) Used by 802.1 / 802.3 / Cisco extensions
-#
-#  LLDP FRAME STRUCTURE
-#  ─────────────────────
-#  Byte  Field               Size    Value
-#  ────  ──────────────────  ──────  ──────────────────────────────────────────
-#    0   Preamble            7 B     0x55 × 7
-#    7   SFD                 1 B     0xD5
-#    8   Dst MAC             6 B     01:80:C2:00:00:0E  (LLDP multicast)
-#   14   Src MAC             6 B     Sender MAC
-#   20   EtherType           2 B     0x88CC  (LLDP)
-#   22   LLDPDU              var     Sequence of TLVs
-#   ??   FCS                 4 B     CRC-32
-#
-# ═══════════════════════════════════════════════════════════════════════════════
-
+# ──────────────────────────────────────────────────────────────────────────────
+#  LLDP — Link Layer Discovery Protocol  (IEEE 802.1AB)
+# ──────────────────────────────────────────────────────────────────────────────
 def print_lldp_education():
     print(f"""
   {'═'*110}
@@ -2985,13 +1633,11 @@ def print_lldp_education():
   01:80:C2:00:00:0E  → LLDP dedicated multicast (IEEE 802.1AB)
   NOT forwarded by 802.1D bridges.
   {'═'*110}""")
-
 def make_lldp_tlv(tlv_type, value_bytes):
     """Build a single LLDP TLV: 2-byte header (type<<9 | length) + value."""
     length = len(value_bytes)
     header = struct.pack("!H", (tlv_type << 9) | length)
     return header + value_bytes
-
 def ask_l2_lldp():
     section("LAYER 1  —  Physical")
     preamble = get_hex("Preamble  7 B", "55555555555555", 7)
@@ -3078,7 +1724,6 @@ def ask_l2_lldp():
     return (preamble, sfd, dst_s, src_s,
             chassis_val, port_val, ttl_val, ttl_bytes,
             opt_tlvs)
-
 def build_lldp(preamble, sfd, dst_s, src_s,
                chassis_val, port_val, ttl_val, ttl_bytes, opt_tlvs):
     dst_mb = mac_b(dst_s)
@@ -3130,64 +1775,9 @@ def build_lldp(preamble, sfd, dst_s, src_s,
     ]
     return full_frame, records
 
-def flow_eth_lldp():
-    banner("LLDP — LINK LAYER DISCOVERY PROTOCOL  IEEE 802.1AB",
-           "L1: Preamble+SFD  |  L2: EtherType 0x88CC  |  L3: LLDP TLVs (Chassis+Port+TTL+Options)")
-    print_lldp_education()
-    inputs = ask_l2_lldp()
-    full_frame, records = build_lldp(*inputs)
-    print_frame_table(records)
-    fcs_stored = full_frame[-4:]
-    fcs_ref    = crc32_eth(full_frame[8:-4])
-    verify_report([("Ethernet FCS (CRC-32)", fcs_stored.hex(), fcs_ref.hex(), fcs_stored==fcs_ref)])
-    print_encapsulation(records, full_frame)
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  VLAN TAGGED FRAME  (IEEE 802.1Q)
-# ═══════════════════════════════════════════════════════════════════════════════
-#
-#  WHAT IS 802.1Q?
-#  ───────────────
-#  IEEE 802.1Q inserts a 4-byte VLAN tag between the Source MAC and EtherType.
-#  It allows a single physical link to carry traffic for multiple VLANs.
-#  Used on trunk ports between switches and between switches and routers.
-#
-#  THE 802.1Q TAG  (4 bytes inserted at offset 12)
-#  ─────────────────────────────────────────────────────────────────────────────
-#  Bytes  Field               Size   Value / Notes
-#  ─────  ──────────────────  ─────  ─────────────────────────────────────────
-#   +0    TPID (Tag Protocol  2 B    0x8100  (standard 802.1Q)
-#           Identifier)               0x88A8  (802.1ad Q-in-Q outer tag)
-#                                     0x9100  (Cisco proprietary Q-in-Q)
-#   +2    TCI (Tag Control    2 B    Combined: PCP(3b) + DEI(1b) + VID(12b)
-#           Information)
-#           PCP  bits 15-13   3 b    Priority Code Point = CoS 0–7
-#                                     0=BestEffort  1=Background  2=Excellent
-#                                     3=CritApp     4=Video       5=Voice
-#                                     6=Internetwork-Ctrl   7=Network-Ctrl
-#           DEI  bit 12       1 b    Drop Eligible Indicator (0=keep, 1=drop)
-#           VID  bits 11-0   12 b    VLAN ID  0–4095
-#                                     0    = priority-tagged only (no VLAN)
-#                                     1    = default native VLAN
-#                                     1–4094 = user VLANs
-#                                     4095 = reserved, not used
-#
-#  DOUBLE TAGGING (Q-in-Q / 802.1ad)
-#  ───────────────────────────────────
-#  Outer tag TPID = 0x88A8  (provider tag / S-Tag)
-#  Inner tag TPID = 0x8100  (customer tag / C-Tag)
-#  Used by Metro Ethernet providers to tunnel customer VLANs.
-#
-#  PCP → PRIORITY MAPPING
-#  ────────────────────────
-#  PCP 0  Best Effort (default)      PCP 4  Controlled Load
-#  PCP 1  Background (low priority)  PCP 5  Video <100ms latency
-#  PCP 2  Excellent Effort           PCP 6  Voice <10ms latency
-#  PCP 3  Critical Applications      PCP 7  Network Control
-#
-# ═══════════════════════════════════════════════════════════════════════════════
-
+# ──────────────────────────────────────────────────────────────────────────────
+#  VLAN Tagged Frame  (IEEE 802.1Q)
+# ──────────────────────────────────────────────────────────────────────────────
 def print_vlan_education():
     print(f"""
   {'═'*110}
@@ -3235,7 +1825,6 @@ def print_vlan_education():
   Tagged   :  DstMAC(6) | SrcMAC(6) | TPID(2) | TCI(2) | EtherType(2) | Payload
   Q-in-Q   :  DstMAC(6) | SrcMAC(6) | TPID_S(2) | TCI_S(2) | TPID_C(2) | TCI_C(2) | EtherType(2) | Payload
   {'═'*110}""")
-
 def ask_l2_vlan():
     section("LAYER 1  —  Physical")
     preamble = get_hex("Preamble  7 B", "55555555555555", 7)
@@ -3315,7 +1904,6 @@ def ask_l2_vlan():
             tpid_val, tci, pcp, dei, vid,
             double_tag, inner_tpid_val, inner_tci,
             inner_et, payload)
-
 def build_vlan(preamble, sfd, dst_s, src_s,
                tpid_val, tci, pcp, dei, vid,
                double_tag, inner_tpid_val, inner_tci,
@@ -3364,83 +1952,9 @@ def build_vlan(preamble, sfd, dst_s, src_s,
     ]
     return full_frame, records
 
-def flow_eth_vlan():
-    banner("VLAN TAGGED FRAME  —  IEEE 802.1Q  (+Q-in-Q / 802.1ad option)",
-           "L1: Preamble+SFD  |  L2: TPID(0x8100)+TCI[PCP+DEI+VID]  |  Inner EtherType  |  Payload")
-    print_vlan_education()
-    inputs = ask_l2_vlan()
-    full_frame, records = build_vlan(*inputs)
-    print_frame_table(records)
-    fcs_stored = full_frame[-4:]
-    fcs_ref    = crc32_eth(full_frame[8:-4])
-    verify_report([("Ethernet FCS (CRC-32)", fcs_stored.hex(), fcs_ref.hex(), fcs_stored==fcs_ref)])
-    print_encapsulation(records, full_frame)
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  JUMBO FRAME  (vendor extension — no IEEE standard number)
-# ═══════════════════════════════════════════════════════════════════════════════
-#
-#  WHAT IS A JUMBO FRAME?
-#  ──────────────────────
-#  Jumbo frames are Ethernet frames with an MTU larger than the standard 1500B.
-#  They are NOT defined in any IEEE standard — they are a vendor extension.
-#  Common jumbo MTU values: 9000B (most switches), 9216B, 9600B, 16110B.
-#
-#  KEY BENEFIT
-#  ───────────
-#  Larger frames = fewer frames for same data = less CPU overhead per byte.
-#  For 1 GbE with 9000B jumbo vs 1500B standard:
-#    Efficiency gain ≈ 9000/1500 = 6× fewer frame headers, interrupts, checksums.
-#  Used in: NFS, iSCSI, Ceph, Hadoop, HPC clusters, storage networks.
-#
-#  REQUIREMENTS
-#  ────────────
-#  • ALL devices on the path must support and have jumbo frames enabled.
-#  • One misconfigured switch/NIC causes silent frame drops or fragmentation.
-#  • Must be configured consistently: same MTU on both ends of every link.
-#  • Jumbo frames do NOT fragment if the IP DF (Don't Fragment) bit is set.
-#
-#  STANDARD vs JUMBO SIZE COMPARISON
-#  ────────────────────────────────────────────────────────────────────────────
-#  Frame type      Max payload   Total frame   Use case
-#  ─────────────── ─────────────  ────────────  ─────────────────────────────
-#  Standard        1500 B        1518 B         General LAN
-#  Baby Giant      1600 B        1618 B         MPLS labels (+4B per label)
-#  Jumbo (typical) 9000 B        9018 B         NFS/iSCSI/Ceph/HPC
-#  Jumbo (extended)9216 B        9234 B         Some storage switches
-#  Super Jumbo     16110 B       16128 B        InfiniBand bridging
-#
-#  FIELD STRUCTURE  (same as standard Ethernet II — only payload size differs)
-#  ─────────────────────────────────────────────────────────────────────────────
-#  Byte  Field        Size   Value
-#  ────  ───────────  ─────  ──────────────────────────────────────────────────
-#    0   Preamble     7 B    0x55 × 7
-#    7   SFD          1 B    0xD5
-#    8   Dst MAC      6 B    destination MAC
-#   14   Src MAC      6 B    source MAC
-#   20   EtherType    2 B    0x0800(IPv4) / 0x86DD(IPv6) / etc.
-#   22   Payload      up to 9000 B  (or more depending on NIC config)
-#   ??   FCS          4 B    CRC-32
-#
-#  NOTE ON VLAN-TAGGED JUMBO
-#  ─────────────────────────
-#  With a 802.1Q tag, the tag itself (+4B) does not reduce the payload limit.
-#  The NIC sees 9000B payload + 4B tag = 9004B payload space needed.
-#  Known as "9004-byte jumbo" in some vendor documentation.
-#
-# ═══════════════════════════════════════════════════════════════════════════════
-
-JUMBO_PRESETS = {
-    '1': (1500,  "Standard Ethernet (baseline)"),
-    '2': (1600,  "Baby Giant  (MPLS +1 label)"),
-    '3': (4470,  "FDDI over Ethernet bridging"),
-    '4': (9000,  "Typical Jumbo (NFS/iSCSI/Ceph/HPC)"),
-    '5': (9216,  "Extended Jumbo (storage switches)"),
-    '6': (16110, "Super Jumbo (InfiniBand bridging)"),
-    '7': (0,     "Custom"),
-}
-
+# ──────────────────────────────────────────────────────────────────────────────
+#  Jumbo Frame  (vendor extension)
+# ──────────────────────────────────────────────────────────────────────────────
 def print_jumbo_education():
     print(f"""
   {'═'*110}
@@ -3480,7 +1994,6 @@ def print_jumbo_education():
   A VLAN tag adds 4 bytes to the frame but should NOT reduce payload space.
   Many switches support "9004-byte jumbo" to accommodate the extra 4 bytes.
   {'═'*110}""")
-
 def ask_l2_jumbo():
     section("LAYER 1  —  Physical")
     preamble = get_hex("Preamble  7 B", "55555555555555", 7)
@@ -3540,7 +2053,6 @@ def ask_l2_jumbo():
         print(f"    -> VLAN tag: {vlan_tag.hex()}  ({vlan_note})")
 
     return preamble, sfd, dst_s, src_s, et, payload, vlan_tag, vlan_note, max_payload, preset_desc
-
 def build_jumbo(preamble, sfd, dst_s, src_s, et, payload, vlan_tag, vlan_note, max_payload, preset_desc):
     dst_mb = mac_b(dst_s)
     src_mb = mac_b(src_s)
@@ -3565,195 +2077,644 @@ def build_jumbo(preamble, sfd, dst_s, src_s, et, payload, vlan_tag, vlan_note, m
     ]
     return full_frame, records
 
-def flow_eth_jumbo():
-    banner("JUMBO FRAME  —  Non-Standard Vendor Extension",
-           "L1: Preamble+SFD  |  L2: Ethernet II  |  Payload up to 9000B+ (MTU > 1500B)")
-    print_jumbo_education()
-    inputs = ask_l2_jumbo()
-    full_frame, records = build_jumbo(*inputs)
-    total = len(full_frame)
-    print(f"\n  -> Frame size: {total} bytes  ({total*8} bits)")
-    if total > 1518:
-        overhead_pct = (14 + 4) / total * 100
-        print(f"  -> Header overhead: {overhead_pct:.2f}%  (Payload efficiency: {100-overhead_pct:.2f}%)")
-    print_frame_table(records)
-    fcs_stored = full_frame[-4:]
-    fcs_ref    = crc32_eth(full_frame[8:-4])
-    verify_report([("Ethernet FCS (CRC-32)", fcs_stored.hex(), fcs_ref.hex(), fcs_stored==fcs_ref)])
-    print_encapsulation(records, full_frame)
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 5 — LAYER 3  (Network)
+# ══════════════════════════════════════════════════════════════════════════════
+def ask_l3_arp():
+    section("LAYER 3 — ARP")
+    hw_type    = get("Hardware Type (1=Ethernet)", "1",
+        help="Identifies the link-layer (hardware) address type.\n"
+             "1 = Ethernet (most common)   6 = IEEE 802 networks   15 = Frame Relay\n"
+             "Wrong value: receiver discards the ARP or misinterprets addresses.")
+    proto_type = get("Protocol Type hex (0800=IPv4)", "0800",
+        help="Same as EtherType — identifies the network-layer protocol.\n"
+             "0800 = IPv4 (standard)   86DD = IPv6   8100 = VLAN\n"
+             "This tells ARP what kind of network address (IP) is being resolved.")
+    hw_len     = get("HW Address Length", "6",
+        help="Length of hardware (MAC) addresses in this packet, in bytes.\n"
+             "6 = Ethernet MAC address (always 6 for Ethernet).\n"
+             "Wrong value: receiver won't know where sender/target MACs end.")
+    proto_len  = get("Protocol Address Length", "4",
+        help="Length of network (IP) addresses in this packet, in bytes.\n"
+             "4 = IPv4 address (always 4 for IPv4).   16 = IPv6 address.\n"
+             "Wrong value: receiver reads wrong bytes as the IP address.")
+    opcode     = get("Opcode  1=Request  2=Reply", "1",
+        help="ARP operation code.\n"
+             "1 = Request  — 'Who has IP X? Tell IP Y' (broadcast, target MAC = 00:00..)\n"
+             "2 = Reply    — 'IP X is at MAC AA:BB:CC:DD:EE:FF' (unicast reply)\n"
+             "3 = RARP Request   4 = RARP Reply (reverse ARP, rarely used today)")
+    sender_ha  = get("Sender MAC", "00:11:22:33:44:55",
+        help="MAC address of the device SENDING this ARP frame.\n"
+             "In a Request: your own MAC.   In a Reply: your own MAC.\n"
+             "Receiver uses this to update its ARP cache (IP→MAC mapping).")
+    sender_pa  = get("Sender IP",  "192.168.1.10",
+        help="IP address of the device SENDING this ARP frame (your IP).\n"
+             "In a Request: your own IP.   In a Reply: your own IP.\n"
+             "Gratuitous ARP: sender IP = target IP (announces your own IP).")
+    target_ha  = get("Target MAC", "00:00:00:00:00:00",
+        help="MAC address of the TARGET device.\n"
+             "In a Request: 00:00:00:00:00:00 (unknown — that's why we're asking!).\n"
+             "In a Reply: the MAC of the device that sent the original request.")
+    target_pa  = get("Target IP",  "192.168.1.100",
+        help="IP address you want to resolve to a MAC address.\n"
+             "In a Request: the IP whose MAC you want to find.\n"
+             "In a Reply: the IP of the original requester.\n"
+             "Must match the IP being queried — receiver ignores non-matching replies.")
+    return (hw_type, proto_type, hw_len, proto_len, opcode,
+            sender_ha, sender_pa, target_ha, target_pa)
+def build_arp(inputs):
+    hw_type, proto_type, hw_len, proto_len, opcode, sha, spa, tha, tpa = inputs
+    hdr  = struct.pack("!HHBBH",
+               int(hw_type), int(proto_type, 16),
+               int(hw_len), int(proto_len), int(opcode))
+    body = mac_b(sha) + ip_b(spa) + mac_b(tha) + ip_b(tpa)
+    raw  = hdr + body
+    op_s = "Request" if opcode=="1" else "Reply" if opcode=="2" else opcode
+    fields = [
+        {"layer":3,"name":"ARP HW Type",       "raw":hdr[0:2],   "user_val":hw_type,    "note":"1=Ethernet"},
+        {"layer":3,"name":"ARP Protocol Type", "raw":hdr[2:4],   "user_val":proto_type, "note":"0800=IPv4"},
+        {"layer":3,"name":"ARP HW Addr Len",   "raw":hdr[4:5],   "user_val":hw_len,     "note":"bytes"},
+        {"layer":3,"name":"ARP Proto Addr Len","raw":hdr[5:6],   "user_val":proto_len,  "note":"bytes"},
+        {"layer":3,"name":"ARP Opcode",        "raw":hdr[6:8],   "user_val":opcode,     "note":op_s},
+        {"layer":3,"name":"ARP Sender MAC",    "raw":body[0:6],  "user_val":sha,        "note":""},
+        {"layer":3,"name":"ARP Sender IP",     "raw":body[6:10], "user_val":spa,        "note":""},
+        {"layer":3,"name":"ARP Target MAC",    "raw":body[10:16],"user_val":tha,        "note":""},
+        {"layer":3,"name":"ARP Target IP",     "raw":body[16:20],"user_val":tpa,        "note":""},
+    ]
+    return raw, fields
+def ask_l3_ipv4():
+    section("LAYER 3 — IPv4")
+    src_ip  = get("Source IP", "192.168.1.10",
+        help="IPv4 address of the SENDER of this packet.\n"
+             "Must be your interface's IP address (or spoofed for testing).\n"
+             "Used by receiver to send replies back to you.\n"
+             "Private ranges: 10.x.x.x / 172.16-31.x.x / 192.168.x.x")
+    dst_ip  = get("Destination IP", "192.168.1.20",
+        help="IPv4 address of the intended RECEIVER.\n"
+             "For unicast: target host's IP.   255.255.255.255 = limited broadcast.\n"
+             "Network broadcast: e.g. 192.168.1.255 (host bits all 1).\n"
+             "224.0.0.0–239.255.255.255 = multicast range.")
+    ttl     = get("TTL", "64",
+        help="Time To Live — decremented by 1 at each router hop.\n"
+             "Packet discarded when TTL reaches 0 (prevents routing loops).\n"
+             "64 = Linux/Mac default.   128 = Windows default.   255 = maximum.\n"
+             "Low TTL (e.g. 1) = traceroute trick to get ICMP Time Exceeded back.")
+    ip_id   = get("Identification (decimal)", "4660",
+        help="16-bit identifier for this packet (0–65535).\n"
+             "All fragments of the same original packet share the same ID.\n"
+             "Used with Fragment Offset to reassemble fragmented packets.\n"
+             "For non-fragmented packets, value is arbitrary (OS usually increments it).")
+    dscp    = get("DSCP/ECN (decimal, usu. 0)", "0",
+        help="Differentiated Services Code Point + ECN (6+2 bits = 1 byte).\n"
+             "DSCP controls QoS queuing priority in routers:\n"
+             "0=Best Effort  8=CS1(low)  40=CS5  46=EF(voice/VoIP)  48=CS6(routing)\n"
+             "ECN bits (low 2): 0=non-ECN  1/2=ECN-capable  3=Congestion Experienced")
+    df      = get("DF flag? (y/n)", "y",
+        help="Don't Fragment bit in the IP Flags field.\n"
+             "y = DF=1: routers MUST NOT fragment this packet.\n"
+             "    If packet is too large, router drops it and sends ICMP type 3 code 4.\n"
+             "    Required for Path MTU Discovery (PMTUD) to work correctly.\n"
+             "n = DF=0: routers may fragment if needed (legacy behaviour).")
+    return src_ip, dst_ip, int(ttl), int(ip_id), int(dscp), df.lower().startswith('y'), 0
+def build_ipv4(l4_payload, src_ip, dst_ip, ttl, ip_id, dscp, df, proto_num):
+    flags_frag = 0x4000 if df else 0x0000
+    ver_ihl    = (4 << 4) | 5
+    tot_len    = 20 + len(l4_payload)
+    hdr0 = struct.pack("!BBHHHBBH4s4s",
+               ver_ihl, dscp, tot_len, ip_id, flags_frag,
+               ttl, proto_num, 0, ip_b(src_ip), ip_b(dst_ip))
+    ck = inet_cksum(hdr0)
+    hdr = struct.pack("!BBHHHBBH4s4s",
+               ver_ihl, dscp, tot_len, ip_id, flags_frag,
+               ttl, proto_num, ck, ip_b(src_ip), ip_b(dst_ip))
 
+    flag_s = ("DF" if flags_frag & 0x4000 else "") + ("MF" if flags_frag & 0x2000 else "")
+    proto_s = L3_PROTO_NAMES.get(proto_num, str(proto_num))
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  LAYER 3 MENU
-# ═══════════════════════════════════════════════════════════════════════════════
+    fields = [
+        {"layer":3,"name":"IP Version + IHL",    "raw":hdr[0:1],  "user_val":"4 / 5",    "note":"IPv4, 20B header"},
+        {"layer":3,"name":"IP DSCP/ECN",          "raw":hdr[1:2],  "user_val":str(dscp),  "note":""},
+        {"layer":3,"name":"IP Total Length",      "raw":hdr[2:4],  "user_val":"auto",     "note":f"{tot_len}B (20+{len(l4_payload)})"},
+        {"layer":3,"name":"IP Identification",    "raw":hdr[4:6],  "user_val":str(ip_id), "note":f"0x{ip_id:04x}"},
+        {"layer":3,"name":"IP Flags + FragOffset","raw":hdr[6:8],  "user_val":flag_s or "none", "note":"frag offset=0"},
+        {"layer":3,"name":"IP TTL",               "raw":hdr[8:9],  "user_val":str(ttl),   "note":"hops"},
+        {"layer":3,"name":"IP Protocol",          "raw":hdr[9:10], "user_val":str(proto_num), "note":proto_s},
+        {"layer":3,"name":"IP Header Checksum",   "raw":hdr[10:12],"user_val":"auto",     "note":f"0x{ck:04x} RFC791"},
+        {"layer":3,"name":"IP Source Address",    "raw":hdr[12:16],"user_val":src_ip,     "note":""},
+        {"layer":3,"name":"IP Destination Addr",  "raw":hdr[16:20],"user_val":dst_ip,     "note":""},
+    ]
+    return hdr, fields, ck
+def ask_l3_stp():
+    section("LAYER 3 — STP / RSTP BPDU")
+    version   = get("Version  0=STP  2=RSTP", "2",
+        help="BPDU protocol version.\n"
+             "0 = STP (802.1D original) — slow convergence, 30–50 seconds.\n"
+             "2 = RSTP (802.1w/802.1D-2004) — fast convergence, <1 second.\n"
+             "3 = MSTP (802.1s) — multiple spanning tree instances.")
+    bpdu_type = get("BPDU Type  00=Config  80=TCN", "00",
+        help="Type of BPDU message.\n"
+             "00 = Configuration BPDU — normal periodic hello from root/designated bridge.\n"
+             "80 = Topology Change Notification — alert that topology has changed.\n"
+             "02 = RSTP BPDU (used when version=2).")
+    flags     = get("Flags (hex)", "00",
+        help="8-bit flags field (more important in RSTP).\n"
+             "Bit 0: Topology Change   Bit 7: Topology Change Acknowledgment\n"
+             "RSTP adds bits 1-6: Proposal, Port Role (2b), Learning, Forwarding, Agreement.\n"
+             "0x00 = no flags set.   0x3C = RSTP Designated port, Learning+Forwarding.")
+    root_prio = get("Root Priority", "32768",
+        help="Priority component of the Root Bridge ID (0–61440, steps of 4096).\n"
+             "Bridge with LOWEST Bridge ID becomes Root Bridge.\n"
+             "Bridge ID = Priority(2B) + MAC(6B).  Lower priority = more likely to be root.\n"
+             "Default: 32768.   Set 4096 to force a switch to become root.")
+    root_mac  = get("Root MAC", "00:00:00:00:00:00",
+        help="MAC address component of the Root Bridge ID.\n"
+             "Together with Root Priority, uniquely identifies the root bridge.\n"
+             "Lower MAC wins ties in priority.  Set to the actual root switch's MAC.")
+    path_cost = get("Root Path Cost", "0",
+        help="Total accumulated cost of the path from THIS bridge to the Root Bridge.\n"
+             "0 = this bridge IS the root (or directly connected to root with 0 cost).\n"
+             "Cost depends on link speed: 100Mbps=19  1Gbps=4  10Gbps=2  100Gbps=1\n"
+             "Bridges use lowest path cost to choose which port faces the root.")
+    br_prio   = get("Bridge Priority", "32768",
+        help="Priority component of THIS bridge's own Bridge ID.\n"
+             "Used to elect Designated Bridge on each segment.\n"
+             "Same encoding as Root Priority (steps of 4096, default 32768).")
+    br_mac    = get("Bridge MAC", "00:11:22:33:44:55",
+        help="MAC address of THIS bridge (the switch sending this BPDU).\n"
+             "Together with Bridge Priority, forms the Bridge ID of the sender.")
+    port_id   = get("Port ID (hex)", "8001",
+        help="2-byte Port ID: Priority(1B, default 0x80) + Port Number(1B).\n"
+             "0x8001 = priority 128, port 1.   0x8002 = priority 128, port 2.\n"
+             "Used to break ties when two ports of same bridge connect to same segment.")
+    msg_age   = get("Message Age (sec)", "0",
+        help="Age of this BPDU since it was generated by the root bridge.\n"
+             "0 = generated by the root itself.   Incremented by 1 at each bridge hop.\n"
+             "When Message Age >= Max Age (20s), BPDU is discarded as stale.")
+    max_age   = get("Max Age (sec)", "20",
+        help="Maximum time a bridge stores a BPDU before discarding it (default 20s).\n"
+             "If no BPDU received within Max Age, bridge assumes root has failed.\n"
+             "Increasing this slows failover.  Decreasing speeds it up but risks instability.")
+    hello     = get("Hello Time (sec)", "2",
+        help="Interval between Configuration BPDUs sent by the Root Bridge (default 2s).\n"
+             "Root sends a hello every 2 seconds to prove it's still alive.\n"
+             "Reducing this speeds up failure detection but increases traffic.")
+    fwd_delay = get("Forward Delay (sec)", "15",
+        help="Time spent in Listening and Learning states before moving to Forwarding (default 15s).\n"
+             "Total transition time = 2 × Forward Delay = 30 seconds for classic STP.\n"
+             "Prevents temporary loops during topology changes.\n"
+             "RSTP replaces this with handshake-based fast transition (ignores this field).")
+    return (version, bpdu_type, flags, root_prio, root_mac, path_cost,
+            br_prio, br_mac, port_id, msg_age, max_age, hello, fwd_delay)
+def build_stp(inputs):
+    (version, bpdu_type, flags, root_prio, root_mac, path_cost,
+     br_prio, br_mac, port_id, msg_age, max_age, hello, fwd_delay) = inputs
 
+    root_id = struct.pack("!H", int(root_prio)) + mac_b(root_mac)
+    br_id   = struct.pack("!H", int(br_prio))   + mac_b(br_mac)
+    bpdu = (bytes.fromhex("0000") +
+            hpad(version,1) + hpad(bpdu_type,1) + hpad(flags,1) +
+            root_id + struct.pack("!I", int(path_cost)) + br_id +
+            hpad(port_id,2) +
+            struct.pack("!HHHH",
+                int(msg_age)*256, int(max_age)*256,
+                int(hello)*256,   int(fwd_delay)*256))
+    fields = [
+        {"layer":3,"name":"BPDU Protocol ID",  "raw":bpdu[0:2],  "user_val":"0x0000","note":"always 0"},
+        {"layer":3,"name":"BPDU Version",       "raw":bpdu[2:3],  "user_val":version, "note":"0=STP 2=RSTP"},
+        {"layer":3,"name":"BPDU Type",          "raw":bpdu[3:4],  "user_val":bpdu_type,"note":"00=Config 80=TCN"},
+        {"layer":3,"name":"BPDU Flags",         "raw":bpdu[4:5],  "user_val":flags,   "note":""},
+        {"layer":3,"name":"BPDU Root ID",       "raw":bpdu[5:13], "user_val":f"prio={root_prio} mac={root_mac}","note":"8B"},
+        {"layer":3,"name":"BPDU Root Path Cost","raw":bpdu[13:17],"user_val":path_cost,"note":""},
+        {"layer":3,"name":"BPDU Bridge ID",     "raw":bpdu[17:25],"user_val":f"prio={br_prio} mac={br_mac}","note":"8B"},
+        {"layer":3,"name":"BPDU Port ID",       "raw":bpdu[25:27],"user_val":port_id, "note":""},
+        {"layer":3,"name":"BPDU Message Age",   "raw":bpdu[27:29],"user_val":msg_age, "note":"sec"},
+        {"layer":3,"name":"BPDU Max Age",       "raw":bpdu[29:31],"user_val":max_age, "note":"sec"},
+        {"layer":3,"name":"BPDU Hello Time",    "raw":bpdu[31:33],"user_val":hello,   "note":"sec"},
+        {"layer":3,"name":"BPDU Forward Delay", "raw":bpdu[33:35],"user_val":fwd_delay,"note":"sec"},
+    ]
+    return bpdu, fields
+def ask_l3_dtp():
+    section("LAYER 3 — DTP  (Dynamic Trunking Protocol)")
+    print("    Modes:  02=desirable  03=auto  04=on  05=off")
+    mode = get("DTP Mode (hex)", "02",
+        help="DTP (Dynamic Trunking Protocol) port trunking mode.\n"
+             "02=desirable: actively tries to form a trunk with the other end.\n"
+             "03=auto: will become a trunk only if the other end is desirable/on.\n"
+             "04=on: unconditionally trunks (regardless of other end's mode).\n"
+             "05=off: unconditionally access port (no trunking).\n"
+             "Cisco proprietary — disable with 'switchport nonegotiate' for security.")
+    return mode
+def build_dtp(mode):
+    snap    = bytes.fromhex("00000c0104")
+    payload = b"\x01\x03\x01" + hpad(mode,1) + b"\x00"*26
+    mode_s  = {"02":"desirable","03":"auto","04":"on","05":"off"}.get(mode, f"0x{mode}")
+    fields  = [
+        {"layer":3,"name":"DTP SNAP OUI",  "raw":snap[0:3],    "user_val":"00000c","note":"Cisco"},
+        {"layer":3,"name":"DTP SNAP PID",  "raw":snap[3:5],    "user_val":"0104",  "note":"DTP"},
+        {"layer":3,"name":"DTP Version",   "raw":payload[0:1], "user_val":"1",     "note":""},
+        {"layer":3,"name":"DTP Flags",     "raw":payload[1:2], "user_val":"03",    "note":""},
+        {"layer":3,"name":"DTP Domain",    "raw":payload[2:3], "user_val":"01",    "note":""},
+        {"layer":3,"name":"DTP Mode",      "raw":payload[3:4], "user_val":mode,    "note":mode_s},
+        {"layer":3,"name":"DTP Pad",       "raw":payload[4:],  "user_val":"0x00*26","note":""},
+    ]
+    return snap + payload, fields
+def ask_l3_pagp():
+    section("LAYER 3 — PAgP  (Port Aggregation Protocol)")
+    print("    Port State flags: 0x01=Active 0x04=Consistent 0x05=Active+Consistent")
+    state = get("Port State (hex)", "05",
+        help="PAgP (Port Aggregation Protocol) port state bitmask.\n"
+             "0x01=Active: port is willing to form a channel.\n"
+             "0x04=Consistent: port parameters match the group.\n"
+             "0x05=Active+Consistent: normal operating state for channel member.\n"
+             "0x00=Inactive: port not participating in channel aggregation.\n"
+             "Cisco proprietary — IEEE equivalent is LACP (option 8).")
+    return state
+def build_pagp(state):
+    snap    = bytes.fromhex("00000c0104")
+    payload = (b"\x01\x01" + bytes.fromhex("8001") +
+               bytes.fromhex("00000001") + hpad(state,1) + b"\x00"*25)
+    fields = [
+        {"layer":3,"name":"PAgP SNAP OUI",    "raw":snap[0:3],    "user_val":"00000c","note":"Cisco"},
+        {"layer":3,"name":"PAgP SNAP PID",    "raw":snap[3:5],    "user_val":"0104",  "note":"PAgP"},
+        {"layer":3,"name":"PAgP Version",     "raw":payload[0:1], "user_val":"1",     "note":""},
+        {"layer":3,"name":"PAgP Flags",       "raw":payload[1:2], "user_val":"01",    "note":""},
+        {"layer":3,"name":"PAgP Port ID",     "raw":payload[2:4], "user_val":"8001",  "note":""},
+        {"layer":3,"name":"PAgP System ID",   "raw":payload[4:8], "user_val":"00000001","note":""},
+        {"layer":3,"name":"PAgP Port State",  "raw":payload[8:9], "user_val":state,   "note":""},
+        {"layer":3,"name":"PAgP Pad",         "raw":payload[9:],  "user_val":"0x00*25","note":""},
+    ]
+    return snap + payload, fields
+def ask_l3_lacp():
+    section("LAYER 3 — LACP  (802.3ad Link Aggregation)")
+    actor_mac   = get("Actor System MAC",  "00:11:22:33:44:55",
+        help="MAC address of THIS switch/NIC participating in LACP.\n"
+             "Forms part of the Actor System ID (Priority + MAC).\n"
+             "Used by the peer to uniquely identify this LACP participant.")
+    actor_key   = get("Actor Key (hex)",   "0001",
+        help="2-byte operational key — identifies which ports can be aggregated together.\n"
+             "Ports with the same key on the same system can form one LAG (bundle).\n"
+             "0x0001 = first aggregation group.   Different keys = different bundles.")
+    actor_state = get("Actor State (hex)  [3d=Active+Short+Aggregating+Sync+Col+Dist]", "3d",
+        help="8-bit LACP state flags for this actor port.\n"
+             "Bit 0: LACP Activity (1=Active, sends PDUs periodically)\n"
+             "Bit 1: LACP Timeout (1=Short 1s, 0=Long 30s)\n"
+             "Bit 2: Aggregation (1=can aggregate, 0=individual)\n"
+             "Bit 3: Synchronisation (1=in sync with partner)\n"
+             "Bit 4: Collecting (1=receiving frames from partner)\n"
+             "Bit 5: Distributing (1=sending frames to partner)\n"
+             "Bit 6: Defaulted (1=using default partner info)\n"
+             "Bit 7: Expired (1=partner info has expired)\n"
+             "0x3D = 00111101 = Active+Short+Aggregating+Sync+Collecting+Distributing")
+    return actor_mac, actor_key, actor_state
+def build_lacp(actor_mac, actor_key, actor_state):
+    subtype_ver = b"\x01\x01"   # subtype=LACP, version=1
+    tlv = (b"\x01\x14" +
+           bytes.fromhex("8000") + mac_b(actor_mac) +
+           hpad(actor_key,2) + bytes.fromhex("80008001") +
+           hpad(actor_state,1) + b"\x00\x00\x00")
+    terminator = b"\x00\x00"
+    raw = subtype_ver + tlv + terminator
+    # offsets into raw
+    fields = [
+        {"layer":3,"name":"LACP Subtype",       "raw":raw[0:1],  "user_val":"1",       "note":"LACP"},
+        {"layer":3,"name":"LACP Version",        "raw":raw[1:2],  "user_val":"1",       "note":""},
+        {"layer":3,"name":"LACP Actor TLV Type", "raw":raw[2:3],  "user_val":"01",      "note":"Actor Info"},
+        {"layer":3,"name":"LACP Actor TLV Len",  "raw":raw[3:4],  "user_val":"20",      "note":"bytes=20"},
+        {"layer":3,"name":"LACP Actor Sys Prio", "raw":raw[4:6],  "user_val":"8000",    "note":"32768"},
+        {"layer":3,"name":"LACP Actor Sys MAC",  "raw":raw[6:12], "user_val":actor_mac, "note":""},
+        {"layer":3,"name":"LACP Actor Key",      "raw":raw[12:14],"user_val":actor_key, "note":""},
+        {"layer":3,"name":"LACP Actor Port Prio","raw":raw[14:16],"user_val":"8000",    "note":""},
+        {"layer":3,"name":"LACP Actor Port",     "raw":raw[16:18],"user_val":"8001",    "note":""},
+        {"layer":3,"name":"LACP Actor State",    "raw":raw[18:19],"user_val":actor_state,"note":"0x3d=Active+Sync+Agg"},
+        {"layer":3,"name":"LACP Actor Reserved", "raw":raw[19:22],"user_val":"000000",  "note":""},
+        {"layer":3,"name":"LACP Terminator",     "raw":raw[22:24],"user_val":"0000",    "note":""},
+    ]
+    return raw, fields
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  WiFi FRAME  —  IEEE 802.11  (Wi-Fi MAC Layer)
-# ═══════════════════════════════════════════════════════════════════════════════
-#
-#  OVERVIEW
-#  ────────
-#  IEEE 802.11 defines the MAC and PHY for wireless LAN (Wi-Fi).
-#  Unlike Ethernet, 802.11 frames carry up to FOUR MAC addresses, a sequence
-#  number, duration/NAV, QoS control, and HT/VHT control fields.
-#
-#  THREE FRAME TYPES
-#  ─────────────────
-#  Type 00 = Management  — BSS administration (Beacon, Probe, Auth, Assoc)
-#  Type 01 = Control     — Medium access (RTS, CTS, ACK, Block Ack)
-#  Type 10 = Data        — Actual data payload (Data, QoS Data, Null)
-#
-#  FRAME CONTROL FIELD  (2 bytes — the very first field)
-#  ──────────────────────────────────────────────────────
-#  Bits  Field             Description
-#  ────  ───────────────── ────────────────────────────────────────────────────
-#  1-0   Protocol Version  Always 0b00 (only version defined)
-#  3-2   Type              00=Mgmt  01=Ctrl  10=Data  11=Reserved
-#  7-4   Subtype           Depends on Type (see tables below)
-#  8     To DS             1 = frame going TO the distribution system (AP)
-#  9     From DS           1 = frame coming FROM distribution system
-#  10    More Fragments    1 = more fragments follow
-#  11    Retry             1 = retransmission of earlier frame
-#  12    Power Mgmt        1 = STA going into power-save mode after this frame
-#  13    More Data         1 = AP has more buffered frames for sleeping STA
-#  14    Protected Frame   1 = frame body is encrypted (WEP/TKIP/CCMP/GCMP)
-#  15    +HTC/Order        1 = HT Control field present (HT/VHT frames)
-#
-#  DS BITS → ADDRESS INTERPRETATION  (crucial!)
-#  ──────────────────────────────────────────────────────────────────────────
-#  ToDS  FromDS  Addr1(RA)    Addr2(TA)    Addr3       Addr4
-#  ────  ──────  ───────────  ───────────  ─────────── ────────────────────
-#    0     0     Destination  Source       BSSID       not present
-#    0     1     Destination  BSSID        Source      not present
-#    1     0     BSSID        Source       Destination not present
-#    1     1     RA (nexthop) TA (sender)  DA (dest)   SA (source)  ← WDS
-#
-#  ToDS=0 FromDS=0 → IBSS/Ad-Hoc direct  (STA↔STA, no AP)
-#  ToDS=1 FromDS=0 → Infrastructure uplink  (STA → AP → DS)
-#  ToDS=0 FromDS=1 → Infrastructure downlink (DS → AP → STA)
-#  ToDS=1 FromDS=1 → WDS / Mesh (AP ↔ AP bridge)
-#
-#  SEQUENCE CONTROL  (2 bytes, present in most frames)
-#  ────────────────────────────────────────────────────
-#  Bits 15-4 : Sequence Number (12 bits, 0–4095, wraps)
-#  Bits  3-0 : Fragment Number (4 bits, 0 = unfragmented)
-#
-#  QoS CONTROL  (2 bytes, present when subtype has QoS bit set)
-#  ──────────────────────────────────────────────────────────────
-#  Bits  3-0 : TID  (Traffic ID / UP — User Priority 0–7)
-#  Bit   4   : EOSP (End of Service Period)
-#  Bits  6-5 : Ack Policy  0=Normal  1=No-Ack  2=No-Explicit  3=Block-Ack
-#  Bit   7   : A-MSDU Present
-#  Bits 15-8 : TXOP Limit / Queue Size / AP PS Buffer State
-#
-#  MANAGEMENT FRAME SUBTYPES
-#  ─────────────────────────────────────────────────────────────────────────
-#  Sub  Name               Direction     Purpose
-#  ───  ─────────────────  ────────────  ──────────────────────────────────
-#   0   Association Req    STA→AP        STA requests to join BSS
-#   1   Association Resp   AP→STA        AP grants/denies association
-#   2   Reassociation Req  STA→new-AP    STA roams to new AP
-#   3   Reassociation Resp new-AP→STA    New AP responds to roam
-#   4   Probe Request      STA→all/AP    STA scans for APs / networks
-#   5   Probe Response     AP→STA        AP responds to probe
-#   8   Beacon             AP→all        AP announces BSS periodically
-#  10   Disassociation     either        Terminate association
-#  11   Authentication     either        Open/SAE auth exchange
-#  12   Deauthentication   either        Terminate authentication
-#  13   Action             either        Management actions (BA, RM, etc.)
-#
-#  CONTROL FRAME SUBTYPES
-#  ─────────────────────────────────────────────────────────────────────────
-#  Sub  Name               Size     Purpose
-#  ───  ─────────────────  ───────  ─────────────────────────────────────
-#   8   Block Ack Req      24+ B    Request block acknowledgment
-#   9   Block Ack          32+ B    Block acknowledgment bitmap
-#  10   PS-Poll            20 B     Power-save station polls for buffered data
-#  11   RTS                20 B     Request To Send (collision avoidance)
-#  12   CTS                14 B     Clear To Send (response to RTS)
-#  13   ACK                14 B     Acknowledgment of received frame
-#  14   CF-End             20 B     End of contention-free period
-#
-#  DATA FRAME SUBTYPES
-#  ─────────────────────────────────────────────────────────────────────────
-#  Sub  Name               QoS?  Notes
-#  ───  ─────────────────  ────  ──────────────────────────────────────────
-#   0   Data               No    Basic data frame
-#   4   Null               No    No data — used for power management signalling
-#   8   QoS Data           Yes   Data with QoS Control field  (Wi-Fi Multimedia)
-#  12   QoS Null           Yes   QoS power-save signalling, no payload
-#
-#  LLCSNAP HEADER  (8 bytes — bridges 802.11 payload to Ethernet)
-#  ──────────────────────────────────────────────────────────────
-#  Bytes  Value        Field
-#  ─────  ─────────── ─────────────────────────────────────
-#   0     0xAA         LLC DSAP  (SNAP indicator)
-#   1     0xAA         LLC SSAP  (SNAP indicator)
-#   2     0x03         LLC Control (Unnumbered Information)
-#   3-5   0x00 0x00 0x00  SNAP OUI  (0x000000 for Ethernet-mapped)
-#   6-7   EtherType    Protocol (0x0800=IPv4  0x0806=ARP  0x86DD=IPv6)
-#
-#  FCS  (Frame Check Sequence — 4 bytes, CRC-32)
-#  ────────────────────────────────────────────────
-#  802.11 FCS = CRC-32 over the entire MPDU (MAC Protocol Data Unit):
-#  Frame Control + Duration + all Address fields + Seq Ctrl + QoS +
-#  HTC (if present) + Frame Body.
-#  NOTE: In most captures (pcap) the FCS is stripped by the driver.
-#        This builder includes it as transmitted on air.
-#
-# ═══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 6 — LAYER 4  (Transport / Control)
+# ══════════════════════════════════════════════════════════════════════════════
 
-# ── Frame type/subtype definitions ───────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+#  ICMP
+# ──────────────────────────────────────────────────────────────────────────────
+def print_icmp_table():
+    print(f"\n  {'─'*100}")
+    print(f"  {'ICMP TYPE / CODE REFERENCE TABLE':^100}")
+    print(f"  {'─'*100}")
+    print(f"  {'Type':>5}  {'Type Name':<28}  {'Code':>5}  Code Description")
+    print(f"  {'─'*100}")
+    for t, (tname, codes) in sorted(ICMP_TABLE.items()):
+        first = True
+        for c, cdesc in sorted(codes.items()):
+            if first:
+                print(f"  {t:5d}  {tname:<28}  {c:5d}  {cdesc}")
+                first = False
+            else:
+                print(f"  {'':5}  {'':28}  {c:5d}  {cdesc}")
+    print(f"  {'─'*100}")
+def ask_l4_icmp():
+    print_icmp_table()
+    section("LAYER 4 — ICMP")
+    icmp_type = int(get("ICMP Type  (default=8 Echo Request)", "8",
+        help="ICMP message type — defines what kind of ICMP message this is.\n"
+             "8 = Echo Request (ping sent)   0 = Echo Reply (ping response)\n"
+             "3 = Destination Unreachable    11 = Time Exceeded (TTL expired)\n"
+             "5 = Redirect   12 = Parameter Problem\n"
+             "See the table above for all types and their codes."))
+    if icmp_type in ICMP_TABLE:
+        codes = ICMP_TABLE[icmp_type][1]
+        code_hint = "  ".join(f"{c}={d}" for c,d in sorted(codes.items()))
+        print(f"    Valid codes: {code_hint}")
+    icmp_code = int(get("ICMP Code", "0",
+        help="ICMP sub-code — gives more detail about the type.\n"
+             "For Echo Request/Reply (type 8/0): always 0 (only one code).\n"
+             "For Destination Unreachable (type 3): 0=net  1=host  3=port  4=frag-needed\n"
+             "For Time Exceeded (type 11): 0=TTL in transit  1=reassembly timeout"))
+    icmp_id   = int(get("ICMP Identifier (decimal)", "1",
+        help="16-bit identifier used to match Echo Requests with Echo Replies.\n"
+             "The ping tool usually sets this to the process ID (PID).\n"
+             "Receiver copies this value unchanged into the Echo Reply.\n"
+             "Allows multiple ping sessions to run simultaneously without confusion."))
+    icmp_seq  = int(get("ICMP Sequence   (decimal)", "1",
+        help="16-bit sequence number — incremented with each ping request sent.\n"
+             "Starts at 1, goes up: 1, 2, 3, ...\n"
+             "Receiver copies this into the Reply — sender matches reply to request.\n"
+             "Gaps in sequence numbers indicate lost packets."))
+    print("    ICMP data payload hex  (default = ping pattern 'abcdefgh')")
+    data_hex  = get("ICMP payload hex", "6162636465666768")
+    try:
+        icmp_data = bytes.fromhex(data_hex.replace(" ",""))
+    except ValueError:
+        print("    -> invalid hex, using default"); icmp_data = bytes.fromhex("6162636465666768")
+    return icmp_type, icmp_code, icmp_id, icmp_seq, icmp_data, data_hex
+def build_icmp(icmp_type, icmp_code, icmp_id, icmp_seq, icmp_data, data_hex_repr=""):
+    rest = struct.pack("!HH", icmp_id, icmp_seq) if icmp_type in ICMP_ECHO_TYPES else b'\x00\x00\x00\x00'
+    msg0 = struct.pack("!BBH", icmp_type, icmp_code, 0) + rest + icmp_data
+    ck   = inet_cksum(msg0)
+    msg  = struct.pack("!BBH", icmp_type, icmp_code, ck) + rest + icmp_data
 
-WIFI_FRAME_TYPES = {
-    '1': (0b00, "Management"),
-    '2': (0b01, "Control"),
-    '3': (0b10, "Data"),
-}
+    tname = ICMP_TABLE.get(icmp_type, (f"Type {icmp_type}",{}))[0]
+    cname = ICMP_TABLE.get(icmp_type,("",{}))[1].get(icmp_code, f"Code {icmp_code}")
 
-WIFI_MGMT_SUBTYPES = {
-    '0' : (0x00, "Association Request",    "STA→AP  join BSS"),
-    '1' : (0x01, "Association Response",   "AP→STA  grant/deny join"),
-    '2' : (0x02, "Reassociation Request",  "STA→AP  roaming"),
-    '3' : (0x03, "Reassociation Response", "AP→STA  roam reply"),
-    '4' : (0x04, "Probe Request",          "STA→all scan for APs"),
-    '5' : (0x05, "Probe Response",         "AP→STA  scan reply"),
-    '8' : (0x08, "Beacon",                 "AP→all  periodic BSS announce"),
-    '10': (0x0A, "Disassociation",         "either  end association"),
-    '11': (0x0B, "Authentication",         "either  auth exchange"),
-    '12': (0x0C, "Deauthentication",       "either  end auth"),
-    '13': (0x0D, "Action",                 "either  BA/RM/spectrum action"),
-}
+    fields = [
+        {"layer":4,"name":"ICMP Type",     "raw":msg[0:1], "user_val":str(icmp_type), "note":tname},
+        {"layer":4,"name":"ICMP Code",     "raw":msg[1:2], "user_val":str(icmp_code), "note":cname},
+        {"layer":4,"name":"ICMP Checksum", "raw":msg[2:4], "user_val":"auto",         "note":f"0x{ck:04x} RFC792 over full ICMP"},
+    ]
+    if icmp_type in ICMP_ECHO_TYPES:
+        fields += [
+            {"layer":4,"name":"ICMP Identifier","raw":msg[4:6],"user_val":str(icmp_id), "note":f"0x{icmp_id:04x}"},
+            {"layer":4,"name":"ICMP Sequence",  "raw":msg[6:8],"user_val":str(icmp_seq),"note":""},
+        ]
+    else:
+        fields.append({"layer":4,"name":"ICMP Rest-of-Header","raw":msg[4:8],"user_val":"0","note":"type-specific"})
+    if icmp_data:
+        fields.append({"layer":4,"name":"ICMP Data Payload","raw":icmp_data,
+                       "user_val":data_hex_repr[:20] if data_hex_repr else icmp_data.hex()[:20],
+                       "note":f"{len(icmp_data)}B"})
+    return msg, fields, ck
 
-WIFI_CTRL_SUBTYPES = {
-    '8' : (0x08, "Block Ack Request", "Request aggregated ACK"),
-    '9' : (0x09, "Block Ack",        "Aggregated ACK bitmap"),
-    '10': (0x0A, "PS-Poll",          "Power-save poll for buffered data"),
-    '11': (0x0B, "RTS",              "Request To Send (CSMA/CA)"),
-    '12': (0x0C, "CTS",              "Clear To Send (RTS response)"),
-    '13': (0x0D, "ACK",              "Acknowledge received frame"),
-    '14': (0x0E, "CF-End",           "End contention-free period"),
-}
+# ──────────────────────────────────────────────────────────────────────────────
+#  TCP
+# ──────────────────────────────────────────────────────────────────────────────
+def port_note(port):
+    return WELL_KNOWN_PORTS.get(port, "")
+def print_port_table():
+    print(f"\n  {'─'*100}")
+    print(f"  {'WELL-KNOWN PORT REFERENCE  (TCP & UDP)':^100}")
+    print(f"  {'─'*100}")
+    ports = sorted(WELL_KNOWN_PORTS.items())
+    # print in 3 columns
+    cols = 3
+    rows = (len(ports) + cols - 1) // cols
+    for r in range(rows):
+        line = "  "
+        for c in range(cols):
+            idx = r + c * rows
+            if idx < len(ports):
+                p, n = ports[idx]
+                line += f"  {p:>5} = {n:<18}"
+        print(line)
+    print(f"  {'─'*100}")
+def tcp_checksum(src_ip, dst_ip, tcp_segment):
+    """RFC 793: checksum over pseudo-header + TCP segment."""
+    pseudo = (ip_b(src_ip) + ip_b(dst_ip) +
+              b'\x00' + b'\x06' +
+              struct.pack("!H", len(tcp_segment)))
+    return inet_cksum(pseudo + tcp_segment)
+def print_tcp_handshake_diagram():
+    print("""
+  ┌──────────────────────────────────────────────────────────────────────┐
+  │                 TCP 3-WAY HANDSHAKE FLOW                             │
+  │                                                                      │
+  │   CLIENT                                          SERVER             │
+  │     │                                               │                │
+  │     │  ── STEP 1: SYN ──────────────────────────>  │  SEQ=x         │
+  │     │             SYN=1  ACK=0                      │                │
+  │     │                                               │                │
+  │     │  <─ STEP 2: SYN-ACK ───────────────────────  │  SEQ=y ACK=x+1 │
+  │     │             SYN=1  ACK=1                      │                │
+  │     │                                               │                │
+  │     │  ── STEP 3: ACK ──────────────────────────>  │  SEQ=x+1       │
+  │     │             SYN=0  ACK=1  ACK_NUM=y+1         │                │
+  │     │                                               │                │
+  │     │  ── STEP 4: PSH+ACK (data) ───────────────>  │                │
+  │     │                                               │                │
+  │     │  ── STEP 5: FIN+ACK (close) ──────────────>  │                │
+  │     │                                               │                │
+  │     │  ── STEP 6: RST (reset) ──────────────────>  │                │
+  │                                                                      │
+  │  Flags:  SYN=0x02  ACK=0x10  SYN+ACK=0x12  PSH=0x08  FIN=0x01     │
+  │          RST=0x04  URG=0x20  ECE=0x40  CWR=0x80                     │
+  └──────────────────────────────────────────────────────────────────────┘""")
+def ask_l4_tcp(src_ip, dst_ip):
+    print_tcp_handshake_diagram()
+    print_port_table()
+    section("LAYER 4 — TCP")
 
-WIFI_DATA_SUBTYPES = {
-    '0' : (0x00, "Data",     False, "Basic data, no QoS field"),
-    '4' : (0x04, "Null",     False, "No payload, power-mgmt signal"),
-    '8' : (0x08, "QoS Data", True,  "Data + QoS Control (WMM/WME)"),
-    '12': (0x0C, "QoS Null", True,  "No payload + QoS, power-mgmt"),
-}
+    print("    Handshake step:")
+    for k,(name,_,desc) in TCP_STEPS.items():
+        print(f"      {k} = {name:<10}  {desc}")
+    step = get("Choose step", "1")
+    if step not in TCP_STEPS: step = '1'
+    step_name, default_flags, step_desc = TCP_STEPS[step]
 
-WIFI_ACK_POLICY = {0:"Normal ACK", 1:"No ACK", 2:"No Explicit ACK", 3:"Block ACK"}
-WIFI_TID_NAMES  = {
-    0:"BE(Best Effort)", 1:"BK(Background)", 2:"BK(Background)",
-    3:"BE(Best Effort)", 4:"VI(Video)",       5:"VI(Video)",
-    6:"VO(Voice)",       7:"VO(Voice)",
-}
+    print(f"\n    Building: {step_name}  —  {step_desc}")
 
-def wifi_crc32(data: bytes) -> bytes:
-    """802.11 FCS = CRC-32 same polynomial as Ethernet, little-endian."""
-    return (zlib.crc32(data) & 0xFFFFFFFF).to_bytes(4, 'little')
+    src_port = int(get("Source Port", "49152",
+        help="TCP port number on the SENDER side (0–65535).\n"
+             "Ports 0–1023 = well-known (HTTP=80, HTTPS=443, SSH=22, DNS=53).\n"
+             "Ports 1024–49151 = registered.   49152–65535 = ephemeral (client picks random).\n"
+             "For a client connecting to a server, use a random ephemeral port (>49152)."))
+    dst_port = int(get("Destination Port", "80",
+        help="TCP port number on the RECEIVER side — identifies which service to reach.\n"
+             "80=HTTP  443=HTTPS  22=SSH  21=FTP  25=SMTP  53=DNS  3306=MySQL  5432=PG\n"
+             "Wrong port: connection refused (RST) or no response (firewall drop)."))
+    pn = port_note(dst_port) or port_note(src_port)
+    if pn: print(f"    -> Port note: {pn}")
 
+    seq_num  = int(get("Sequence Number  (ISN for SYN, else continuation)", "1000",
+        help="32-bit number identifying the position of this segment in the byte stream.\n"
+             "SYN (step 1): use a random ISN (Initial Sequence Number) — e.g. 1000.\n"
+             "After SYN: each segment's SeqNum = previous SeqNum + bytes sent.\n"
+             "Receiver uses this to reassemble data in order and detect duplicates."))
+    ack_num  = int(get("Acknowledgement Number  (0 if SYN, else peer_seq+1)",
+        "0" if step=='1' else "1001",
+        help="32-bit number = next SeqNum the sender EXPECTS from the peer.\n"
+             "Meaning: 'I have received everything up to ACK_NUM - 1.'\n"
+             "SYN (step 1): 0 (ACK flag not set, no data acknowledged yet).\n"
+             "SYN-ACK (step 2): peer_ISN + 1.   ACK (step 3): peer_ISN + 1.\n"
+             "Only valid when ACK flag is set in the flags field."))
+    data_off = 5
+    flags_val = default_flags
+    print(f"    TCP Flags (hex, default={default_flags:#04x} = {step_name})")
+    flags_in = get("Flags hex (Enter=default)", f"{default_flags:02x}",
+        help="8-bit field where each bit enables a TCP control flag.\n"
+             "SYN=0x02  ACK=0x10  SYN+ACK=0x12  PSH=0x08  FIN=0x01  RST=0x04\n"
+             "URG=0x20  ECE=0x40  CWR=0x80\n"
+             "SYN: initiate connection.   ACK: acknowledge data.   FIN: close gracefully.\n"
+             "RST: abort connection immediately.   PSH: deliver data to app right away.\n"
+             "URG: urgent data present (pointer field matters).   ECE/CWR: congestion.")
+    try:    flags_val = int(flags_in, 16)
+    except: flags_val = default_flags
+
+    window   = int(get("Window Size (bytes)", "65535",
+        help="16-bit receive buffer size — how many bytes the sender can send before waiting for ACK.\n"
+             "65535 = maximum without window scaling (RFC 7323 extends this).\n"
+             "Smaller value: receiver is telling sender to slow down (flow control).\n"
+             "0 = zero window — stop sending (receiver buffer is full)."))
+    urg_ptr  = int(get("Urgent Pointer      (0 unless URG set)", "0",
+        help="16-bit offset from SeqNum to the end of urgent data.\n"
+             "Only meaningful when URG flag is set — points to last urgent byte.\n"
+             "Almost never used in modern protocols. Keep 0 for normal frames."))
+
+    # Optional data payload (for PSH+ACK)
+    tcp_data = b''
+    if step in ('4',):
+        print("    TCP data payload hex  (default = 'GET / HTTP/1.0\\r\\n')")
+        dhex = get("Data hex", "474554202f20485454502f312e300d0a")
+        try:    tcp_data = bytes.fromhex(dhex.replace(" ",""))
+        except: tcp_data = b''
+
+    return (step, step_name, src_port, dst_port, seq_num, ack_num,
+            data_off, flags_val, window, urg_ptr, tcp_data, src_ip, dst_ip)
+def build_tcp(step, step_name, src_port, dst_port, seq_num, ack_num,
+              data_off, flags_val, window, urg_ptr, tcp_data,
+              src_ip, dst_ip):
+    # Build with checksum=0
+    hdr_no_ck = struct.pack("!HHIIBBHHH",
+        src_port, dst_port,
+        seq_num, ack_num,
+        (data_off << 4),   # data offset in high nibble
+        flags_val,
+        window, 0, urg_ptr)
+    seg_no_ck = hdr_no_ck + tcp_data
+    ck = tcp_checksum(src_ip, dst_ip, seg_no_ck)
+    hdr = struct.pack("!HHIIBBHHH",
+        src_port, dst_port,
+        seq_num, ack_num,
+        (data_off << 4),
+        flags_val,
+        window, ck, urg_ptr)
+    seg = hdr + tcp_data
+
+    # Decode flags for display
+    flag_names = [n for n,v in TCP_FLAGS.items() if flags_val & v]
+    flag_str   = '+'.join(flag_names) if flag_names else "none"
+    pn_src = port_note(src_port); pn_dst = port_note(dst_port)
+
+    fields = [
+        {"layer":4,"name":"TCP Source Port",     "raw":seg[0:2],  "user_val":str(src_port),
+         "note":pn_src or "ephemeral"},
+        {"layer":4,"name":"TCP Dest Port",       "raw":seg[2:4],  "user_val":str(dst_port),
+         "note":pn_dst or ""},
+        {"layer":4,"name":"TCP Sequence Num",    "raw":seg[4:8],  "user_val":str(seq_num),
+         "note":f"0x{seq_num:08x}"},
+        {"layer":4,"name":"TCP Ack Number",      "raw":seg[8:12], "user_val":str(ack_num),
+         "note":f"0x{ack_num:08x}"},
+        {"layer":4,"name":"TCP Data Offset+Res", "raw":seg[12:13],"user_val":str(data_off),
+         "note":f"{data_off*4}B header, reserved=0"},
+        {"layer":4,"name":"TCP Flags",           "raw":seg[13:14],"user_val":f"0x{flags_val:02x}",
+         "note":f"{flag_str}  [{step_name}]"},
+        {"layer":4,"name":"TCP Window Size",     "raw":seg[14:16],"user_val":str(window),
+         "note":"bytes"},
+        {"layer":4,"name":"TCP Checksum",        "raw":seg[16:18],"user_val":"auto",
+         "note":f"0x{ck:04x}  RFC793 pseudo-hdr+segment"},
+        {"layer":4,"name":"TCP Urgent Pointer",  "raw":seg[18:20],"user_val":str(urg_ptr),
+         "note":"0 unless URG flag set"},
+    ]
+    if tcp_data:
+        fields.append({"layer":4,"name":"TCP Data Payload","raw":tcp_data,
+                       "user_val":tcp_data.hex()[:24],"note":f"{len(tcp_data)}B"})
+    return seg, fields, ck
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  UDP
+# ──────────────────────────────────────────────────────────────────────────────
+def udp_checksum(src_ip, dst_ip, udp_datagram):
+    """RFC 768: checksum over pseudo-header + UDP datagram."""
+    pseudo = (ip_b(src_ip) + ip_b(dst_ip) +
+              b'\x00' + b'\x11' +
+              struct.pack("!H", len(udp_datagram)))
+    return inet_cksum(pseudo + udp_datagram)
+def ask_l4_udp(src_ip, dst_ip):
+    print_port_table()
+    section("LAYER 4 — UDP")
+    print("    UDP is connectionless – single datagram, no handshake.")
+    print("    Common uses: DNS (53), DHCP (67/68), NTP (123), SNMP (161), TFTP (69)")
+
+    src_port = int(get("Source Port", "49152",
+        help="UDP port number on the SENDER side (0–65535).\n"
+             "Ephemeral range 49152–65535 for clients.  Well-known: 53=DNS 67/68=DHCP.\n"
+             "Unlike TCP, UDP has no connection — port just identifies the sending socket."))
+    dst_port = int(get("Destination Port", "53",
+        help="UDP port number on the RECEIVER — identifies which service to reach.\n"
+             "53=DNS  67=DHCP server  68=DHCP client  69=TFTP  123=NTP  161=SNMP\n"
+             "514=Syslog  520=RIP  1194=OpenVPN  5060=SIP"))
+    pn = port_note(dst_port) or port_note(src_port)
+    if pn: print(f"    -> Port note: {pn}")
+
+    print("    UDP data payload hex")
+    print("      DNS query example : 0001010000010000000000000377777703636f6d00000100 01")
+    print("      NTP request       : e300000000000000000000000000000000000000000000000000000000000000000000000000000000000000")
+    print("      Syslog example    : 3c31343e4a756c2031352030303a30303a303020686f73 74206d657373616765")
+    dhex = get("Data hex  (Enter=empty datagram)", "")
+    try:    udp_data = bytes.fromhex(dhex.replace(" ",""))
+    except: udp_data = b''
+
+    return src_port, dst_port, udp_data, src_ip, dst_ip
+def build_udp(src_port, dst_port, udp_data, src_ip, dst_ip):
+    length = 8 + len(udp_data)
+    # Build with checksum=0
+    hdr_no_ck = struct.pack("!HHHH", src_port, dst_port, length, 0)
+    dgram_no_ck = hdr_no_ck + udp_data
+    ck = udp_checksum(src_ip, dst_ip, dgram_no_ck)
+    # RFC 768: if computed checksum is 0, transmit 0xFFFF
+    if ck == 0: ck = 0xFFFF
+    hdr  = struct.pack("!HHHH", src_port, dst_port, length, ck)
+    dgram = hdr + udp_data
+
+    pn_src = port_note(src_port); pn_dst = port_note(dst_port)
+
+    fields = [
+        {"layer":4,"name":"UDP Source Port",  "raw":dgram[0:2],"user_val":str(src_port),
+         "note":pn_src or "ephemeral"},
+        {"layer":4,"name":"UDP Dest Port",    "raw":dgram[2:4],"user_val":str(dst_port),
+         "note":pn_dst or ""},
+        {"layer":4,"name":"UDP Length",       "raw":dgram[4:6],"user_val":"auto",
+         "note":f"{length}B (8 hdr + {len(udp_data)} data)"},
+        {"layer":4,"name":"UDP Checksum",     "raw":dgram[6:8],"user_val":"auto",
+         "note":f"0x{ck:04x}  RFC768 pseudo-hdr+datagram"},
+    ]
+    if udp_data:
+        fields.append({"layer":4,"name":"UDP Data Payload","raw":udp_data,
+                       "user_val":udp_data.hex()[:24],"note":f"{len(udp_data)}B"})
+    return dgram, fields, ck
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 7 — WIFI / IEEE 802.11  (MAC frame builder)
+# ══════════════════════════════════════════════════════════════════════════════
 def print_wifi_education():
     print(f"""
   {'═'*110}
@@ -3890,285 +2851,6 @@ def print_wifi_education():
 
   FCS: CRC-32 over entire MPDU (FC → Frame Body), 4B little-endian
   {'═'*110}""")
-
-
-# ── PHY preamble builders ─────────────────────────────────────────────────────
-
-WIFI_PHY_MODES = {
-    '1': "802.11b  DSSS/CCK  (2.4 GHz, 1/2/5.5/11 Mbps)",
-    '2': "802.11a  OFDM      (5 GHz,   6–54 Mbps)",
-    '3': "802.11g  ERP-OFDM  (2.4 GHz, 6–54 Mbps)",
-    '4': "802.11n  HT-Mixed  (2.4/5 GHz, up to 600 Mbps)",
-    '5': "802.11ac VHT       (5 GHz,   up to 6.9 Gbps)",
-    '6': "802.11ax HE        (2.4/5/6 GHz, up to 9.6 Gbps)",
-    '7': "No PHY preamble   (MAC MPDU only — as seen in Wireshark pcap)",
-}
-
-DSSS_RATES = {
-    '1': (0x0A, "1 Mbps  DBPSK"),
-    '2': (0x14, "2 Mbps  DQPSK"),
-    '3': (0x37, "5.5 Mbps CCK"),
-    '4': (0x6E, "11 Mbps CCK"),
-}
-
-OFDM_RATE_BITS = {
-    '6' : (0b1011, "6 Mbps  BPSK  R=1/2"),
-    '9' : (0b1111, "9 Mbps  BPSK  R=3/4"),
-    '12': (0b1010, "12 Mbps QPSK  R=1/2"),
-    '18': (0b1110, "18 Mbps QPSK  R=3/4"),
-    '24': (0b1001, "24 Mbps 16-QAM R=1/2"),
-    '36': (0b1101, "36 Mbps 16-QAM R=3/4"),
-    '48': (0b1000, "48 Mbps 64-QAM R=2/3"),
-    '54': (0b1100, "54 Mbps 64-QAM R=3/4"),
-}
-
-def crc16_ibm(data: bytes) -> int:
-    """CRC-16/IBM used in DSSS PLCP header."""
-    crc = 0xFFFF
-    for byte in data:
-        crc ^= byte
-        for _ in range(8):
-            if crc & 1:
-                crc = (crc >> 1) ^ 0x8005
-            else:
-                crc >>= 1
-    return crc
-
-def build_dsss_plcp(mpdu_len_bytes, rate_byte, short_preamble=False):
-    """
-    Build 802.11b DSSS PLCP preamble.
-    Returns (plcp_bytes, records).
-    Long preamble:  SYNC(128b=16B) + SFD(2B) + SIGNAL(1B) + SERVICE(1B) + LENGTH(2B) + CRC(2B) = 24B
-    Short preamble: SYNC(56b=7B)  + SFD(2B) + SIGNAL(1B) + SERVICE(1B) + LENGTH(2B) + CRC(2B) = 15B
-    LENGTH field = MPDU duration in µs.
-    """
-    if short_preamble:
-        sync    = bytes([0xFF] * 7)
-        sfd_val = 0x05CF
-        sync_note = "56-bit SYNC (7×0xFF) — short preamble scrambled 1s"
-        sfd_note  = "0x05CF — 802.11b SHORT preamble SFD (frame boundary)"
-        mode_note = "Short preamble (96µs total PLCP)"
-    else:
-        sync    = bytes([0xFF] * 16)
-        sfd_val = 0xF3A0
-        sync_note = "128-bit SYNC (16×0xFF) — long preamble scrambled 1s"
-        sfd_note  = "0xF3A0 — 802.11b LONG preamble SFD (frame boundary)"
-        mode_note = "Long preamble (192µs total PLCP)"
-
-    sfd_b    = struct.pack("<H", sfd_val)
-    signal_b = bytes([rate_byte])
-    service_b= bytes([0x00])
-    # LENGTH = MPDU duration in µs at the signalled rate
-    # For simplicity, store MPDU byte length directly (standard uses µs but
-    # most implementations interpret length bytes at the signalled rate)
-    length_b = struct.pack("<H", mpdu_len_bytes & 0xFFFF)
-    crc_input = bytes([rate_byte, 0x00]) + length_b
-    crc_val  = crc16_ibm(crc_input)
-    crc_b    = struct.pack("<H", crc_val)
-
-    plcp = sync + sfd_b + signal_b + service_b + length_b + crc_b
-    records = [
-        {"layer":1, "name":"DSSS SYNC (preamble)",
-         "raw": sync,     "user_val": f"0xFF×{len(sync)}",
-         "note": sync_note},
-        {"layer":1, "name":"DSSS SFD  ← FRAME BOUNDARY",
-         "raw": sfd_b,    "user_val": f"0x{sfd_val:04X}",
-         "note": sfd_note},
-        {"layer":1, "name":"DSSS SIGNAL (rate)",
-         "raw": signal_b, "user_val": f"0x{rate_byte:02X}",
-         "note": f"Rate encoding — see SIGNAL table"},
-        {"layer":1, "name":"DSSS SERVICE",
-         "raw": service_b,"user_val": "0x00",
-         "note": "Reserved in long preamble"},
-        {"layer":1, "name":"DSSS LENGTH (MPDU µs/B)",
-         "raw": length_b, "user_val": str(mpdu_len_bytes),
-         "note": "MPDU length (bytes encoded as µs field)"},
-        {"layer":1, "name":"DSSS PLCP CRC-16",
-         "raw": crc_b,    "user_val": f"0x{crc_val:04X}",
-         "note": f"CRC-16/IBM over SIGNAL+SERVICE+LENGTH  {mode_note}"},
-    ]
-    return plcp, records
-
-def build_ofdm_lsig(mpdu_len_bytes, rate_bits, rate_label):
-    """
-    Build 802.11a/g L-SIG field (3 bytes / 24 bits).
-    Bits [3:0]=RATE  [4]=Reserved  [16:5]=LENGTH  [17]=Parity  [23:18]=Tail
-    Returned as 3 bytes (raw bit-packed, transmitted LSB-first in OFDM symbol).
-    """
-    length_field = mpdu_len_bytes & 0xFFF
-    word = (rate_bits & 0xF) | (0 << 4) | (length_field << 5)
-    # parity over bits 0..16
-    parity = bin(word & 0x1FFFF).count('1') % 2
-    word |= (parity << 17)
-    # tail bits [23:18] = 000000 (already 0)
-    lsig_bytes = struct.pack("<I", word)[:3]
-    records = [
-        {"layer":1, "name":"L-STF  (Short Training Field)",
-         "raw": bytes(10), "user_val": "8µs OFDM symbols",
-         "note": "10 symbols × 0.8µs — AGC + coarse freq sync  (not byte-representable)"},
-        {"layer":1, "name":"L-LTF  (Long Training Field)",
-         "raw": bytes(8),  "user_val": "8µs OFDM symbols",
-         "note": "GI(1.6µs) + 2×LTF(3.2µs each) — fine channel estimation"},
-        {"layer":1, "name":"L-SIG  ← FRAME BOUNDARY",
-         "raw": lsig_bytes,"user_val": f"RATE={rate_bits:04b} LEN={mpdu_len_bytes}",
-         "note": (f"{rate_label}  LEN={mpdu_len_bytes}B  Par={parity}  "
-                  f"4µs OFDM symbol — marks MPDU start  [closest to SFD]")},
-    ]
-    return lsig_bytes, records  # we return only L-SIG bytes (STF/LTF are analog)
-
-def build_ht_sig(mpdu_len_bytes, mcs, bw40, sgi, stbc, ldpc, rate_label):
-    """
-    Build 802.11n HT-SIG (2 × 24-bit fields = 6 bytes).
-    HT-SIG1: MCS(7b)+BW(1b)+HT-LEN(16b)
-    HT-SIG2: Smoothing+NotSounding+Reserved+Aggregation+STBC+FEC+SGI+NumExtSS+CRC+Tail
-    """
-    ht_len = mpdu_len_bytes & 0xFFFF
-    sig1_word = (mcs & 0x7F) | ((1 if bw40 else 0) << 7) | (ht_len << 8)
-    sig1 = struct.pack("<I", sig1_word)[:3]
-
-    smooth=1; not_snd=1; aggr=0
-    stbc_b=(1 if stbc else 0); fec=(1 if ldpc else 0); sgi_b=(1 if sgi else 0)
-    sig2_lo = (smooth | (not_snd<<1) | (0<<2) | (aggr<<3) |
-               (stbc_b<<4) | (fec<<5) | (sgi_b<<6) | (0<<7))
-    crc_input = sig1 + bytes([sig2_lo])
-    crc8 = 0xFF
-    for byte in crc_input:
-        for i in range(8):
-            bit = (byte >> i) & 1
-            fb  = ((crc8 >> 7) & 1) ^ bit
-            crc8= ((crc8 << 1) & 0xFF) | 0
-            if fb: crc8 ^= 0x07
-    sig2 = bytes([sig2_lo, crc8 & 0xFF, 0x00])
-
-    lsig_bytes, lsig_records = build_ofdm_lsig(mpdu_len_bytes, 0b1011, "6Mbps legacy")
-    records = lsig_records + [
-        {"layer":1, "name":"HT-SIG-1  (MCS+BW+Length)",
-         "raw": sig1, "user_val": f"MCS{mcs} BW={'40' if bw40 else '20'}MHz LEN={ht_len}",
-         "note": "8µs (2×4µs OFDM) — HT rate/length descriptor"},
-        {"layer":1, "name":"HT-SIG-2  ← HT FRAME BOUNDARY",
-         "raw": sig2, "user_val": f"SGI={int(sgi)} LDPC={int(ldpc)} STBC={int(stbc)}",
-         "note": "HT-SIG-2 + CRC8+Tail — marks HT MPDU start (≈SFD for 802.11n)"},
-        {"layer":1, "name":"HT-STF  (HT Short Training)",
-         "raw": bytes(4), "user_val": "4µs", "note": "MIMO AGC adjustment"},
-        {"layer":1, "name":"HT-LTF(s) (HT Long Training)",
-         "raw": bytes(4), "user_val": f"4µs×NSS", "note": "Per-stream channel estimation"},
-    ]
-    return sig1 + sig2, records
-
-def build_vht_sig(mpdu_len_bytes, mcs, nss, bw, sgi, ldpc):
-    """Build 802.11ac VHT-SIG-A (2×24b) summary."""
-    bw_map = {20:0, 40:1, 80:2, 160:3}
-    bw_bits = bw_map.get(bw, 0)
-    nss_b = (nss - 1) & 0x7
-    siga1 = struct.pack("<I", bw_bits | (0<<2) | (1<<3) | (nss_b<<13))[:3]
-    siga2 = struct.pack("<I", (mcs<<4) | (int(sgi)<<0) | (int(ldpc)<<2))[:3]
-    lsig_bytes, lsig_records = build_ofdm_lsig(mpdu_len_bytes, 0b1011, "6Mbps legacy")
-    records = lsig_records + [
-        {"layer":1, "name":"VHT-SIG-A1  (BW+NSS+STBC)",
-         "raw": siga1, "user_val": f"BW={bw}MHz NSS={nss}",
-         "note": "8µs — VHT rate/NSS/BW descriptor"},
-        {"layer":1, "name":"VHT-SIG-A2  ← VHT FRAME BOUNDARY",
-         "raw": siga2, "user_val": f"MCS{mcs} SGI={int(sgi)} LDPC={int(ldpc)}",
-         "note": "VHT-SIG-A2 — marks VHT MPDU start  (≈SFD for 802.11ac)"},
-        {"layer":1, "name":"VHT-STF",
-         "raw": bytes(4), "user_val": "4µs", "note": "MIMO AGC"},
-        {"layer":1, "name":"VHT-LTF(s)",
-         "raw": bytes(4), "user_val": f"4µs×{nss}", "note": "Per-stream channel est."},
-        {"layer":1, "name":"VHT-SIG-B  (length per user)",
-         "raw": bytes(3), "user_val": f"LEN={mpdu_len_bytes}", "note": "Per-user MPDU length"},
-    ]
-    return siga1 + siga2, records
-
-def build_he_sig(mpdu_len_bytes, mcs, nss, bw, gi, ldpc):
-    """Build 802.11ax HE-SIG-A summary."""
-    bw_map = {20:0, 40:1, 80:2, 160:3}
-    bw_bits = bw_map.get(bw, 0)
-    nss_b = (nss-1) & 0x7
-    hesa1 = struct.pack("<I", bw_bits | (0<<2) | (nss_b<<9))[:3]
-    hesa2 = struct.pack("<I", (mcs<<4) | (int(ldpc)<<3) | (gi & 0x3))[:3]
-    lsig_bytes, lsig_records = build_ofdm_lsig(mpdu_len_bytes, 0b1011, "6Mbps legacy")
-    gi_names = {0:"0.8µs(Normal)", 1:"1.6µs(Double)", 2:"3.2µs(Quad)"}
-    records = lsig_records + [
-        {"layer":1, "name":"RL-SIG  (Repeated L-SIG)",
-         "raw": lsig_bytes, "user_val": "repeat", "note": "Confirms HE frame to non-HE stations"},
-        {"layer":1, "name":"HE-SIG-A1  (BW+BSS-Color+NSS)",
-         "raw": hesa1, "user_val": f"BW={bw}MHz NSS={nss}",
-         "note": "8µs — HE BSS colour, UL/DL, NSS"},
-        {"layer":1, "name":"HE-SIG-A2  ← HE FRAME BOUNDARY",
-         "raw": hesa2, "user_val": f"MCS{mcs} GI={gi_names.get(gi,'?')} LDPC={int(ldpc)}",
-         "note": "HE-SIG-A2 — marks HE MPDU start  (≈SFD for 802.11ax)"},
-        {"layer":1, "name":"HE-STF",
-         "raw": bytes(4), "user_val": "4µs or 8µs", "note": "HE MIMO AGC"},
-        {"layer":1, "name":"HE-LTF(s)",
-         "raw": bytes(4), "user_val": f"4/8µs×{nss}", "note": "HE channel estimation"},
-    ]
-    return hesa1 + hesa2, records
-
-def ask_wifi_phy(phy_ch, mpdu_len):
-    """Ask PHY-specific parameters and return (phy_records)."""
-    phy_records = []
-
-    if phy_ch == '1':  # DSSS
-        section("802.11b DSSS PLCP HEADER")
-        print("    Long preamble (192µs) or Short preamble (96µs)?")
-        sp = get("Short preamble? (y/n)", "n").lower().startswith("y")
-        print("    SIGNAL (rate) byte:")
-        for k,(rb,rd) in DSSS_RATES.items():
-            print(f"      {k} = 0x{rb:02X}  {rd}")
-        rate_ch = get("Rate", "4")
-        rate_byte, rate_desc = DSSS_RATES.get(rate_ch, (0x6E, "11 Mbps CCK"))
-        print(f"    -> Rate: {rate_desc}")
-        _, phy_records = build_dsss_plcp(mpdu_len, rate_byte, sp)
-
-    elif phy_ch in ('2','3'):  # OFDM 802.11a/g
-        std = "802.11a (5GHz)" if phy_ch=='2' else "802.11g (2.4GHz)"
-        section(f"{std} OFDM L-SIG  (legacy preamble: L-STF + L-LTF + L-SIG)")
-        print("    L-SIG RATE field (MCS/rate code, 4 bits):")
-        for k,(rb,rd) in OFDM_RATE_BITS.items():
-            print(f"      {k:>2} Mbps = 0b{rb:04b}  {rd}")
-        rate_ch = get("Data rate (Mbps)", "54")
-        rate_bits, rate_label = OFDM_RATE_BITS.get(rate_ch, (0b1100, "54 Mbps"))
-        print(f"    -> {rate_label}")
-        print(f"    NOTE: L-STF (8µs) and L-LTF (8µs) are OFDM analog waveforms.")
-        print(f"    They are NOT byte-representable. Shown as placeholder bytes below.")
-        _, phy_records = build_ofdm_lsig(mpdu_len, rate_bits, rate_label)
-
-    elif phy_ch == '4':  # HT 802.11n
-        section("802.11n HT-MIXED PLCP  (L-STF + L-LTF + L-SIG + HT-SIG1 + HT-SIG2 + HT-STF + HT-LTF)")
-        print("    MCS index (0=BPSK 1/2, 7=64QAM 5/6, 8-15=2-stream ...)")
-        mcs  = int(get("MCS index (0-31)", "7")) & 0x1F
-        bw40 = get("40 MHz bandwidth? (y/n)", "n").lower().startswith("y")
-        sgi  = get("Short Guard Interval 400ns? (y/n)", "n").lower().startswith("y")
-        stbc = get("STBC? (y/n)", "n").lower().startswith("y")
-        ldpc = get("LDPC FEC? (y/n)", "n").lower().startswith("y")
-        rate_label = f"MCS{mcs} {'HT40' if bw40 else 'HT20'} {'SGI' if sgi else 'LGI'}"
-        _, phy_records = build_ht_sig(mpdu_len, mcs, bw40, sgi, stbc, ldpc, rate_label)
-
-    elif phy_ch == '5':  # VHT 802.11ac
-        section("802.11ac VHT PLCP  (L-STF+L-LTF+L-SIG+VHT-SIG-A+VHT-STF+VHT-LTF+VHT-SIG-B)")
-        mcs = int(get("MCS index (0-9)", "9")) & 0xF
-        nss = int(get("Number of Spatial Streams NSS (1-8)", "1"))
-        bw  = int(get("Bandwidth  20/40/80/160 MHz", "80"))
-        sgi = get("Short GI 400ns? (y/n)", "n").lower().startswith("y")
-        ldpc= get("LDPC FEC? (y/n)", "n").lower().startswith("y")
-        _, phy_records = build_vht_sig(mpdu_len, mcs, nss, bw, sgi, ldpc)
-
-    elif phy_ch == '6':  # HE 802.11ax
-        section("802.11ax HE PLCP  (L-STF+L-LTF+L-SIG+RL-SIG+HE-SIG-A+HE-STF+HE-LTF)")
-        mcs = int(get("MCS index (0-11)", "11")) & 0xF
-        nss = int(get("Number of Spatial Streams NSS (1-8)", "1"))
-        bw  = int(get("Bandwidth  20/40/80/160 MHz", "80"))
-        print("    Guard Interval:  0=0.8µs(Normal)  1=1.6µs  2=3.2µs")
-        gi  = int(get("GI (0/1/2)", "0")) & 0x3
-        ldpc= get("LDPC FEC? (y/n)", "n").lower().startswith("y")
-        _, phy_records = build_he_sig(mpdu_len, mcs, nss, bw, gi, ldpc)
-
-    # phy_ch == '7': no PHY, phy_records stays empty
-    return phy_records
-
-
-# ── Inputs ────────────────────────────────────────────────────────────────────
-
 def ask_wifi_frame():
     # ── PHY mode selection ─────────────────────────────────────────────────────
     section("WiFi PHY MODE  (determines preamble / frame boundary field)")
@@ -4458,7 +3140,6 @@ def ask_wifi_frame():
         'frame_body': frame_body,
         'ftype_ch': ftype_ch,
     }
-
 def build_wifi(d):
     """Assemble the 802.11 MPDU from the ask_wifi_frame dict and return
     (full_frame, records, mpdu_bytes, fcs, fcs_computed)."""
@@ -4561,162 +3242,9 @@ def build_wifi(d):
                     "note":f"0x{fcs.hex()}  ({len(mpdu)}B MPDU)"})
     return mpdu + fcs, records, mpdu, fcs, fcs_computed
 
-
-def flow_wifi():
-    banner("WiFi FRAME  —  IEEE 802.11  (PHY Preamble + MAC MPDU)",
-           "PHY: STF+LTF+SIG(≈SFD)  |  MAC: FC+Dur+Addr1-4+SeqCtrl+QoS+HTC+Body+FCS")
-    print_wifi_education()
-    d = ask_wifi_frame()
-    full_frame, records, mpdu, fcs, fcs_computed = build_wifi(d)
-
-    # ── Now ask PHY preamble AFTER we know MPDU length ─────────────────────────
-    mpdu_len = len(mpdu) + 4  # include FCS in MPDU length for PLCP
-    phy_records = ask_wifi_phy(d['phy_ch'], mpdu_len)
-
-    # Prepend PHY records to the record list
-    all_records = phy_records + records
-
-    print_frame_table(all_records)
-    fcs_ok = (fcs == fcs_computed)
-    verify_report([
-        ("802.11 FCS (CRC-32 MPDU)", fcs.hex(), fcs_computed.hex(), fcs_ok),
-    ])
-
-    # For encapsulation, build phy_bytes to prepend
-    phy_bytes = b''.join(r['raw'] for r in phy_records)
-    full_with_phy = phy_bytes + full_frame
-    print_encapsulation(all_records, full_with_phy)
-
-
-L3_ETH_MENU = """
-  ┌──────────────────────────────────────────────────────────────────────────┐
-  │              LAYER 3  —  Choose protocol to carry in Ethernet            │
-  ├────┬─────────────────────────────────────────────────────────────────────┤
-  │  1 │ ARP                        (EtherType 0x0806)                       │
-  │  2 │ IPv4 + ICMP                (EtherType 0x0800)                       │
-  │  3 │ IPv4 + TCP  3-way handshk  (EtherType 0x0800, proto=6)              │
-  │  4 │ IPv4 + UDP                 (EtherType 0x0800, proto=17)             │
-  │  5 │ STP / RSTP BPDU            (802.3 + LLC wrapper)                    │
-  │  6 │ DTP  – Cisco Trunking      (802.3 + SNAP)                           │
-  │  7 │ PAgP – Cisco Port Agg.     (802.3 + SNAP)                           │
-  │  8 │ LACP – 802.3ad             (EtherType 0x8809)                       │
-  │  9 │ Pause Frame  – IEEE 802.3x (EtherType 0x8808, opcode 0x0001)        │
-  │ 10 │ PFC  – IEEE 802.1Qbb       (EtherType 0x8808, opcode 0x0101, per-P) │
-  │ 11 │ LLDP – IEEE 802.1AB        (EtherType 0x88CC, TLV discovery)        │
-  │ 12 │ VLAN Tagged – IEEE 802.1Q  (TPID 0x8100, PCP+DEI+VID + Q-in-Q opt) │
-  │ 13 │ Jumbo Frame  – vendor ext  (MTU > 1500B, up to 9000B+)              │
-  └────┴─────────────────────────────────────────────────────────────────────┘"""
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  MAIN MENU
-# ═══════════════════════════════════════════════════════════════════════════════
-
-MAIN_MENU = """
-╔════════════════════════════════════════════════════════════════════════════════╗
-║           NETWORK FRAME BUILDER  —  LAYERED INPUT FLOW                        ║
-╠════════════════════════════════════════════════════════════════════════════════╣
-║  SELECT LAYER 2 TECHNOLOGY                                                     ║
-╠═══╦════════════════════════════════════════════════════════════════════════════╣
-║ 1 ║ Ethernet / 802.3  →  choose L3 protocol (13 options)                      ║
-║   ║  ARP | ICMP | TCP | UDP | STP | DTP | PAgP | LACP                         ║
-║   ║  Pause(802.3x) | PFC(802.1Qbb) | LLDP(802.1AB) | VLAN(802.1Q) | Jumbo    ║
-╠═══╬════════════════════════════════════════════════════════════════════════════╣
-║ 2 ║ Serial / WAN  →  choose L2 protocol (11 options)                          ║
-║   ║  Raw | SLIP | PPP | HDLC-basic | HDLC-Full(I/S/U) | KISS | Modbus        ║
-║   ║  HDLC+BitStuff | ATM AAL5 | Cisco HDLC | COBS                             ║
-╠═══╬════════════════════════════════════════════════════════════════════════════╣
-║ 3 ║ WiFi / 802.11  →  choose frame type (Management / Control / Data)         ║
-║   ║  Beacon | Probe | Auth | Assoc | RTS | CTS | ACK | Data | QoS | Null      ║
-╚═══╩════════════════════════════════════════════════════════════════════════════╝"""
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  STANDALONE IP PACKET BUILDER  (L3 only — no Ethernet wrapper)
-# ═══════════════════════════════════════════════════════════════════════════════
-#
-#  IPv4 HEADER STRUCTURE  (RFC 791)
-#  ─────────────────────────────────────────────────────────────────────────────
-#  Octet  Bits  Field               Description
-#  ─────  ────  ──────────────────  ──────────────────────────────────────────
-#    0      4   Version             Always 4 for IPv4
-#    0      4   IHL                 Header length in 32-bit words (min 5 = 20B)
-#    1      8   DSCP/ECN            QoS + congestion notification
-#    2     16   Total Length        Entire packet bytes (header + payload)
-#    4     16   Identification      Fragment group ID (0 for non-fragmented)
-#    6      3   Flags               DF (don't fragment), MF (more fragments)
-#    6     13   Fragment Offset     Offset of this fragment in 8-byte units
-#    8      8   TTL                 Hop limit (decremented by each router)
-#    9      8   Protocol            Upper layer: 1=ICMP 6=TCP 17=UDP 89=OSPF
-#   10     16   Header Checksum     One's complement of header (auto or manual)
-#   12     32   Source Address      Sender's IP
-#   16     32   Destination Address Receiver's IP
-#   20+    N    Options (optional)  Padding to reach IHL boundary
-#   IHL×4  …   Data / Payload      Upper-layer protocol data
-#  ─────────────────────────────────────────────────────────────────────────────
-#
-#  IP OPTIONS (when IHL > 5)
-#  ─────────────────────────────────────────────────────────────────────────────
-#  Option  Code  Description
-#  ──────  ────  ──────────────────────────────────────────────────────────────
-#  EOOL    0x00  End Of Option List — padding
-#  NOP     0x01  No Operation — 1-byte padding to align
-#  RR      0x07  Record Route — each router appends its IP
-#  TS      0x44  Internet Timestamp — each router appends time
-#  LSRR    0x83  Loose Source and Record Route — must visit listed IPs
-#  SSRR    0x89  Strict Source and Record Route — must visit exactly
-#  ─────────────────────────────────────────────────────────────────────────────
-#
-#  CHECKSUM CALCULATION  (RFC 791 — one's complement)
-#  ─────────────────────────────────────────────────────────────────────────────
-#  1. Set checksum field to 0x0000
-#  2. Sum all 16-bit words of the header
-#  3. Add carry bits back into the sum (fold carries)
-#  4. Take one's complement (~sum & 0xFFFF)
-#  5. Store result in checksum field
-#  Verification: sum all header words including checksum → result must be 0xFFFF
-# ═══════════════════════════════════════════════════════════════════════════════
-
-IP_PROTO_NAMES = {
-    0:  ("HOPOPT",  "IPv6 Hop-by-Hop Options"),
-    1:  ("ICMP",    "Internet Control Message Protocol"),
-    2:  ("IGMP",    "Internet Group Management Protocol"),
-    4:  ("IP-IP",   "IP-in-IP Encapsulation"),
-    6:  ("TCP",     "Transmission Control Protocol"),
-    17: ("UDP",     "User Datagram Protocol"),
-    41: ("IPv6",    "IPv6 Encapsulation"),
-    47: ("GRE",     "Generic Routing Encapsulation"),
-    50: ("ESP",     "Encapsulating Security Payload"),
-    51: ("AH",      "Authentication Header"),
-    58: ("ICMPv6",  "ICMP for IPv6"),
-    89: ("OSPF",    "Open Shortest Path First"),
-    103:("PIM",     "Protocol Independent Multicast"),
-    112:("VRRP",    "Virtual Router Redundancy Protocol"),
-    132:("SCTP",    "Stream Control Transmission Protocol"),
-}
-
-DSCP_TABLE = {
-    0:  ("CS0 / BE",  "Best Effort — default"),
-    8:  ("CS1",       "Scavenger / low-priority"),
-    10: ("AF11",      "Assured Forwarding low drop"),
-    12: ("AF12",      "Assured Forwarding med drop"),
-    14: ("AF13",      "Assured Forwarding high drop"),
-    16: ("CS2",       "OAM"),
-    18: ("AF21",      "AF class 2 low drop"),
-    20: ("AF22",      "AF class 2 med drop"),
-    22: ("AF23",      "AF class 2 high drop"),
-    24: ("CS3",       "Broadcast video"),
-    26: ("AF31",      "AF class 3 low drop"),
-    28: ("AF32",      "AF class 3 med drop"),
-    30: ("AF33",      "AF class 3 high drop"),
-    32: ("CS4",       "Real-time interactive"),
-    34: ("AF41",      "AF class 4 low drop"),
-    36: ("AF42",      "AF class 4 med drop"),
-    38: ("AF43",      "AF class 4 high drop"),
-    40: ("CS5",       "Signalling"),
-    46: ("EF",        "Expedited Forwarding — VoIP"),
-    48: ("CS6",       "Network control (routing)"),
-    56: ("CS7",       "Reserved"),
-}
-
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 8 — STANDALONE IPv4 PACKET BUILDER
+# ══════════════════════════════════════════════════════════════════════════════
 def print_ip_education():
     print(f"""
   {'═'*110}
@@ -4765,8 +3293,6 @@ def print_ip_education():
   1=ICMP  2=IGMP  4=IP-in-IP  6=TCP  17=UDP  41=IPv6(tunnel)
   47=GRE  50=ESP  51=AH  58=ICMPv6  89=OSPF  103=PIM  112=VRRP  132=SCTP
   {'═'*110}""")
-
-
 def ask_ip_options():
     """Ask whether to add IP options and build them."""
     section("IP OPTIONS  (optional — extends header beyond 20 bytes)")
@@ -4856,8 +3382,6 @@ def ask_ip_options():
                     "raw":opt_bytes,"user_val":opt_bytes.hex()[:24],
                     "note":f"{len(opt_bytes)}B"}]
         return opt_bytes, records
-
-
 def ask_ip_payload():
     """Ask what L4 payload to put inside the IP packet."""
     section("IP PAYLOAD  (Layer 4 content)")
@@ -4875,7 +3399,742 @@ def ask_ip_payload():
              "5=Empty: just the IP header with no payload (testing header-only).")
     return ch
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 9 — FLOW CONTROLLERS  (top-level frame assembly)
+# ══════════════════════════════════════════════════════════════════════════════
 
+# ──────────────────────────────────────────────────────────────────────────────
+#  Ethernet flows
+# ──────────────────────────────────────────────────────────────────────────────
+def flow_eth_arp():
+    banner("ETHERNET  +  ARP",
+           "L1: Preamble+SFD  |  L2: Ethernet II (0x0806)  |  L3: ARP")
+    preamble, sfd = ask_layer1_eth()
+    (dst_mb, src_mb, type_len_b, llc_b, snap_b,
+     variant, dst_s, src_s, v) = ask_l2_ethernet("0806")
+    arp_inputs    = ask_l3_arp()
+    arp_raw, arp_fields = build_arp(arp_inputs)
+    full_frame, records = assemble_eth_frame(
+        arp_raw, arp_fields, dst_mb, src_mb, type_len_b,
+        llc_b, snap_b, variant, dst_s, src_s, v, preamble, sfd)
+    print_frame_table(records)
+    # verify FCS
+    fcs_stored = full_frame[-4:]
+    fcs_ref    = crc32_eth(full_frame[8:-4])
+    verify_report([
+        ("Ethernet FCS (CRC-32)", fcs_stored.hex(), fcs_ref.hex(), fcs_stored==fcs_ref),
+    ])
+    print_encapsulation(records, full_frame)
+def flow_eth_ip_icmp():
+    banner("ETHERNET  +  IPv4  +  ICMP",
+           "L1: Preamble+SFD  |  L2: Ethernet II (0x0800)  |  L3: IPv4  |  L4: ICMP")
+    preamble, sfd = ask_layer1_eth()
+    (dst_mb, src_mb, type_len_b, llc_b, snap_b,
+     variant, dst_s, src_s, v) = ask_l2_ethernet("0800")
+    (src_ip, dst_ip, ttl, ip_id, dscp,
+     df, _) = ask_l3_ipv4()
+    # L4
+    icmp_type, icmp_code, icmp_id, icmp_seq, icmp_data, data_hex = ask_l4_icmp()
+    icmp_msg, icmp_fields, icmp_ck = build_icmp(icmp_type, icmp_code, icmp_id, icmp_seq, icmp_data, data_hex)
+    ip_hdr, ip_fields, ip_ck = build_ipv4(icmp_msg, src_ip, dst_ip, ttl, ip_id, dscp, df, 1)
+    l3_payload = ip_hdr + icmp_msg
+    all_upper  = ip_fields + icmp_fields
+
+    full_frame, records = assemble_eth_frame(
+        l3_payload, all_upper, dst_mb, src_mb, type_len_b,
+        llc_b, snap_b, variant, dst_s, src_s, v, preamble, sfd)
+
+    print_frame_table(records)
+    fcs_stored = full_frame[-4:]
+    fcs_ref    = crc32_eth(full_frame[8:-4])
+    ip_ver     = inet_cksum(ip_hdr)
+    icmp_ver   = inet_cksum(icmp_msg)
+    verify_report([
+        ("IP Header Checksum",    f"0x{ip_ck:04x}",  f"0x{ip_ver:04x}",   ip_ver==0),
+        ("ICMP Checksum",         f"0x{icmp_ck:04x}",f"0x{icmp_ver:04x}", icmp_ver==0),
+        ("Ethernet FCS (CRC-32)", fcs_stored.hex(),  fcs_ref.hex(),        fcs_stored==fcs_ref),
+    ])
+    print_encapsulation(records, full_frame)
+def flow_eth_ip_tcp():
+    banner("ETHERNET  +  IPv4  +  TCP",
+           "L1: Preamble+SFD  |  L2: Ethernet II (0x0800)  |  L3: IPv4  |  L4: TCP")
+    preamble, sfd = ask_layer1_eth()
+    (dst_mb, src_mb, type_len_b, llc_b, snap_b,
+     variant, dst_s, src_s, v) = ask_l2_ethernet("0800")
+    (src_ip, dst_ip, ttl, ip_id, dscp, df, _) = ask_l3_ipv4()
+    # Force protocol=6 (TCP) regardless of user proto input
+    (step, step_name, src_port, dst_port, seq_num, ack_num,
+     data_off, flags_val, window, urg_ptr, tcp_data,
+     sip, dip) = ask_l4_tcp(src_ip, dst_ip)
+
+    tcp_seg, tcp_fields, tcp_ck = build_tcp(
+        step, step_name, src_port, dst_port, seq_num, ack_num,
+        data_off, flags_val, window, urg_ptr, tcp_data, src_ip, dst_ip)
+
+    ip_hdr, ip_fields, ip_ck = build_ipv4(
+        tcp_seg, src_ip, dst_ip, ttl, ip_id, dscp, df, 6)
+
+    l3_payload = ip_hdr + tcp_seg
+    all_upper  = ip_fields + tcp_fields
+
+    full_frame, records = assemble_eth_frame(
+        l3_payload, all_upper, dst_mb, src_mb, type_len_b,
+        llc_b, snap_b, variant, dst_s, src_s, v, preamble, sfd)
+
+    print_frame_table(records)
+    fcs_stored = full_frame[-4:]
+    fcs_ref    = crc32_eth(full_frame[8:-4])
+    ip_ver     = inet_cksum(ip_hdr)
+    tcp_ver    = tcp_checksum(src_ip, dst_ip, tcp_seg)
+    verify_report([
+        ("IP Header Checksum",    f"0x{ip_ck:04x}",  f"0x{ip_ver:04x}",  ip_ver==0),
+        ("TCP Checksum",          f"0x{tcp_ck:04x}", f"0x{tcp_ver:04x}", tcp_ver==0),
+        ("Ethernet FCS (CRC-32)", fcs_stored.hex(),  fcs_ref.hex(),       fcs_stored==fcs_ref),
+    ])
+    print_encapsulation(records, full_frame)
+def flow_eth_ip_udp():
+    banner("ETHERNET  +  IPv4  +  UDP",
+           "L1: Preamble+SFD  |  L2: Ethernet II (0x0800)  |  L3: IPv4  |  L4: UDP")
+    preamble, sfd = ask_layer1_eth()
+    (dst_mb, src_mb, type_len_b, llc_b, snap_b,
+     variant, dst_s, src_s, v) = ask_l2_ethernet("0800")
+    (src_ip, dst_ip, ttl, ip_id, dscp, df, _) = ask_l3_ipv4()
+
+    (src_port, dst_port, udp_data,
+     sip, dip) = ask_l4_udp(src_ip, dst_ip)
+
+    udp_dgram, udp_fields, udp_ck = build_udp(
+        src_port, dst_port, udp_data, src_ip, dst_ip)
+
+    ip_hdr, ip_fields, ip_ck = build_ipv4(
+        udp_dgram, src_ip, dst_ip, ttl, ip_id, dscp, df, 17)
+
+    l3_payload = ip_hdr + udp_dgram
+    all_upper  = ip_fields + udp_fields
+
+    full_frame, records = assemble_eth_frame(
+        l3_payload, all_upper, dst_mb, src_mb, type_len_b,
+        llc_b, snap_b, variant, dst_s, src_s, v, preamble, sfd)
+
+    print_frame_table(records)
+    fcs_stored = full_frame[-4:]
+    fcs_ref    = crc32_eth(full_frame[8:-4])
+    ip_ver     = inet_cksum(ip_hdr)
+    udp_ver    = udp_checksum(src_ip, dst_ip, udp_dgram)
+    verify_report([
+        ("IP Header Checksum",    f"0x{ip_ck:04x}",  f"0x{ip_ver:04x}",  ip_ver==0),
+        ("UDP Checksum",          f"0x{udp_ck:04x}", f"0x{udp_ver:04x}", udp_ver==0),
+        ("Ethernet FCS (CRC-32)", fcs_stored.hex(),  fcs_ref.hex(),       fcs_stored==fcs_ref),
+    ])
+    print_encapsulation(records, full_frame)
+def flow_eth_stp():
+    banner("ETHERNET (802.3 + LLC)  +  STP / RSTP BPDU",
+           "L1: Preamble+SFD  |  L2: 802.3+LLC  |  L3: BPDU")
+    preamble, sfd = ask_layer1_eth()
+    stp_inputs = ask_l3_stp()
+    bpdu_raw, bpdu_fields = build_stp(stp_inputs)
+
+    # STP always uses 802.3+LLC, fixed MACs
+    section("LAYER 2 — 802.3 + LLC  (STP uses fixed multicast)")
+    dst_s = get("Destination MAC", "01:80:c2:00:00:00")
+    src_s = get("Source MAC",      "00:11:22:33:44:55")
+    llc_b = bytes.fromhex("424203")   # DSAP=0x42 SSAP=0x42 Ctrl=0x03
+    length_val = len(llc_b) + len(bpdu_raw)
+    tl    = struct.pack('>H', length_val)
+    dst_mb, src_mb = mac_b(dst_s), mac_b(src_s)
+
+    mac_content = dst_mb + src_mb + tl + llc_b + bpdu_raw
+    fcs, fcs_note = ask_fcs_eth(mac_content)
+    full_frame = preamble + sfd + mac_content + fcs
+
+    records = [
+        {"layer":1,"name":"Preamble",        "raw":preamble,"user_val":preamble.hex(),"note":"7×0x55"},
+        {"layer":1,"name":"SFD",             "raw":sfd,     "user_val":sfd.hex(),     "note":"0xD5"},
+        {"layer":2,"name":"Dst MAC",         "raw":dst_mb,  "user_val":dst_s,         "note":"STP multicast"},
+        {"layer":2,"name":"Src MAC",         "raw":src_mb,  "user_val":src_s,         "note":"bridge MAC"},
+        {"layer":2,"name":"802.3 Length",    "raw":tl,      "user_val":str(length_val),"note":"bytes"},
+        {"layer":2,"name":"LLC DSAP",        "raw":llc_b[0:1],"user_val":"42",        "note":"STP SAP"},
+        {"layer":2,"name":"LLC SSAP",        "raw":llc_b[1:2],"user_val":"42",        "note":"STP SAP"},
+        {"layer":2,"name":"LLC Control",     "raw":llc_b[2:3],"user_val":"03",        "note":"UI frame"},
+    ] + bpdu_fields + [
+        {"layer":0,"name":"Ethernet FCS","raw":fcs,"user_val":"auto/custom","note":fcs_note},
+    ]
+    print_frame_table(records)
+    fcs_stored = full_frame[-4:]
+    fcs_ref    = crc32_eth(full_frame[8:-4])
+    verify_report([("Ethernet FCS (CRC-32)", fcs_stored.hex(), fcs_ref.hex(), fcs_stored==fcs_ref)])
+    print_encapsulation(records, full_frame)
+def flow_eth_dtp():
+    banner("ETHERNET (802.3 + SNAP)  +  DTP",
+           "L1: Preamble+SFD  |  L2: 802.3+SNAP  |  L3: DTP")
+    preamble, sfd = ask_layer1_eth()
+    section("LAYER 2 — Ethernet 802.3")
+    dst_s = get("Destination MAC", "01:00:0c:cc:cc:cc")
+    src_s = get("Source MAC",      "00:11:22:33:44:55")
+    mode  = ask_l3_dtp()
+    dtp_raw, dtp_fields = build_dtp(mode)
+    dst_mb, src_mb = mac_b(dst_s), mac_b(src_s)
+    length_val = len(dtp_raw)
+    tl = struct.pack('>H', length_val)
+    mac_content = dst_mb + src_mb + tl + dtp_raw
+    fcs, fcs_note = ask_fcs_eth(mac_content)
+    full_frame = preamble + sfd + mac_content + fcs
+    records = [
+        {"layer":1,"name":"Preamble","raw":preamble,"user_val":preamble.hex(),"note":"7×0x55"},
+        {"layer":1,"name":"SFD",     "raw":sfd,     "user_val":sfd.hex(),     "note":"0xD5"},
+        {"layer":2,"name":"Dst MAC", "raw":dst_mb,  "user_val":dst_s,         "note":"Cisco multicast"},
+        {"layer":2,"name":"Src MAC", "raw":src_mb,  "user_val":src_s,         "note":""},
+        {"layer":2,"name":"802.3 Length","raw":tl,  "user_val":str(length_val),"note":"bytes"},
+    ] + dtp_fields + [
+        {"layer":0,"name":"Ethernet FCS","raw":fcs,"user_val":"auto/custom","note":fcs_note},
+    ]
+    print_frame_table(records)
+    fcs_stored = full_frame[-4:]
+    fcs_ref    = crc32_eth(full_frame[8:-4])
+    verify_report([("Ethernet FCS (CRC-32)", fcs_stored.hex(), fcs_ref.hex(), fcs_stored==fcs_ref)])
+    print_encapsulation(records, full_frame)
+def flow_eth_pagp():
+    banner("ETHERNET (802.3 + SNAP)  +  PAgP",
+           "L1: Preamble+SFD  |  L2: 802.3+SNAP  |  L3: PAgP")
+    preamble, sfd = ask_layer1_eth()
+    section("LAYER 2 — Ethernet 802.3")
+    dst_s = get("Destination MAC", "01:00:0c:cc:cc:cc")
+    src_s = get("Source MAC",      "00:11:22:33:44:55")
+    state = ask_l3_pagp()
+    pagp_raw, pagp_fields = build_pagp(state)
+    dst_mb, src_mb = mac_b(dst_s), mac_b(src_s)
+    length_val = len(pagp_raw)
+    tl = struct.pack('>H', length_val)
+    mac_content = dst_mb + src_mb + tl + pagp_raw
+    fcs, fcs_note = ask_fcs_eth(mac_content)
+    full_frame = preamble + sfd + mac_content + fcs
+    records = [
+        {"layer":1,"name":"Preamble","raw":preamble,"user_val":preamble.hex(),"note":"7×0x55"},
+        {"layer":1,"name":"SFD",     "raw":sfd,     "user_val":sfd.hex(),     "note":"0xD5"},
+        {"layer":2,"name":"Dst MAC", "raw":dst_mb,  "user_val":dst_s,         "note":"Cisco multicast"},
+        {"layer":2,"name":"Src MAC", "raw":src_mb,  "user_val":src_s,         "note":""},
+        {"layer":2,"name":"802.3 Length","raw":tl,  "user_val":str(length_val),"note":"bytes"},
+    ] + pagp_fields + [
+        {"layer":0,"name":"Ethernet FCS","raw":fcs,"user_val":"auto/custom","note":fcs_note},
+    ]
+    print_frame_table(records)
+    fcs_stored = full_frame[-4:]
+    fcs_ref    = crc32_eth(full_frame[8:-4])
+    verify_report([("Ethernet FCS (CRC-32)", fcs_stored.hex(), fcs_ref.hex(), fcs_stored==fcs_ref)])
+    print_encapsulation(records, full_frame)
+def flow_eth_lacp():
+    banner("ETHERNET II (0x8809)  +  LACP",
+           "L1: Preamble+SFD  |  L2: Ethernet II  |  L3: LACP")
+    preamble, sfd = ask_layer1_eth()
+    section("LAYER 2 — Ethernet II")
+    dst_s = get("Destination MAC", "01:80:c2:00:00:02")
+    src_s = get("Source MAC",      "00:11:22:33:44:55")
+    actor_mac, actor_key, actor_state = ask_l3_lacp()
+    lacp_raw, lacp_fields = build_lacp(actor_mac, actor_key, actor_state)
+    dst_mb, src_mb = mac_b(dst_s), mac_b(src_s)
+    et = bytes.fromhex("8809")
+    mac_content = dst_mb + src_mb + et + lacp_raw
+    fcs, fcs_note = ask_fcs_eth(mac_content)
+    full_frame = preamble + sfd + mac_content + fcs
+    records = [
+        {"layer":1,"name":"Preamble",  "raw":preamble,"user_val":preamble.hex(),"note":"7×0x55"},
+        {"layer":1,"name":"SFD",       "raw":sfd,     "user_val":sfd.hex(),     "note":"0xD5"},
+        {"layer":2,"name":"Dst MAC",   "raw":dst_mb,  "user_val":dst_s,         "note":"Slow Protocol multicast"},
+        {"layer":2,"name":"Src MAC",   "raw":src_mb,  "user_val":src_s,         "note":""},
+        {"layer":2,"name":"EtherType", "raw":et,      "user_val":"0x8809",      "note":"Slow Protocols"},
+    ] + lacp_fields + [
+        {"layer":0,"name":"Ethernet FCS","raw":fcs,"user_val":"auto/custom","note":fcs_note},
+    ]
+    print_frame_table(records)
+    fcs_stored = full_frame[-4:]
+    fcs_ref    = crc32_eth(full_frame[8:-4])
+    verify_report([("Ethernet FCS (CRC-32)", fcs_stored.hex(), fcs_ref.hex(), fcs_stored==fcs_ref)])
+    print_encapsulation(records, full_frame)
+def flow_eth_pause():
+    banner("ETHERNET PAUSE FRAME  —  IEEE 802.3x",
+           "L1: Preamble+SFD  |  L2: EtherType 0x8808  |  MAC Ctrl Opcode 0x0001  |  Pause Quanta")
+    print_pause_education()
+    preamble, sfd, dst_s, src_s, quanta_val = ask_l2_pause()
+    full_frame, records = build_pause(preamble, sfd, dst_s, src_s, quanta_val)
+
+    print_frame_table(records)
+
+    fcs_stored = full_frame[-4:]
+    fcs_ref    = crc32_eth(full_frame[8:-4])
+    verify_report([
+        ("Ethernet FCS (CRC-32)", fcs_stored.hex(), fcs_ref.hex(), fcs_stored==fcs_ref),
+    ])
+    print_encapsulation(records, full_frame)
+def flow_eth_pfc():
+    banner("PFC — PRIORITY FLOW CONTROL  IEEE 802.1Qbb",
+           "L1: Preamble+SFD  |  L2: EtherType 0x8808  |  Opcode 0x0101  |  8×Priority Quanta")
+    print_pfc_education()
+    preamble, sfd, dst_s, src_s, vec_val, quanta = ask_l2_pfc()
+    full_frame, records = build_pfc(preamble, sfd, dst_s, src_s, vec_val, quanta)
+    print_frame_table(records)
+    fcs_stored = full_frame[-4:]
+    fcs_ref    = crc32_eth(full_frame[8:-4])
+    verify_report([("Ethernet FCS (CRC-32)", fcs_stored.hex(), fcs_ref.hex(), fcs_stored==fcs_ref)])
+    print_encapsulation(records, full_frame)
+def flow_eth_lldp():
+    banner("LLDP — LINK LAYER DISCOVERY PROTOCOL  IEEE 802.1AB",
+           "L1: Preamble+SFD  |  L2: EtherType 0x88CC  |  L3: LLDP TLVs (Chassis+Port+TTL+Options)")
+    print_lldp_education()
+    inputs = ask_l2_lldp()
+    full_frame, records = build_lldp(*inputs)
+    print_frame_table(records)
+    fcs_stored = full_frame[-4:]
+    fcs_ref    = crc32_eth(full_frame[8:-4])
+    verify_report([("Ethernet FCS (CRC-32)", fcs_stored.hex(), fcs_ref.hex(), fcs_stored==fcs_ref)])
+    print_encapsulation(records, full_frame)
+def flow_eth_vlan():
+    banner("VLAN TAGGED FRAME  —  IEEE 802.1Q  (+Q-in-Q / 802.1ad option)",
+           "L1: Preamble+SFD  |  L2: TPID(0x8100)+TCI[PCP+DEI+VID]  |  Inner EtherType  |  Payload")
+    print_vlan_education()
+    inputs = ask_l2_vlan()
+    full_frame, records = build_vlan(*inputs)
+    print_frame_table(records)
+    fcs_stored = full_frame[-4:]
+    fcs_ref    = crc32_eth(full_frame[8:-4])
+    verify_report([("Ethernet FCS (CRC-32)", fcs_stored.hex(), fcs_ref.hex(), fcs_stored==fcs_ref)])
+    print_encapsulation(records, full_frame)
+def flow_eth_jumbo():
+    banner("JUMBO FRAME  —  Non-Standard Vendor Extension",
+           "L1: Preamble+SFD  |  L2: Ethernet II  |  Payload up to 9000B+ (MTU > 1500B)")
+    print_jumbo_education()
+    inputs = ask_l2_jumbo()
+    full_frame, records = build_jumbo(*inputs)
+    total = len(full_frame)
+    print(f"\n  -> Frame size: {total} bytes  ({total*8} bits)")
+    if total > 1518:
+        overhead_pct = (14 + 4) / total * 100
+        print(f"  -> Header overhead: {overhead_pct:.2f}%  (Payload efficiency: {100-overhead_pct:.2f}%)")
+    print_frame_table(records)
+    fcs_stored = full_frame[-4:]
+    fcs_ref    = crc32_eth(full_frame[8:-4])
+    verify_report([("Ethernet FCS (CRC-32)", fcs_stored.hex(), fcs_ref.hex(), fcs_stored==fcs_ref)])
+    print_encapsulation(records, full_frame)
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  HDLC full builder
+# ──────────────────────────────────────────────────────────────────────────────
+def flow_hdlc():
+    banner("HDLC FRAME BUILDER — ISO 13239",
+           "3 Frame Types:  I-frame (data+seq)  |  S-frame (supervisory)  |  U-frame (link mgmt)")
+    print_hdlc_education()
+
+    # ── Flags ──────────────────────────────────────────────────────────────────
+    section("FLAGS  (frame delimiters)")
+    print("    Standard HDLC flag = 0x7E.  Both start and end use same value.")
+    flag_hex = get("Flag byte (hex)", "7e",
+        help="Frame delimiter — 1 byte, marks the start and end of every HDLC frame.\n"
+             "0x7E = 01111110 in binary — the standard HDLC flag.\n"
+             "Bit-stuffing inserts a 0 after every 5 consecutive 1-bits inside the frame\n"
+             "to prevent 0x7E appearing in the frame content.\n"
+             "Keep 0x7E unless working with a non-standard implementation.")
+    try:    flag_b = bytes([int(flag_hex, 16) & 0xFF])
+    except: flag_b = b'\x7E'
+
+    # ── Address ───────────────────────────────────────────────────────────────
+    addr_bytes, addr_note = ask_hdlc_address()
+
+    # ── Frame Type ────────────────────────────────────────────────────────────
+    section("HDLC FRAME TYPE")
+    print("    1 = I-frame  (Information)   — reliable data with sequence numbers")
+    print("    2 = S-frame  (Supervisory)   — ACK/NAK/flow control, no data")
+    print("    3 = U-frame  (Unnumbered)    — link setup/teardown/UI datagram")
+    ftype = get("Frame type (1/2/3)", "1")
+    if ftype not in ('1','2','3'): ftype = '1'
+
+    # ── Modulo (I and S only) ─────────────────────────────────────────────────
+    mod128 = False
+    if ftype in ('1','2'):
+        print("\n    Window size / modulo:")
+        print("      Modulo  8: N(S)/N(R) 0–7,   1-byte control  (basic HDLC)")
+        print("      Modulo 128: N(S)/N(R) 0–127, 2-byte control  (extended HDLC / ISDN)")
+        mod128 = get("Use Modulo-128 extended control? (y/n)", "n",
+            help="Modulo controls the sequence number range and control field size.\n"
+                 "Modulo-8:   1-byte control, window size up to 7 frames in flight.\n"
+                 "            Used in basic HDLC, Cisco HDLC, simple WAN links.\n"
+                 "Modulo-128: 2-byte control, window size up to 127 frames in flight.\n"
+                 "            Used in ISDN (LAPD/Q.921), X.25 (LAPB), high-throughput links.\n"
+                 "Choose 128 when you need large send windows or are building LAPD frames.").lower().startswith("y")
+
+    # ── P/F bit ───────────────────────────────────────────────────────────────
+    section("POLL/FINAL (P/F) BIT")
+    print("    P=1 in a COMMAND means: 'respond now' (poll)")
+    print("    F=1 in a RESPONSE means: 'this is my final response'")
+    pf = int(get("P/F bit (0 or 1)", "0",
+        help="Poll/Final bit — 1 bit in the control field.\n"
+             "In a COMMAND frame: P=1 = Poll — instructs the peer to respond immediately.\n"
+             "In a RESPONSE frame: F=1 = Final — this is the last response to a poll.\n"
+             "P=0 / F=0 = normal unsolicited frame (no immediate response required).\n"
+             "Example: Primary sends RR with P=1 (poll), Secondary responds with RR+F=1.")) & 1
+
+    # ─────────────────────────────────────────────────────────────────────────
+    if ftype == '1':
+        # I-FRAME
+        section("I-FRAME — SEQUENCE NUMBERS")
+        print("    N(S) = Send Sequence Number (sequence of THIS frame)")
+        print("    N(R) = Receive Sequence Number (acknowledges receipt up to N(R)-1)")
+        ns_max = 127 if mod128 else 7
+        ns = int(get(f"N(S) Send Sequence  (0–{ns_max})", "0",
+            help=f"N(S) — Send Sequence Number of THIS I-frame (0–{ns_max}).\n"
+                 "Identifies this frame's position in the outgoing sequence.\n"
+                 "Receiver checks N(S) matches what it expects; rejects out-of-order frames.\n"
+                 "After sending N(S)=7 (mod-8), next frame has N(S)=0 (wraps around).")) & (0x7F if mod128 else 0x7)
+        nr = int(get(f"N(R) Receive/ACK Seq (0–{ns_max})", "0",
+            help=f"N(R) — Receive Sequence Number / ACK (0–{ns_max}).\n"
+                 "Meaning: 'I have correctly received all frames up to N(R)-1.'\n"
+                 "Implicitly acknowledges the peer's frames — piggybacked ACK.\n"
+                 "Set to the SeqNum of the NEXT frame you expect from the peer.\n"
+                 "Example: peer sent frames 0,1,2 → set N(R)=3 to ACK all three.")) & (0x7F if mod128 else 0x7)
+        ctrl_bytes = build_hdlc_control_i(ns, pf, nr, mod128)
+        ctrl_note  = f"I-frame  N(S)={ns}  P/F={pf}  N(R)={nr}  {'mod-128' if mod128 else 'mod-8'}"
+
+        section("I-FRAME — INFORMATION PAYLOAD")
+        print("    Enter the data payload in hex.")
+        print("    Examples:  PPP data: ff030021...  IP packet: 4500...")
+        payload_hex = get("Payload hex (Enter=empty)", "")
+        try:    info_bytes = bytes.fromhex(payload_hex.replace(" ",""))
+        except: info_bytes = b''
+        has_info = True
+
+    elif ftype == '2':
+        # S-FRAME
+        section("S-FRAME — SUPERVISORY FUNCTION")
+        for k,(s1,s0,mn,desc) in HDLC_S_SUBTYPES.items():
+            print(f"      {k} = {mn:<6}  {desc}")
+        s_ch = get("S-frame subtype (1-4)", "1")
+        if s_ch not in HDLC_S_SUBTYPES: s_ch = '1'
+        s1, s0, s_mn, s_desc = HDLC_S_SUBTYPES[s_ch]
+        s1s0 = (s1 << 1) | s0
+
+        nr_max = 127 if mod128 else 7
+        nr = int(get(f"N(R) Receive/ACK Sequence (0–{nr_max})", "0",
+            help=f"N(R) — Receive/ACK sequence number for this S-frame (0–{nr_max}).\n"
+                 "Meaning: 'I have received everything up to N(R)-1 correctly.'\n"
+                 "RR with N(R)=5: ACKs frames 0–4, ready to receive frame 5.\n"
+                 "REJ with N(R)=3: frames 0–2 OK, retransmit from frame 3 onward.\n"
+                 "RNR with N(R)=5: ACKs 0–4, but STOP sending — buffer full.\n"
+                 "SREJ with N(R)=3: retransmit only frame 3 (everything else fine).")) & (0x7F if mod128 else 0x7)
+        ctrl_bytes = build_hdlc_control_s(nr, pf, s1s0, mod128)
+        ctrl_note  = f"S-frame  {s_mn}({s_desc.split('—')[0].strip()})  N(R)={nr}  P/F={pf}  {'mod-128' if mod128 else 'mod-8'}"
+        info_bytes = b''
+        has_info   = False
+
+    else:
+        # U-FRAME
+        section("U-FRAME — UNNUMBERED SUBTYPE")
+        for k,(m4,m3,m2,m1,m0,mn,cr,desc) in HDLC_U_SUBTYPES.items():
+            m_str = f"{m4}{m3}{m2}-{m1}{m0}"
+            print(f"    {k:>2} = {mn:<6}  [{m_str}]  {cr:3}  {desc}")
+        u_ch = get("U-frame subtype (1-10)", "1")
+        if u_ch not in HDLC_U_SUBTYPES: u_ch = '1'
+        m4,m3,m2,m1,m0, u_mn, u_cr, u_desc = HDLC_U_SUBTYPES[u_ch]
+        m4m3m2 = (m4<<2)|(m3<<1)|m2
+        m1m0   = (m1<<1)|m0
+        ctrl_bytes = build_hdlc_control_u(m4m3m2, pf, m1m0)
+        ctrl_note  = f"U-frame  {u_mn}  P/F={pf}  M={m4}{m3}{m2}-{m1}{m0}  ({u_cr}) {u_desc}"
+
+        # Info field for UI / XID / TEST / FRMR
+        info_bytes = b''
+        has_info   = u_mn in ("UI", "XID", "TEST", "FRMR")
+        if has_info:
+            section(f"U-FRAME INFO FIELD  ({u_mn} carries optional data)")
+            if u_mn == "XID":
+                print("    XID info format: Format-ID(1B) + Group-ID(1B) + Length(1B) + params")
+                print("    Default: 81 00 00 (basic XID)")
+                xid_hex = get("XID info hex", "810000")
+            elif u_mn == "FRMR":
+                print("    FRMR info: rejected-ctrl(1-2B) + N(R)(3b)+V(S)(3b)+flags(2B)")
+                print("    Flags: W(invalid ctrl) X(info in S/U) Y(info too long) Z(invalid N(R))")
+                xid_hex = get("FRMR info hex (3 bytes)", "000000")
+            elif u_mn == "TEST":
+                print("    TEST info: echo payload (responder copies this back)")
+                xid_hex = get("TEST payload hex", "00112233")
+            else:  # UI
+                print("    UI frame carries data without sequence numbering (like UDP).")
+                xid_hex = get("UI payload hex (Enter=empty)", "")
+            try:    info_bytes = bytes.fromhex(xid_hex.replace(" ",""))
+            except: info_bytes = b''
+
+    # ── FCS ──────────────────────────────────────────────────────────────────
+    fcs_input = addr_bytes + ctrl_bytes + info_bytes
+    section("FCS  (Frame Check Sequence)")
+    print("    1 = CRC-16/CCITT  (2 bytes, standard HDLC, x^16+x^12+x^5+1)")
+    print("    2 = CRC-32        (4 bytes, extended HDLC)")
+    fcs_mode = get("FCS type (1=CRC-16  2=CRC-32)", "1",
+        help="Frame Check Sequence type — detects transmission errors.\n"
+             "1 = CRC-16/CCITT (2 bytes): standard HDLC, PPP, X.25, ISDN LAPD.\n"
+             "    Polynomial x^16+x^12+x^5+1 (0x1021), init=0xFFFF, stored LE.\n"
+             "    Covers: Address + Control + Information fields.\n"
+             "2 = CRC-32 (4 bytes): extended HDLC for high-reliability links.\n"
+             "    Same polynomial as Ethernet CRC-32 — stronger error detection.\n"
+             "    Used when payload > a few KB or when link quality is poor.")
+
+    if fcs_mode == '2':
+        crc_auto = crc32_eth(fcs_input)   # same polynomial
+        fcs_label = "CRC-32 (4B)"
+    else:
+        crc_val  = crc16_ccitt(fcs_input)
+        crc_auto = crc_val.to_bytes(2, 'little')  # HDLC FCS-16 is little-endian
+        fcs_label = "FCS-16/CCITT (2B)"
+
+    print(f"    Auto-computed {fcs_label} = 0x{crc_auto.hex()}")
+    custom = get("Use auto FCS? (y=auto  n=enter custom)", "y")
+    if custom.lower().startswith('n'):
+        fcs_hex = get("Enter FCS hex", crc_auto.hex())
+        try:
+            fcs_bytes = bytes.fromhex(fcs_hex.replace(" ",""))
+            if len(fcs_bytes) not in (2,4):
+                raise ValueError
+        except:
+            print("    -> invalid, using auto")
+            fcs_bytes = crc_auto
+    else:
+        fcs_bytes = crc_auto
+
+    # ── Bit-stuffing option ───────────────────────────────────────────────────
+    section("BIT STUFFING  (transparent operation)")
+    print("    HDLC uses bit-stuffing: after 5 consecutive 1-bits a 0 is inserted.")
+    print("    This prevents 0x7E appearing inside the frame content.")
+    do_stuff = get("Apply bit-stuffing to content? (y/n)", "n",
+        help="Bit-stuffing ensures 0x7E never appears inside the frame content.\n"
+             "How it works: after every 5 consecutive 1-bits, insert a 0-bit.\n"
+             "The receiver removes the stuffed 0 — transparent to upper layers.\n"
+             "y = apply (correct for synchronous HDLC on physical serial lines).\n"
+             "n = skip (correct for async links, or when framing is done by the OS driver).").lower().startswith("y")
+
+    # ── Assemble frame ────────────────────────────────────────────────────────
+    inner = addr_bytes + ctrl_bytes + info_bytes + fcs_bytes
+    if do_stuff:
+        inner = bit_stuff(byte_escape(inner))
+        stuff_note = "bit-stuffed + byte-escaped"
+    else:
+        stuff_note = "raw (no bit-stuffing)"
+
+    full_frame = flag_b + inner + flag_b
+
+    # ── Control field decode for display ──────────────────────────────────────
+    ctrl_hex = ctrl_bytes.hex()
+    if ftype == '1':
+        frame_type_label = "I-frame (Information)"
+    elif ftype == '2':
+        frame_type_label = f"S-frame (Supervisory) — {s_mn}"
+    else:
+        frame_type_label = f"U-frame (Unnumbered) — {u_mn}"
+
+    # ── Verify FCS ────────────────────────────────────────────────────────────
+    if fcs_mode == '2':
+        fcs_verify = crc32_eth(fcs_input)
+    else:
+        fcs_verify = crc16_ccitt(fcs_input).to_bytes(2, 'little')
+
+    # ── Build records ─────────────────────────────────────────────────────────
+    records = [
+        {"layer":1, "name":"HDLC Start Flag",
+         "raw": flag_b, "user_val": flag_b.hex(),
+         "note": "0x7E — frame delimiter (same role as Ethernet Preamble+SFD)"},
+
+        {"layer":2, "name":"HDLC Address",
+         "raw": addr_bytes, "user_val": addr_bytes.hex(),
+         "note": addr_note},
+
+        {"layer":2, "name":f"HDLC Control  ({frame_type_label})",
+         "raw": ctrl_bytes, "user_val": f"0x{ctrl_hex}",
+         "note": ctrl_note},
+    ]
+
+    # Control field sub-breakdown as individual records (display only — zero-length raw)
+    if ftype == '1':
+        if mod128:
+            records += [
+                {"layer":2,"name":"  └─ I-ctrl Byte0: N(S)+0",
+                 "raw":b"",
+                 "user_val":f"N(S)={ns}",
+                 "note":f"bits[7:1]=N(S)={ns}  bit[0]=0(I-frame)"},
+                {"layer":2,"name":"  └─ I-ctrl Byte1: N(R)+P/F",
+                 "raw":b"",
+                 "user_val":f"N(R)={nr} P/F={pf}",
+                 "note":f"bits[7:1]=N(R)={nr}  bit[0]=P/F={pf}"},
+            ]
+        else:
+            records.append({"layer":2,"name":"  └─ I-ctrl bits breakdown",
+                            "raw":b"",
+                            "user_val":f"N(S)={ns} P/F={pf} N(R)={nr}",
+                            "note":f"[7:5]N(S)={ns:03b}  [4]P/F={pf}  [3:1]N(R)={nr:03b}  [0]=0"})
+    elif ftype == '2':
+        records.append({"layer":2,"name":"  └─ S-ctrl bits breakdown",
+                        "raw":b"",
+                        "user_val":f"N(R)={nr} P/F={pf} {s_mn}",
+                        "note":f"[7:5]N(R)={nr:03b}  [4]P/F={pf}  [3:2]SS={s1}{s0}({s_mn})  [1:0]=01"})
+    else:
+        records.append({"layer":2,"name":"  └─ U-ctrl bits breakdown",
+                        "raw":b"",
+                        "user_val":f"{u_mn}  P/F={pf}",
+                        "note":f"[7:5]M={m4}{m3}{m2}  [4]P/F={pf}  [3:2]M={m1}{m0}  [1:0]=11"})
+
+    if info_bytes:
+        records.append({"layer":3,"name":"HDLC Information (payload)",
+                        "raw":info_bytes,
+                        "user_val":info_bytes.hex()[:30] if len(info_bytes)<=15 else f"{len(info_bytes)}B",
+                        "note":f"{len(info_bytes)} bytes"})
+
+    records += [
+        {"layer":0, "name":f"HDLC FCS  ({fcs_label})",
+         "raw": fcs_bytes, "user_val": fcs_bytes.hex(),
+         "note": f"Covers: Addr+Ctrl+Info={len(fcs_input)}B  {stuff_note}"},
+
+        {"layer":1, "name":"HDLC End Flag",
+         "raw": flag_b, "user_val": flag_b.hex(),
+         "note": "0x7E — frame end delimiter"},
+    ]
+
+    # ── Output ────────────────────────────────────────────────────────────────
+    banner(f"HDLC FRAME — {frame_type_label}")
+    print_frame_table(records)
+
+    fcs_ok = (fcs_bytes == fcs_verify)
+    verify_report([
+        (f"HDLC {fcs_label}", fcs_bytes.hex(), fcs_verify.hex(), fcs_ok),
+    ])
+    print_encapsulation(records, full_frame)
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  Serial / WAN
+# ──────────────────────────────────────────────────────────────────────────────
+def flow_serial():
+    banner("SERIAL / WAN FRAME BUILDER",
+           "L2: PPP | HDLC | SLIP | Modbus RTU | ATM AAL5 | Cisco HDLC | KISS | COBS")
+    ch, proto_name = ask_l2_serial()
+
+    # HDLC Full builder — redirect to dedicated 3-frame-type handler
+    if ch == '11':
+        flow_hdlc()
+        return
+
+    start_flag = b'\x7E'; end_flag = b'\x7E'
+    if ch in ('3','4','8','10'):
+        start_flag = get_hex("Start Flag (2 hex)", "7e", 1)
+        end_flag   = get_hex("End   Flag (2 hex)", "7e", 1)
+
+    addr_map = {'3':'ff','4':'ff','8':'ff','10':'0f','7':'01'}
+    address = b''
+    if ch in addr_map:
+        address = get_hex(f"Address/Slave (2 hex)", addr_map[ch], 1)
+
+    control = b''
+    if ch in ('3','4','8','10'):
+        control = get_hex("Control field (2 hex)", "03", 1)
+
+    # L3 inside serial
+    l3_payload = b''
+    l3_fields  = []
+    if ch in ('3','4','8','10'):
+        section("LAYER 3 — Payload inside Serial frame")
+        print("    Options:  1=None (empty)   2=Raw hex   3=IPv4+ICMP")
+        l3ch = input("    Choose [1]: ").strip() or '1'
+        if l3ch == '2':
+            phex = get("Payload hex", "")
+            try:    l3_payload = bytes.fromhex(phex.replace(" ",""))
+            except: l3_payload = b''
+        elif l3ch == '3':
+            (src_ip, dst_ip, ttl, ip_id, dscp, df, _) = ask_l3_ipv4()
+            icmp_type, icmp_code, icmp_id, icmp_seq, icmp_data, data_hex = ask_l4_icmp()
+            icmp_msg, icmp_flds, icmp_ck = build_icmp(icmp_type, icmp_code, icmp_id, icmp_seq, icmp_data, data_hex)
+            ip_hdr, ip_flds, ip_ck = build_ipv4(icmp_msg, src_ip, dst_ip, ttl, ip_id, dscp, df, 1)
+            l3_payload = ip_hdr + icmp_msg
+            l3_fields  = ip_flds + icmp_flds
+
+    header    = address + control
+    crc_input = header + l3_payload
+
+    # CRC selection
+    fcs = b''; fcs_desc = "none"
+    if ch in ('3','4','8','10'):
+        fcs, fcs_desc = ask_serial_crc(crc_input, "FCS-16 CCITT", 'big')
+    elif ch == '7':
+        fcs, fcs_desc = ask_serial_crc(crc_input, "Modbus CRC-16", 'little')
+    elif ch == '9':
+        crc_val = zlib.crc32(crc_input) & 0xFFFFFFFF
+        section("ATM AAL5 CRC-32")
+        cx = input("    1=Auto  2=Custom  [1]: ").strip() or '1'
+        if cx == '2':
+            fh = input("    Enter 8 hex digits: ").strip()
+            try:
+                cf = bytes.fromhex(fh)
+                if len(cf)==4: fcs=cf; fcs_desc="AAL5 CRC-32 custom"
+                else: raise ValueError
+            except:
+                fcs = crc_val.to_bytes(4,'big'); fcs_desc=f"AAL5 CRC-32 auto over {len(crc_input)}B"
+        else:
+            fcs = crc_val.to_bytes(4,'big'); fcs_desc=f"AAL5 CRC-32 auto over {len(crc_input)}B"
+
+    content = header + l3_payload + fcs
+
+    # Apply framing
+    if ch == '2':
+        full_frame = slip_enc(content)
+    elif ch in ('3','4','10'):
+        full_frame = start_flag + byte_escape(content) + end_flag
+    elif ch == '8':
+        full_frame = start_flag + bit_stuff(byte_escape(content)) + end_flag
+    elif ch == '9':
+        pad_len = (48 - (len(content)+8) % 48) % 48
+        full_frame = content + b'\x00'*pad_len + fcs
+    else:
+        full_frame = content
+
+    # Build records
+    records = []
+    if ch in ('3','4','8','10'):
+        records.append({"layer":1,"name":"Start Flag","raw":start_flag,"user_val":start_flag.hex(),"note":""})
+    if address:
+        records.append({"layer":2,"name":"Address","raw":address,"user_val":address.hex(),"note":""})
+    if control:
+        records.append({"layer":2,"name":"Control","raw":control,"user_val":control.hex(),"note":""})
+    records += l3_fields
+    if fcs:
+        records.append({"layer":0,"name":f"CRC/FCS","raw":fcs,"user_val":"auto/custom","note":fcs_desc})
+    if ch in ('3','4','8','10'):
+        records.append({"layer":1,"name":"End Flag","raw":end_flag,"user_val":end_flag.hex(),"note":""})
+
+    banner(f"SERIAL FRAME — {proto_name}")
+    print_frame_table(records)
+    print_encapsulation(records, full_frame)
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  WiFi
+# ──────────────────────────────────────────────────────────────────────────────
+def flow_wifi():
+    banner("WiFi FRAME  —  IEEE 802.11  (PHY Preamble + MAC MPDU)",
+           "PHY: STF+LTF+SIG(≈SFD)  |  MAC: FC+Dur+Addr1-4+SeqCtrl+QoS+HTC+Body+FCS")
+    print_wifi_education()
+    d = ask_wifi_frame()
+    full_frame, records, mpdu, fcs, fcs_computed = build_wifi(d)
+
+    # ── Now ask PHY preamble AFTER we know MPDU length ─────────────────────────
+    mpdu_len = len(mpdu) + 4  # include FCS in MPDU length for PLCP
+    phy_records = ask_wifi_phy(d['phy_ch'], mpdu_len)
+
+    # Prepend PHY records to the record list
+    all_records = phy_records + records
+
+    print_frame_table(all_records)
+    fcs_ok = (fcs == fcs_computed)
+    verify_report([
+        ("802.11 FCS (CRC-32 MPDU)", fcs.hex(), fcs_computed.hex(), fcs_ok),
+    ])
+
+    # For encapsulation, build phy_bytes to prepend
+    phy_bytes = b''.join(r['raw'] for r in phy_records)
+    full_with_phy = phy_bytes + full_frame
+    print_encapsulation(all_records, full_with_phy)
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  Standalone IPv4
+# ──────────────────────────────────────────────────────────────────────────────
 def flow_ip_standalone():
     banner("STANDALONE IPv4 PACKET BUILDER",
            "RFC 791  |  Full header fields  |  Options  |  Auto or manual checksum  |  L4 payload")
@@ -5163,25 +4422,27 @@ def flow_ip_standalone():
     verify_report(verify_checks)
     print_encapsulation(records, full_packet)
 
-
-# ── Update menus ──────────────────────────────────────────────────────────────
-
-L3_DISPATCH = {
-    '1' : flow_eth_arp,
-    '2' : flow_eth_ip_icmp,
-    '3' : flow_eth_ip_tcp,
-    '4' : flow_eth_ip_udp,
-    '5' : flow_eth_stp,
-    '6' : flow_eth_dtp,
-    '7' : flow_eth_pagp,
-    '8' : flow_eth_lacp,
-    '9' : flow_eth_pause,
-    '10': flow_eth_pfc,
-    '11': flow_eth_lldp,
-    '12': flow_eth_vlan,
-    '13': flow_eth_jumbo,
-}
-
+# ══════════════════════════════════════════════════════════════════════════════
+#  SECTION 10 — MENUS, DISPATCH TABLE, MAIN
+# ══════════════════════════════════════════════════════════════════════════════
+L3_ETH_MENU = """
+  ┌──────────────────────────────────────────────────────────────────────────┐
+  │              LAYER 3  —  Choose protocol to carry in Ethernet            │
+  ├────┬─────────────────────────────────────────────────────────────────────┤
+  │  1 │ ARP                        (EtherType 0x0806)                       │
+  │  2 │ IPv4 + ICMP                (EtherType 0x0800)                       │
+  │  3 │ IPv4 + TCP  3-way handshk  (EtherType 0x0800, proto=6)              │
+  │  4 │ IPv4 + UDP                 (EtherType 0x0800, proto=17)             │
+  │  5 │ STP / RSTP BPDU            (802.3 + LLC wrapper)                    │
+  │  6 │ DTP  – Cisco Trunking      (802.3 + SNAP)                           │
+  │  7 │ PAgP – Cisco Port Agg.     (802.3 + SNAP)                           │
+  │  8 │ LACP – 802.3ad             (EtherType 0x8809)                       │
+  │  9 │ Pause Frame  – IEEE 802.3x (EtherType 0x8808, opcode 0x0001)        │
+  │ 10 │ PFC  – IEEE 802.1Qbb       (EtherType 0x8808, opcode 0x0101, per-P) │
+  │ 11 │ LLDP – IEEE 802.1AB        (EtherType 0x88CC, TLV discovery)        │
+  │ 12 │ VLAN Tagged – IEEE 802.1Q  (TPID 0x8100, PCP+DEI+VID + Q-in-Q opt) │
+  │ 13 │ Jumbo Frame  – vendor ext  (MTU > 1500B, up to 9000B+)              │
+  └────┴─────────────────────────────────────────────────────────────────────┘"""
 MAIN_MENU = """
 ╔════════════════════════════════════════════════════════════════════════════════╗
 ║           NETWORK FRAME BUILDER  —  LAYERED INPUT FLOW                        ║
@@ -5202,7 +4463,21 @@ MAIN_MENU = """
 ║   ║  Full header | DSCP/ECN | DF/MF/FragOffset | Options(NOP/RR/TS)           ║
 ║   ║  Checksum: auto / custom / force-zero  |  L4: ICMP/TCP/UDP/Raw/Empty      ║
 ╚═══╩════════════════════════════════════════════════════════════════════════════╝"""
-
+L3_DISPATCH = {
+    '1' : flow_eth_arp,
+    '2' : flow_eth_ip_icmp,
+    '3' : flow_eth_ip_tcp,
+    '4' : flow_eth_ip_udp,
+    '5' : flow_eth_stp,
+    '6' : flow_eth_dtp,
+    '7' : flow_eth_pagp,
+    '8' : flow_eth_lacp,
+    '9' : flow_eth_pause,
+    '10': flow_eth_pfc,
+    '11': flow_eth_lldp,
+    '12': flow_eth_vlan,
+    '13': flow_eth_jumbo,
+}
 def main():
     print(MAIN_MENU)
     top = input("  Choose technology  (1=Ethernet  2=Serial  3=WiFi  4=IP): ").strip()
