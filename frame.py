@@ -2237,39 +2237,55 @@ def build_arp(inputs):
     ]
     return raw, fields
 def ask_l3_ipv4():
-    section("LAYER 3 — IPv4")
-    src_ip  = get("Source IP", "192.168.1.10",
-        help="IPv4 address of the SENDER of this packet.\n"
-             "Must be your interface's IP address (or spoofed for testing).\n"
-             "Used by receiver to send replies back to you.\n"
+    section("LAYER 3 — IPv4  (Source + Destination)")
+    print(f"    {C.NOTE}You can enter an IPv4 address OR a domain name for each IP.{C.RESET}")
+    print(f"    {C.DIM}Domain names are resolved via your system DNS (requires internet).{C.RESET}")
+
+    src_raw = get("Source IP or domain", "192.168.1.10",
+        help="IPv4 address OR domain name of the SENDER.\n"
+             "Examples: 192.168.1.10  or  myserver.local  or  eth0.example.com\n"
              "Private ranges: 10.x.x.x / 172.16-31.x.x / 192.168.x.x")
-    dst_ip  = get("Destination IP", "192.168.1.20",
-        help="IPv4 address of the intended RECEIVER.\n"
-             "For unicast: target host's IP.   255.255.255.255 = limited broadcast.\n"
-             "Network broadcast: e.g. 192.168.1.255 (host bits all 1).\n"
-             "224.0.0.0–239.255.255.255 = multicast range.")
-    ttl     = get("TTL", "64",
+    try:
+        src_ip, src_dom = _resolve_host(src_raw.strip())
+        if src_dom:
+            print(f"    {C.PASS_}✓ Resolved:{C.RESET}  {C.NOTE}{src_dom}{C.RESET}  →  {C.HEX}{src_ip}{C.RESET}")
+    except Exception as e:
+        print(f"    {C.WARN}Could not resolve '{src_raw}': {e} — using as-is{C.RESET}")
+        src_ip, src_dom = src_raw.strip(), ""
+
+    dst_raw = get("Destination IP or domain", "192.168.1.20",
+        help="IPv4 address OR domain name of the RECEIVER.\n"
+             "Examples: 8.8.8.8  or  google.com  or  example.org\n"
+             "Domain resolved to IPv4 — IPv6-only domains may fail.")
+    try:
+        dst_ip, dst_dom = _resolve_host(dst_raw.strip())
+        if dst_dom:
+            print(f"    {C.PASS_}✓ Resolved:{C.RESET}  {C.NOTE}{dst_dom}{C.RESET}  →  {C.HEX}{dst_ip}{C.RESET}")
+    except Exception as e:
+        print(f"    {C.WARN}Could not resolve '{dst_raw}': {e} — using as-is{C.RESET}")
+        dst_ip, dst_dom = dst_raw.strip(), ""
+
+    ttl   = get("TTL", "64",
         help="Time To Live — decremented by 1 at each router hop.\n"
              "Packet discarded when TTL reaches 0 (prevents routing loops).\n"
              "64 = Linux/Mac default.   128 = Windows default.   255 = maximum.\n"
              "Low TTL (e.g. 1) = traceroute trick to get ICMP Time Exceeded back.")
-    ip_id   = get("Identification (decimal)", "4660",
+    ip_id = get("Identification (decimal)", "4660",
         help="16-bit identifier for this packet (0–65535).\n"
              "All fragments of the same original packet share the same ID.\n"
-             "Used with Fragment Offset to reassemble fragmented packets.\n"
              "For non-fragmented packets, value is arbitrary (OS usually increments it).")
-    dscp    = get("DSCP/ECN (decimal, usu. 0)", "0",
+    dscp  = get("DSCP/ECN (decimal, usu. 0)", "0",
         help="Differentiated Services Code Point + ECN (6+2 bits = 1 byte).\n"
-             "DSCP controls QoS queuing priority in routers:\n"
-             "0=Best Effort  8=CS1(low)  40=CS5  46=EF(voice/VoIP)  48=CS6(routing)\n"
-             "ECN bits (low 2): 0=non-ECN  1/2=ECN-capable  3=Congestion Experienced")
-    df      = get("DF flag? (y/n)", "y",
+             "0=Best Effort  8=CS1(low)  46=EF(voice/VoIP)  48=CS6(routing protocols)")
+    df    = get("DF flag? (y/n)", "y",
         help="Don't Fragment bit in the IP Flags field.\n"
              "y = DF=1: routers MUST NOT fragment this packet.\n"
-             "    If packet is too large, router drops it and sends ICMP type 3 code 4.\n"
              "    Required for Path MTU Discovery (PMTUD) to work correctly.\n"
              "n = DF=0: routers may fragment if needed (legacy behaviour).")
-    return src_ip, dst_ip, int(ttl), int(ip_id), int(dscp), df.lower().startswith('y'), 0
+
+    return src_ip, dst_ip, int(ttl), int(ip_id), int(dscp), df.lower().startswith('y'), 0, src_dom, dst_dom
+
+
 def build_ipv4(l4_payload, src_ip, dst_ip, ttl, ip_id, dscp, df, proto_num):
     flags_frag = 0x4000 if df else 0x0000
     ver_ihl    = (4 << 4) | 5
@@ -3526,11 +3542,13 @@ def flow_eth_ip_icmp():
     (dst_mb, src_mb, type_len_b, llc_b, snap_b,
      variant, dst_s, src_s, v) = ask_l2_ethernet("0800")
     (src_ip, dst_ip, ttl, ip_id, dscp,
-     df, _) = ask_l3_ipv4()
+     df, _, src_dom, dst_dom) = ask_l3_ipv4()
     # L4
     icmp_type, icmp_code, icmp_id, icmp_seq, icmp_data, data_hex = ask_l4_icmp()
     icmp_msg, icmp_fields, icmp_ck = build_icmp(icmp_type, icmp_code, icmp_id, icmp_seq, icmp_data, data_hex)
     ip_hdr, ip_fields, ip_ck = build_ipv4(icmp_msg, src_ip, dst_ip, ttl, ip_id, dscp, df, 1)
+    if src_dom: ip_fields[8]['note'] = f"{src_ip}  ({src_dom})"
+    if dst_dom: ip_fields[9]['note'] = f"{dst_ip}  ({dst_dom})"
     l3_payload = ip_hdr + icmp_msg
     all_upper  = ip_fields + icmp_fields
 
@@ -3555,7 +3573,7 @@ def flow_eth_ip_tcp():
     preamble, sfd = ask_layer1_eth()
     (dst_mb, src_mb, type_len_b, llc_b, snap_b,
      variant, dst_s, src_s, v) = ask_l2_ethernet("0800")
-    (src_ip, dst_ip, ttl, ip_id, dscp, df, _) = ask_l3_ipv4()
+    (src_ip, dst_ip, ttl, ip_id, dscp, df, _, src_dom, dst_dom) = ask_l3_ipv4()
     # Force protocol=6 (TCP) regardless of user proto input
     (step, step_name, src_port, dst_port, seq_num, ack_num,
      data_off, flags_val, window, urg_ptr, tcp_data,
@@ -3567,6 +3585,8 @@ def flow_eth_ip_tcp():
 
     ip_hdr, ip_fields, ip_ck = build_ipv4(
         tcp_seg, src_ip, dst_ip, ttl, ip_id, dscp, df, 6)
+    if src_dom: ip_fields[8]['note'] = f"{src_ip}  ({src_dom})"
+    if dst_dom: ip_fields[9]['note'] = f"{dst_ip}  ({dst_dom})"
 
     l3_payload = ip_hdr + tcp_seg
     all_upper  = ip_fields + tcp_fields
@@ -3592,7 +3612,7 @@ def flow_eth_ip_udp():
     preamble, sfd = ask_layer1_eth()
     (dst_mb, src_mb, type_len_b, llc_b, snap_b,
      variant, dst_s, src_s, v) = ask_l2_ethernet("0800")
-    (src_ip, dst_ip, ttl, ip_id, dscp, df, _) = ask_l3_ipv4()
+    (src_ip, dst_ip, ttl, ip_id, dscp, df, _, src_dom, dst_dom) = ask_l3_ipv4()
 
     (src_port, dst_port, udp_data,
      sip, dip) = ask_l4_udp(src_ip, dst_ip)
@@ -3602,6 +3622,8 @@ def flow_eth_ip_udp():
 
     ip_hdr, ip_fields, ip_ck = build_ipv4(
         udp_dgram, src_ip, dst_ip, ttl, ip_id, dscp, df, 17)
+    if src_dom: ip_fields[8]['note'] = f"{src_ip}  ({src_dom})"
+    if dst_dom: ip_fields[9]['note'] = f"{dst_ip}  ({dst_dom})"
 
     l3_payload = ip_hdr + udp_dgram
     all_upper  = ip_fields + udp_fields
@@ -4098,6 +4120,52 @@ def flow_hdlc():
 # ──────────────────────────────────────────────────────────────────────────────
 #  Serial / WAN
 # ──────────────────────────────────────────────────────────────────────────────
+def _resolve_host(host):
+    """
+    Resolve hostname → IPv4 string.
+    Returns (ip_str, resolved_domain) or raises socket.gaierror.
+    If host is already an IP, returns it unchanged.
+    """
+    try:
+        socket.inet_aton(host)          # already a valid IPv4 literal
+        return host, ""
+    except OSError:
+        pass
+    info = socket.getaddrinfo(host, None, socket.AF_INET)
+    return info[0][4][0], host
+
+def ask_ip_or_domain(prompt, default_ip, help_extra=""):
+    """
+    Ask for an IP address OR a domain name.
+    If domain is given, resolve it and show the resolved IP.
+    Returns (ip_str, domain_or_empty).
+    """
+    section(f"IP / DOMAIN  —  {prompt}")
+    print(f"    {C.DIM}You can enter either:{C.RESET}")
+    print(f"    {C.NOTE}  • An IPv4 address  e.g. 192.168.1.1{C.RESET}")
+    print(f"    {C.NOTE}  • A domain name    e.g. google.com  (auto-resolved via DNS){C.RESET}")
+    if help_extra:
+        print(f"    {C.HELP}  {help_extra}{C.RESET}")
+
+    raw = get(prompt, default_ip,
+        help="Enter IPv4 address (e.g. 10.0.0.1) or domain name (e.g. example.com).\n"
+             "Domain names are resolved using your system's DNS — requires internet.\n"
+             "The resolved IP is shown before you continue.")
+
+    # Try to resolve
+    try:
+        ip_str, domain = _resolve_host(raw.strip())
+        if domain:
+            print(f"    {C.PASS_}✓ Resolved:{C.RESET}  {C.NOTE}{domain}{C.RESET}  →  {C.HEX}{ip_str}{C.RESET}")
+        else:
+            print(f"    {C.DIM}→ IP literal: {ip_str}{C.RESET}")
+        return ip_str, domain
+    except Exception as e:
+        print(f"    {C.FAIL_}✗ Could not resolve '{raw}': {e}{C.RESET}")
+        print(f"    {C.WARN}  Falling back to default: {default_ip}{C.RESET}")
+        return default_ip, ""
+
+
 def flow_serial():
     banner("SERIAL / WAN FRAME BUILDER",
            "L2: PPP | HDLC | SLIP | Modbus RTU | ATM AAL5 | Cisco HDLC | KISS | COBS")
@@ -4122,24 +4190,104 @@ def flow_serial():
     if ch in ('3','4','8','10'):
         control = get_hex("Control field (2 hex)", "03", 1)
 
-    # L3 inside serial
+    # ── L3/L4 payload inside serial frame ─────────────────────────────────────
     l3_payload = b''
     l3_fields  = []
+
     if ch in ('3','4','8','10'):
-        section("LAYER 3 — Payload inside Serial frame")
-        print("    Options:  1=None (empty)   2=Raw hex   3=IPv4+ICMP")
-        l3ch = input("    Choose [1]: ").strip() or '1'
+        section("LAYER 3/4 — Payload inside Serial frame")
+        print(f"    {C.NOTE}Payload options:{C.RESET}")
+        print(f"      1 = None  (empty payload)")
+        print(f"      2 = Raw hex  (enter bytes directly)")
+        print(f"      3 = IPv4 + ICMP  (ping / error messages)")
+        print(f"      4 = IPv4 + TCP   (3-way handshake — SYN/SYN-ACK/ACK/data/FIN/RST)")
+        print(f"      5 = IPv4 + UDP   (DNS / NTP / SNMP / custom)")
+        l3ch = input(f"    {C.PROMPT}Choose [1]: {C.RESET}").strip() or '1'
+
         if l3ch == '2':
-            phex = get("Payload hex", "")
+            phex = get("Payload hex", "",
+                help="Enter any bytes in hex — for proprietary or custom protocols.\n"
+                     "Example: a PPP LCP packet, an IP fragment, or test pattern.")
             try:    l3_payload = bytes.fromhex(phex.replace(" ",""))
             except: l3_payload = b''
+
         elif l3ch == '3':
-            (src_ip, dst_ip, ttl, ip_id, dscp, df, _) = ask_l3_ipv4()
+            # IPv4 + ICMP
+            section("LAYER 3 — IPv4 Source + Destination  (ICMP)")
+            src_ip, src_dom = ask_ip_or_domain("Source IP / domain", "192.168.1.10",
+                "Source = the WAN endpoint on this side of the serial link.")
+            dst_ip, dst_dom = ask_ip_or_domain("Destination IP / domain", "192.168.1.20",
+                "Destination = the remote WAN endpoint.")
+            ttl  = int(get("TTL", "64",
+                help="IP Time To Live — decremented by each router hop.\n"
+                     "64=Linux/Mac  128=Windows  Use 1 for traceroute-style probes."))
+            ip_id = int(get("IP Identification", "1",
+                help="16-bit fragment group ID. Any value for non-fragmented packets."))
+            dscp = int(get("DSCP (0=BE  46=VoIP  48=routing)", "0",
+                help="QoS class. 0=Best Effort for normal ICMP ping traffic."))
+            df = get("DF flag? (y/n)", "y",
+                help="Don't Fragment. y = router drops and sends ICMP Frag-Needed if oversized.").lower().startswith('y')
             icmp_type, icmp_code, icmp_id, icmp_seq, icmp_data, data_hex = ask_l4_icmp()
-            icmp_msg, icmp_flds, icmp_ck = build_icmp(icmp_type, icmp_code, icmp_id, icmp_seq, icmp_data, data_hex)
+            icmp_msg, icmp_flds, icmp_ck = build_icmp(
+                icmp_type, icmp_code, icmp_id, icmp_seq, icmp_data, data_hex)
             ip_hdr, ip_flds, ip_ck = build_ipv4(icmp_msg, src_ip, dst_ip, ttl, ip_id, dscp, df, 1)
+            if src_dom: ip_flds[8]['note'] = f"{src_ip}  ({src_dom})"
+            if dst_dom: ip_flds[9]['note'] = f"{dst_ip}  ({dst_dom})"
             l3_payload = ip_hdr + icmp_msg
             l3_fields  = ip_flds + icmp_flds
+
+        elif l3ch == '4':
+            # IPv4 + TCP
+            section("LAYER 3 — IPv4 Source + Destination  (TCP)")
+            src_ip, src_dom = ask_ip_or_domain("Source IP / domain", "192.168.1.10",
+                "Local WAN endpoint IP (your side of the serial link).")
+            dst_ip, dst_dom = ask_ip_or_domain("Destination IP / domain", "93.184.216.34",
+                "Remote endpoint IP or domain (e.g. example.com → 93.184.216.34).")
+            ttl  = int(get("TTL", "64",
+                help="IP Time To Live — decremented by each router hop.\n64=Linux  128=Windows"))
+            ip_id = int(get("IP Identification", "1",
+                help="Fragment group ID. Any value for non-fragmented TCP packets."))
+            dscp = int(get("DSCP (0=BE  46=VoIP  48=routing)", "0",
+                help="QoS class. 0=Best Effort for normal TCP."))
+            df   = get("DF flag? (y/n)", "y",
+                help="Don't Fragment. y = required for TCP PMTUD to work correctly.").lower().startswith('y')
+            print_tcp_handshake_diagram()
+            (step, step_name, src_port, dst_port, seq_num, ack_num,
+             data_off, flags_val, window, urg_ptr, tcp_data, sip, dip) = ask_l4_tcp(src_ip, dst_ip)
+            tcp_seg, tcp_flds, tcp_ck = build_tcp(
+                step, step_name, src_port, dst_port, seq_num, ack_num,
+                data_off, flags_val, window, urg_ptr, tcp_data, src_ip, dst_ip)
+            ip_hdr, ip_flds, ip_ck = build_ipv4(tcp_seg, src_ip, dst_ip, ttl, ip_id, dscp, df, 6)
+            if src_dom: ip_flds[8]['note'] = f"{src_ip}  ({src_dom})"
+            if dst_dom: ip_flds[9]['note'] = f"{dst_ip}  ({dst_dom})"
+            l3_payload = ip_hdr + tcp_seg
+            l3_fields  = ip_flds + tcp_flds
+            # Show checksum status inline
+            print(f"\n    {C.DIM}TCP checksum  : 0x{tcp_ck:04X}{C.RESET}")
+            print(f"    {C.DIM}IP hdr cksum  : 0x{ip_ck:04X}{C.RESET}")
+
+        elif l3ch == '5':
+            # IPv4 + UDP
+            section("LAYER 3 — IPv4 Source + Destination  (UDP)")
+            src_ip, src_dom = ask_ip_or_domain("Source IP / domain", "192.168.1.10",
+                "Local WAN endpoint IP.")
+            dst_ip, dst_dom = ask_ip_or_domain("Destination IP / domain", "8.8.8.8",
+                "Remote IP or domain (e.g. 8.8.8.8 or dns.google).")
+            ttl  = int(get("TTL", "64",
+                help="IP Time To Live. 64=Linux/Mac default."))
+            ip_id = int(get("IP Identification", "1",
+                help="Fragment group ID. Any value for non-fragmented packets."))
+            dscp = int(get("DSCP (0=BE  46=VoIP)", "0",
+                help="QoS marking. 0=Best Effort for normal UDP."))
+            df   = get("DF flag? (y/n)", "n",
+                help="Don't Fragment. n = allow fragmentation (normal for UDP).").lower().startswith('y')
+            (src_port, dst_port, udp_data, sip, dip) = ask_l4_udp(src_ip, dst_ip)
+            udp_dgram, udp_flds, udp_ck = build_udp(src_port, dst_port, udp_data, src_ip, dst_ip)
+            ip_hdr, ip_flds, ip_ck = build_ipv4(udp_dgram, src_ip, dst_ip, ttl, ip_id, dscp, df, 17)
+            if src_dom: ip_flds[8]['note'] = f"{src_ip}  ({src_dom})"
+            if dst_dom: ip_flds[9]['note'] = f"{dst_ip}  ({dst_dom})"
+            l3_payload = ip_hdr + udp_dgram
+            l3_fields  = ip_flds + udp_flds
 
     header    = address + control
     crc_input = header + l3_payload
@@ -4153,9 +4301,9 @@ def flow_serial():
     elif ch == '9':
         crc_val = zlib.crc32(crc_input) & 0xFFFFFFFF
         section("ATM AAL5 CRC-32")
-        cx = input("    1=Auto  2=Custom  [1]: ").strip() or '1'
+        cx = input(f"    {C.PROMPT}1=Auto  2=Custom  [1]: {C.RESET}").strip() or '1'
         if cx == '2':
-            fh = input("    Enter 8 hex digits: ").strip()
+            fh = input(f"    {C.PROMPT}Enter 8 hex digits: {C.RESET}").strip()
             try:
                 cf = bytes.fromhex(fh)
                 if len(cf)==4: fcs=cf; fcs_desc="AAL5 CRC-32 custom"
@@ -4183,20 +4331,27 @@ def flow_serial():
     # Build records
     records = []
     if ch in ('3','4','8','10'):
-        records.append({"layer":1,"name":"Start Flag","raw":start_flag,"user_val":start_flag.hex(),"note":""})
+        records.append({"layer":1,"name":"Start Flag","raw":start_flag,
+                        "user_val":start_flag.hex(),"note":"0x7E frame delimiter"})
     if address:
-        records.append({"layer":2,"name":"Address","raw":address,"user_val":address.hex(),"note":""})
+        records.append({"layer":2,"name":"Address","raw":address,
+                        "user_val":address.hex(),"note":""})
     if control:
-        records.append({"layer":2,"name":"Control","raw":control,"user_val":control.hex(),"note":""})
+        records.append({"layer":2,"name":"Control","raw":control,
+                        "user_val":control.hex(),"note":""})
     records += l3_fields
     if fcs:
-        records.append({"layer":0,"name":f"CRC/FCS","raw":fcs,"user_val":"auto/custom","note":fcs_desc})
+        records.append({"layer":0,"name":"CRC/FCS","raw":fcs,
+                        "user_val":"auto/custom","note":fcs_desc})
     if ch in ('3','4','8','10'):
-        records.append({"layer":1,"name":"End Flag","raw":end_flag,"user_val":end_flag.hex(),"note":""})
+        records.append({"layer":1,"name":"End Flag","raw":end_flag,
+                        "user_val":end_flag.hex(),"note":"0x7E frame delimiter"})
 
     banner(f"SERIAL FRAME — {proto_name}")
     print_frame_table(records)
     print_encapsulation(records, full_frame)
+
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  WiFi
@@ -4252,18 +4407,33 @@ def flow_ip_standalone():
 
     # ── IPv4 header fields ────────────────────────────────────────────────────
     section("IPv4 HEADER FIELDS")
+    print(f"    {C.NOTE}You can enter an IPv4 address OR a domain name for each IP.{C.RESET}")
 
-    src_ip = get("Source IP", "192.168.1.10",
-        help="IPv4 address of the SENDER (your interface or spoofed for testing).\n"
-             "Used by receiver to send replies back.\n"
+    src_raw = get("Source IP or domain", "192.168.1.10",
+        help="IPv4 address OR domain name of the SENDER.\n"
+             "Examples: 192.168.1.10  or  myserver.local  or  sender.example.com\n"
              "Private: 10.x.x.x / 172.16–31.x.x / 192.168.x.x\n"
              "Loopback: 127.0.0.1   Link-local: 169.254.x.x")
+    try:
+        src_ip, src_dom = _resolve_host(src_raw.strip())
+        if src_dom:
+            print(f"    {C.PASS_}✓ Resolved:{C.RESET}  {C.NOTE}{src_dom}{C.RESET}  →  {C.HEX}{src_ip}{C.RESET}")
+    except Exception as e:
+        print(f"    {C.WARN}Could not resolve '{src_raw}': {e} — using as-is{C.RESET}")
+        src_ip, src_dom = src_raw.strip(), ""
 
-    dst_ip = get("Destination IP", "192.168.1.20",
-        help="IPv4 address of the intended receiver.\n"
+    dst_raw = get("Destination IP or domain", "192.168.1.20",
+        help="IPv4 address OR domain name of the RECEIVER.\n"
+             "Examples: 8.8.8.8  or  google.com  or  example.org\n"
              "Unicast: specific host.   255.255.255.255 = limited broadcast.\n"
-             "Network broadcast: e.g. 192.168.1.255.\n"
              "Multicast: 224.0.0.0–239.255.255.255 (OSPF=224.0.0.5, PIM=224.0.0.13).")
+    try:
+        dst_ip, dst_dom = _resolve_host(dst_raw.strip())
+        if dst_dom:
+            print(f"    {C.PASS_}✓ Resolved:{C.RESET}  {C.NOTE}{dst_dom}{C.RESET}  →  {C.HEX}{dst_ip}{C.RESET}")
+    except Exception as e:
+        print(f"    {C.WARN}Could not resolve '{dst_raw}': {e} — using as-is{C.RESET}")
+        dst_ip, dst_dom = dst_raw.strip(), ""
 
     ttl = int(get("TTL  (Time To Live)", "64",
         help="Hop limit — decremented by 1 at each router. Packet dropped at 0.\n"
@@ -4481,10 +4651,14 @@ def flow_ip_standalone():
          "note":ck_note},
 
         {"layer":3,"name":"IP Source Address",
-         "raw":hdr[12:16],"user_val":src_ip,"note":""},
+         "raw":hdr[12:16],
+         "user_val":f"{src_ip}  ({src_dom})" if src_dom else src_ip,
+         "note":f"resolved from {src_dom}" if src_dom else ""},
 
         {"layer":3,"name":"IP Destination Addr",
-         "raw":hdr[16:20],"user_val":dst_ip,"note":""},
+         "raw":hdr[16:20],
+         "user_val":f"{dst_ip}  ({dst_dom})" if dst_dom else dst_ip,
+         "note":f"resolved from {dst_dom}" if dst_dom else ""},
     ]
 
     # Add option records if present
