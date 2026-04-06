@@ -21,18 +21,18 @@ PacketCraft is a reference + utility project that helps you:
 ✨ Clean developer-friendly tables
 
 🧱 Layer Mapping Overview
-+-------------------+
-| Application Layer |
-+-------------------+
-| Transport (L4)    |
-+-------------------+
-| Network (L3)      |
-+-------------------+
-| Data Link (L2)    |
-+-------------------+
-| Physical (L1)     |
-+-------------------+
-
+                                        +-------------------+
+                                        | Application Layer |
+                                        +-------------------+
+                                        | Transport (L4)    |
+                                        +-------------------+
+                                        | Network (L3)      |
+                                        +-------------------+
+                                        | Data Link (L2)    |
+                                        +-------------------+
+                                        | Physical (L1)     |
+                                        +-------------------+
+        
 🛠️ Example: Generate Payload Hex
 Input:
 Protocol: IPv4 + TCP + HTTP
