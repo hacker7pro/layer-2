@@ -37,8 +37,7 @@ PacketCraft is a reference + utility project that helps you:
 Input:
 Protocol: IPv4 + TCP + HTTP
 
-Output:
-0x0800 4500003C...0600...474554202F
+
 📦 Use Cases
 🧪 Network packet crafting
 🔐 Security research
