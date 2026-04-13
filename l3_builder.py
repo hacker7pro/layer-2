@@ -1549,6 +1549,295 @@ ADDITIONAL_L3_REGISTRY: dict[str, dict] = {
 
 NON_IP_L3_REGISTRY.update(ADDITIONAL_L3_REGISTRY)
 
+# ── Industrial / ITS / Building-Automation L3 registry ────────────────────────
+INDUSTRIAL_L3_REGISTRY: dict[str, dict] = {
+
+    "wol": dict(
+        name="Wake-on-LAN Magic Packet",
+        header_bytes=6,
+        type_field="Sync Stream (6B 0xFF) — fixed pattern identifies WoL",
+        type_map={
+            0: dict(name="Magic Packet (no password)", l4="wol_magic",
+                    usage="6×0xFF + target_MAC×16 (102B total)"),
+            1: dict(name="Magic Packet + 4B SecureOn password", l4="wol_secure4",
+                    usage="6×0xFF + MAC×16 + 4B password (106B)"),
+            2: dict(name="Magic Packet + 6B SecureOn password", l4="wol_secure6",
+                    usage="6×0xFF + MAC×16 + 6B password (108B)"),
+        },
+        fields={
+            "Sync Stream":   "6B  0xFF 0xFF 0xFF 0xFF 0xFF 0xFF — marks this as WoL magic packet",
+            "Target MAC×16": "96B  destination MAC address repeated exactly 16 times (48 bits × 16 = 96B)",
+            "SecureOn Pwd":  "optional 4B or 6B — SecureOn password appended after MAC×16",
+        },
+        l4_key="wol_type",
+    ),
+
+    "dot1q": dict(
+        name="IEEE 802.1Q VLAN Tag — inner EtherType dispatch",
+        header_bytes=4,
+        type_field="Inner EtherType (2B) at offset 2",
+        type_map={
+            0x0800: dict(name="IPv4 payload",    l4="ipv4_inner",   usage="Tagged IPv4 frame"),
+            0x86DD: dict(name="IPv6 payload",    l4="ipv6_inner",   usage="Tagged IPv6 frame"),
+            0x0806: dict(name="ARP payload",     l4="arp_inner",    usage="Tagged ARP"),
+            0x8847: dict(name="MPLS payload",    l4="mpls_inner",   usage="Tagged MPLS unicast"),
+            0x88A8: dict(name="Q-in-Q S-Tag",    l4="qinq_inner",   usage="Double-tagged outer S-Tag"),
+            0x8100: dict(name="Double-tagged",   l4="double_tag",   usage="Inner C-Tag (VLAN stacking)"),
+        },
+        fields={
+            "TPID":           "2B  0x8100 Tag Protocol ID (identifies 802.1Q tag)",
+            "PCP":            "3b  Priority Code Point 0-7 (802.1p CoS class)",
+            "DEI":            "1b  Drop Eligible Indicator",
+            "VID":            "12b VLAN Identifier (0=priority-only 1-4094=valid 4095=reserved)",
+            "Inner EtherType":"2B  actual payload protocol",
+        },
+        l4_key="inner_ethertype",
+    ),
+
+    "bacnet": dict(
+        name="BACnet Network Layer — ASHRAE 135 Annex H",
+        header_bytes=2,
+        type_field="PDU Type nibble (upper 4 bits of APDU type byte)",
+        type_map={
+            0: dict(name="Confirmed-Request",   l4="bacnet_confirmed",  usage="ReadProperty/WriteProperty/SubscribeCOV"),
+            1: dict(name="Unconfirmed-Request",  l4="bacnet_unconfirmed",usage="WhoIs/IAm/WhoHas/IHave/COVNotification"),
+            2: dict(name="Simple-ACK",           l4="bacnet_simple_ack", usage="Acknowledgement without data"),
+            3: dict(name="Complex-ACK",          l4="bacnet_complex_ack",usage="ReadProperty response with data"),
+            4: dict(name="Segment-ACK",          l4="bacnet_segment",    usage="Segmented transfer acknowledgement"),
+            5: dict(name="Error",                l4="bacnet_error",      usage="Error response"),
+            6: dict(name="Reject",               l4="bacnet_reject",     usage="Request rejected"),
+            7: dict(name="Abort",                l4="bacnet_abort",      usage="Transaction aborted"),
+        },
+        fields={
+            "DSAP":       "1B  0x82 BACnet LSAP",
+            "SSAP":       "1B  0x82 BACnet LSAP",
+            "Control":    "1B  0x03 LLC UI frame",
+            "NPCI Ver":   "1B  0x01 NPCI version",
+            "NPCI Ctrl":  "1B  b7=NetMsg b5=DnetPresent b3=SnetPresent b1-0=Priority",
+            "DNet/DLEN/DADR": "conditional routing fields if b5 set",
+            "SNet/SLEN/SADR": "conditional source routing if b3 set",
+            "Hop Count":  "1B  max 255 router hops",
+        },
+        l4_key="bacnet_pdu_type",
+    ),
+
+    "profinet": dict(
+        name="PROFINET RT/IRT/DCP Frame Classification",
+        header_bytes=2,
+        type_field="Frame ID (2B) at offset 0",
+        type_map={
+            0x0001: dict(name="RT-Class1 Cyclic",    l4="profinet_rt",    usage="Cyclic IO data class 1"),
+            0x8000: dict(name="RT-Class2 Cyclic",    l4="profinet_rt",    usage="Cyclic IO data class 2"),
+            0xC000: dict(name="RT-Class3/IRT",       l4="profinet_irt",   usage="Isochronous real-time <0.25ms"),
+            0xFC00: dict(name="Reserved",            l4="profinet_rsvd",  usage="Reserved range"),
+            0xFC01: dict(name="Alarm High",          l4="profinet_alarm", usage="High-priority alarm"),
+            0xFE01: dict(name="Alarm Low",           l4="profinet_alarm", usage="Low-priority alarm"),
+            0xFF00: dict(name="DCP Multicast",       l4="profinet_dcp",   usage="Device discovery/config multicast"),
+            0xFF01: dict(name="DCP Unicast",         l4="profinet_dcp",   usage="Device discovery/config unicast"),
+            0xFF40: dict(name="Fragmentation",       l4="profinet_frag",  usage="Large PDU fragmentation"),
+        },
+        fields={
+            "Frame ID":       "2B  identifies PDU type and RT class",
+            "Cycle Counter":  "2B  free-running 0-65535 at 32kHz",
+            "DataStatus":     "1B  b6=DataValid b5=ProviderState b3=Redundancy b2=PrimaryAR",
+            "TransferStatus": "1B  0x00=OK",
+            "IO Data":        "variable  process input or output bytes",
+            "IOPS":           "1B  per-slot provider status 0x80=GOOD",
+            "IOCS":           "1B  per-slot consumer status 0x80=GOOD",
+        },
+        l4_key="profinet_frame_id",
+    ),
+
+    "ethercat": dict(
+        name="EtherCAT Datagram Chain — IEC 61158-12",
+        header_bytes=2,
+        type_field="Type field (3 bits at bits [15:13] of first 2B)",
+        type_map={
+            1: dict(name="EtherCAT Datagram Chain", l4="ethercat_datagram", usage="Standard EtherCAT PDU chain"),
+            4: dict(name="Network Variables",       l4="ethercat_nv",       usage="EtherCAT network variable"),
+            5: dict(name="Mailbox Gateway",         l4="ethercat_mbx",      usage="EtherCAT mailbox gateway"),
+        },
+        fields={
+            "Reserved":  "2b  must be 0",
+            "Length":    "11b total byte count of all datagrams in this frame",
+            "Type":      "3b  1=EtherCAT protocol",
+            "Cmd":       "1B  NOP/APRD/APWR/FPRD/FPWR/BRD/BWR/LRD/LWR/LRW",
+            "IDX":       "1B  datagram index for TX/RX pairing",
+            "Address":   "4B  ADP+ADO or logical address",
+            "DLen":      "11b datagram data length",
+            "M":         "1b  more datagrams follow",
+            "IRQ":       "2B  slave interrupt flags",
+            "Data":      "variable  process data",
+            "WKC":       "2B  Working Counter",
+        },
+        l4_key="ethercat_type",
+    ),
+
+    "powerlink": dict(
+        name="Ethernet POWERLINK v2 — EPSG DS 301",
+        header_bytes=3,
+        type_field="Message Type (1B) at offset 0",
+        type_map={
+            0x01: dict(name="SoC — Start of Cycle",       l4="powerlink_soc",  usage="Master broadcasts cycle start"),
+            0x03: dict(name="PReq — Poll Request",        l4="powerlink_preq", usage="Master polls single CN"),
+            0x04: dict(name="PRes — Poll Response",       l4="powerlink_pres", usage="CN responds with process data"),
+            0x05: dict(name="SoA — Start of Async",      l4="powerlink_soa",  usage="Master opens async slot"),
+            0x06: dict(name="ASnd — Async Send",          l4="powerlink_asnd", usage="Acyclic NMT/SDO data"),
+            0x07: dict(name="AMNI — Async MN Indication", l4="powerlink_amni", usage="Active MN indication"),
+        },
+        fields={
+            "Message Type": "1B  SoC/PReq/PRes/SoA/ASnd/AMNI",
+            "Dst Node ID":  "1B  0xFF=broadcast 0xFE=MN 0x01-0xEF=CN",
+            "Src Node ID":  "1B  sender node address",
+            "Data":         "variable  message-type-specific payload",
+        },
+        l4_key="powerlink_msg_type",
+    ),
+
+    "goose": dict(
+        name="IEC 61850-8-1 GOOSE PDU",
+        header_bytes=8,
+        type_field="APPID range (2B) at offset 0 distinguishes GOOSE from SV",
+        type_map={
+            0: dict(name="GOOSE PDU",  l4="goose_pdu",  usage="0x0000-0x3FFF Generic GOOSE event"),
+            1: dict(name="GSSE PDU",   l4="gsse_pdu",   usage="0x4000-0x7FFF Generic Substation State Event (deprecated)"),
+        },
+        fields={
+            "APPID":    "2B  0x0000-0x3FFF GOOSE application identifier",
+            "Length":   "2B  total PDU byte length including APPID and Length",
+            "Reserved1":"2B  0x0000 (IEC 62351-6 HMAC field when security enabled)",
+            "Reserved2":"2B  0x0000",
+            "PDU":      "variable  ASN.1 BER encoded GOOSE PDU",
+        },
+        l4_key="goose_appid_range",
+    ),
+
+    "gse_mgmt": dict(
+        name="IEC 61850-8-1 GSE Management",
+        header_bytes=8,
+        type_field="Management Type (1B) at offset 8 in payload",
+        type_map={
+            1: dict(name="Enter-Group",              l4="gse_enter",   usage="Subscribe to GOOSE/GSSE multicast"),
+            2: dict(name="Leave-Group",              l4="gse_leave",   usage="Unsubscribe from GOOSE/GSSE multicast"),
+            3: dict(name="GetGoReference",           l4="gse_getref",  usage="Query GOOSE reference"),
+            4: dict(name="GetGSSEDataSetReference",  l4="gse_getdsr",  usage="Query GSSE dataset reference"),
+            5: dict(name="GetAllData",               l4="gse_getall",  usage="Retrieve all GOOSE/GSSE data"),
+        },
+        fields={
+            "APPID":           "2B  application identifier",
+            "Length":          "2B  total PDU length",
+            "Reserved1":       "2B  0x0000",
+            "Reserved2":       "2B  0x0000",
+            "Management Type": "1B  1=Enter 2=Leave 3=GetGoRef 4=GetGSSEDSRef 5=GetAll",
+            "MaxTime":         "2B  max retransmission interval ms",
+            "MinTime":         "2B  min retransmission interval ms",
+            "DatSet":          "VisibleString  dataset reference",
+        },
+        l4_key="gse_mgmt_type",
+    ),
+
+    "sv": dict(
+        name="IEC 61850-9-2 Sampled Values",
+        header_bytes=8,
+        type_field="APPID range (2B) at offset 0",
+        type_map={
+            0: dict(name="Sampled Values PDU", l4="sv_pdu", usage="0x4000-0x7FFF instrument transformer streams"),
+        },
+        fields={
+            "APPID":    "2B  0x4000-0x7FFF sampled values identifier",
+            "Length":   "2B  total PDU byte length",
+            "Reserved1":"2B  0x0000",
+            "Reserved2":"2B  0x0000",
+            "PDU":      "variable  ASN.1 BER savPdu with noASDU + SEQUENCE OF ASDU",
+        },
+        l4_key="sv_appid",
+    ),
+
+    "sercos3": dict(
+        name="SERCOS III Telegram — IEC 61784-2-14",
+        header_bytes=1,
+        type_field="Frame Type (1B) at offset 0",
+        type_map={
+            0x01: dict(name="HP-Telegram (Hot-Plug)",  l4="sercos3_hp",  usage="Hot-plug device management"),
+            0x11: dict(name="CP-Telegram (CyclePacket)",l4="sercos3_cp", usage="Standard cyclic data"),
+            0x02: dict(name="AT (Amplifier Telegram)",  l4="sercos3_at", usage="Feedback from servo drive"),
+            0x12: dict(name="MDT (Master Data Telegram)",l4="sercos3_mdt",usage="Command to servo drive"),
+        },
+        fields={
+            "Frame Type":     "1B  HP=0x01 CP=0x11 AT=0x02 MDT=0x12",
+            "Slave Address":  "2B  target slave (AT) or 0xFFFF broadcast (MDT)",
+            "Telegram Length":"2B  payload byte count",
+            "Service Channel":"2B  IDN-based parameter access",
+            "Data":           "variable  AT=feedback MDT=setpoint",
+        },
+        l4_key="sercos3_frame_type",
+    ),
+
+    "wsmp": dict(
+        name="IEEE 1609.3 WAVE Short Message Protocol",
+        header_bytes=2,
+        type_field="PSID value determines application service",
+        type_map={
+            0x20:   dict(name="Basic Safety Message (BSM)",    l4="wsmp_bsm",   usage="SAE J2735 BSM — vehicle position+speed+heading"),
+            0x7E:   dict(name="SPAT — Signal Phase and Timing",l4="wsmp_spat",  usage="Traffic signal state for V2I"),
+            0x80:   dict(name="MAP — Intersection Geometry",   l4="wsmp_map",   usage="Road geometry for intersection assistance"),
+            0x8002: dict(name="TIM — Traveller Information",   l4="wsmp_tim",   usage="Road conditions warnings"),
+            0x8003: dict(name="Certificate/Security",          l4="wsmp_cert",  usage="IEEE 1609.2 certificate management"),
+            0x8007: dict(name="PDM — Probe Data Management",   l4="wsmp_pdm",   usage="Vehicle probe data collection"),
+        },
+        fields={
+            "Version":  "4b  0x3=WSMPv3",
+            "PSID":     "variable 1-4B VLC encoded Provider Service ID",
+            "WSM Len":  "2B  application payload length",
+            "WSM Data": "variable  application layer payload",
+        },
+        l4_key="wsmp_psid",
+    ),
+
+    "geonet": dict(
+        name="ETSI ITS GeoNetworking — EN 302 636-4-1",
+        header_bytes=4,
+        type_field="HT (Header Type, 4b) at bits [15:12] of Common Header",
+        type_map={
+            1: dict(name="BEACON",     l4="geonet_beacon", usage="Periodic position beacon"),
+            2: dict(name="GUC",        l4="geonet_guc",    usage="Geo Unicast to single vehicle"),
+            3: dict(name="GAC",        l4="geonet_gac",    usage="Geo Area Broadcast to area"),
+            4: dict(name="GBC",        l4="geonet_gbc",    usage="Geo Broadcast to area"),
+            5: dict(name="TSB",        l4="geonet_tsb",    usage="Topological Scoped Broadcast"),
+            6: dict(name="LS",         l4="geonet_ls",     usage="Location Service request/reply"),
+        },
+        fields={
+            "Basic Header":  "4B  Version(4b)+NH(4b)+Reserved(8b)+Lifetime(8b)+RHL(8b)",
+            "Common Header": "8B  NH(4b)+HT(4b)+HST(4b)+TC(8b)+Flags(8b)+PL(16b)+MHL(8b)+Res(8b)",
+            "Extended Hdr":  "variable  GUC=8B GBC/GAC=20B BEACON=0B TSB=4B",
+            "BTP Payload":   "variable  BTP-A/B + CAM/DENM/SPAT/MAP application",
+        },
+        l4_key="geonet_header_type",
+    ),
+
+    "tdls": dict(
+        name="IEEE 802.11r Fast BSS Transition / 802.11z TDLS",
+        header_bytes=1,
+        type_field="Payload Type (1B) at offset 0",
+        type_map={
+            1: dict(name="TDLS — Tunneled Direct Link Setup",   l4="tdls_setup",  usage="802.11z TDLS setup/teardown/peer traffic"),
+            2: dict(name="FBT — Fast BSS Transition",          l4="fbt_action",  usage="802.11r fast roaming transition action"),
+        },
+        fields={
+            "Payload Type": "1B  1=TDLS 2=Fast-BSS-Transition",
+            "Category":     "1B  IEEE 802.11 action frame category (12=TDLS 6=FBT)",
+            "Action Code":  "1B  TDLS: 0=Setup-Req 1=Setup-Resp 2=Setup-Confirm 3=Teardown | FBT: 1=Action 2=Ack",
+            "Dialog Token": "1B  request/response pairing",
+            "Data":         "variable  action-specific information elements",
+        },
+        l4_key="tdls_payload_type",
+    ),
+}
+
+NON_IP_L3_REGISTRY.update(INDUSTRIAL_L3_REGISTRY)
+
+
+
 # ── Cisco / IEEE Switch Protocol L3 registries ────────────────────────────────
 CISCO_L3_REGISTRY: dict[str, dict] = {
     "mac_ctrl": dict(
