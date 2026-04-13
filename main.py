@@ -1724,198 +1724,514 @@ def build_ipv4(l4_payload,src_ip,dst_ip,ttl,ip_id,dscp,df,proto_num):
 
 def ask_l3_stp():
     """
-    STP / RSTP / MSTP / PVST+ BPDU builder.
-    Asks every field with caution notes. Detects version and builds
-    correct BPDU format for each: STP(802.1D), RSTP(802.1w),
-    MSTP(802.1s), PVST+(Cisco) and Rapid-PVST+.
+    STP / RSTP / MSTP / PVST+ / Rapid-PVST+ BPDU builder.
+    Asks ONLY the fields that exist in the selected protocol variant.
+    Enforces correct IEEE 802.1D/802.1w/802.1s/802.1Q and Cisco PVST+ rules.
     """
-    section("LAYER 3 — STP / RSTP / MSTP / PVST+  BPDU")
-    print(f"  {C.DIM}  Protocol variants:{C.RESET}")
-    print(f"  {C.DIM}  0=IEEE STP (802.1D-1998)  — 30-50s convergence, one tree, all VLANs{C.RESET}")
-    print(f"  {C.DIM}  2=IEEE RSTP (802.1w)      — <1s convergence, one tree, all VLANs{C.RESET}")
-    print(f"  {C.DIM}  3=IEEE MSTP (802.1s)      — multiple instances, each covers group of VLANs{C.RESET}")
-    print(f"  {C.DIM}  C=Cisco PVST+             — per-VLAN STP (0x8100 tagged, SNAP 00:00:0C:01:07){C.RESET}")
-    print(f"  {C.DIM}  R=Cisco Rapid-PVST+       — per-VLAN RSTP (0x8100 tagged, SNAP 00:00:0C:01:07){C.RESET}")
+    section("LAYER 3 — STP / RSTP / MSTP / PVST+ / Rapid-PVST+  BPDU")
+    print(f"  {C.DIM}  Variant summary:{C.RESET}")
+    print(f"  {C.DIM}  0 = IEEE 802.1D-1998  STP            30-50s convergence  single tree  Bridge-ID=Prio(16b)+MAC(48b){C.RESET}")
+    print(f"  {C.DIM}  2 = IEEE 802.1w       RSTP            <1s convergence     single tree  Bridge-ID=Prio(4b)+Ext=0(12b)+MAC(48b){C.RESET}")
+    print(f"  {C.DIM}  3 = IEEE 802.1s       MSTP            <1s per-instance     multi-tree   Bridge-ID=Prio(4b)+MSTI-ID(12b)+MAC(48b){C.RESET}")
+    print(f"  {C.DIM}  C = Cisco             PVST+           per-VLAN STP        multi-tree   Bridge-ID=Prio(4b)+VLAN-ID(12b)+MAC(48b){C.RESET}")
+    print(f"  {C.DIM}  R = Cisco             Rapid-PVST+     per-VLAN RSTP       multi-tree   Bridge-ID=Prio(4b)+VLAN-ID(12b)+MAC(48b){C.RESET}")
     print(f"  {C.SEP_C}{'─'*76}{C.RESET}")
 
-    version = get("Version  0=STP  2=RSTP  3=MSTP  C=PVST+  R=Rapid-PVST+", "2",
-        help="0=IEEE STP  2=IEEE RSTP  3=IEEE MSTP  C=Cisco PVST+  R=Cisco Rapid-PVST+")
+    version = get("Variant  0=STP  2=RSTP  3=MSTP  C=PVST+  R=Rapid-PVST+", "2",
+        help="0=IEEE STP(802.1D-1998)  2=IEEE RSTP(802.1w)  3=IEEE MSTP(802.1s)\n"
+             "C=Cisco PVST+(per-VLAN STP)  R=Cisco Rapid-PVST+(per-VLAN RSTP)").upper()
+    if version == '2': version = '2'   # normalize
 
-    # PVST / Rapid-PVST — Cisco per-VLAN variant
-    if version.upper() in ('C','R'):
+    # ── PVST+ / Rapid-PVST+ — Cisco per-VLAN ─────────────────────────────────
+    if version in ('C', 'R'):
         vlan_id = get("PVST+ VLAN ID (1-4094)", "1",
-            help="Each VLAN has its own STP instance in PVST+. VLAN 1 uses native VLAN.")
-        pvst_ver = "2" if version.upper() == 'R' else "0"
-        print(f"  {C.WARN}  ⚠  PVST+ uses SNAP encapsulation (00:00:0C:01:07) + 802.1Q tag{C.RESET}")
-        print(f"  {C.WARN}     Dst MAC: 01:00:0C:CC:CC:CD (PVST multicast — differs from IEEE STP){C.RESET}")
-        bpdu_type = "00"
-        flags = get("BPDU Flags (hex)", "3c" if version.upper()=='R' else "00",
-            help="0x00=STP-Config  0x3C=RSTP(Desg+Learn+Fwd)  bit0=TC  bit7=TCA")
-    else:
-        vlan_id = None
-        bpdu_type = get("BPDU Type  00=Config  80=TCN  02=RSTP/MST", "00" if version=="0" else "02",
-            help="0x00=Configuration BPDU  0x80=TCN  0x02=RSTP/MST Config")
-        flags = get("BPDU Flags (hex)", "00" if version=="0" else "3c",
-            help="bit0=TC  bit1=Proposal  bit2-3=PortRole(01=Alt 10=Root 11=Desg)  "
-                 "bit4=Learning  bit5=Forwarding  bit6=Agreement  bit7=TCA\n"
-                 "0x00=plain STP  0x3C=RSTP Designated+Learning+Forwarding")
+            help="Each VLAN runs its own STP instance.\n"
+                 "VLAN ID is encoded in the 12-bit System-ID-Extension of Bridge-ID.\n"
+                 "VLAN 1 uses native (untagged) VLAN on trunk ports.")
+        print(f"  {C.L1}  PVST+ framing: 802.1Q tag (0x8100) + SNAP (AA AA 03 00 00 0C 01 0B){C.RESET}")
+        print(f"  {C.WARN}  Dst MAC: 01:00:0C:CC:CC:CD  (Cisco PVST multicast — NOT IEEE 01:80:C2:00:00:00){C.RESET}")
+        print(f"  {C.WARN}  IEEE switches ignore PVST+ BPDUs (different dst MAC + SNAP encap){C.RESET}")
 
-    print(f"  {C.WARN}  ⚠  Root Bridge ID: lower priority = more likely elected as root{C.RESET}")
-    root_prio = get("Root Bridge Priority (steps of 4096)", "32768",
-        help="0/4096/8192…57344/61440. Default=32768. Lower=preferred root. "
-             "0=highest priority (always root if reachable).")
-    root_sys_ext = get("Root System ID Extension (VLAN/MSTI, 0-4095)", "0",
-        help="12-bit extension: PVST+=VLAN-ID, MSTP=MSTI (instance 0=CIST). "
-             "Combined with priority: BridgeID = priority(4b)+sysExt(12b)+MAC(48b).")
-    root_mac = get("Root Bridge MAC", "00:00:00:00:00:00",
-        help="MAC address of root bridge. 00:00:00:00:00:00 = this bridge IS the root.")
-    path_cost = get("Root Path Cost", "0",
-        help="0=this bridge is root. 10Mbps=100 100Mbps=19 1Gbps=4 10Gbps=2 "
-             "100Gbps=1 (802.1D-2004 short costs).")
-    print(f"  {C.WARN}  ⚠  Bridge ID: must be lower priority than root to be non-root{C.RESET}")
-    br_prio = get("Bridge Priority", "32768",
-        help="Priority of THIS bridge sending this BPDU. Must be ≤ root priority "
-             "for this to be the root.")
-    br_sys_ext = get("Bridge System ID Extension", "0",
-        help="VLAN ID (PVST+) or MSTI (MSTP). Same rules as Root Sys ID Extension.")
-    br_mac = get("Bridge MAC", "00:11:22:33:44:55",
-        help="Unique MAC of THIS bridge. Used to break priority ties.")
-    port_id = get("Port ID (hex)", "8001",
-        help="High byte=port priority (default 0x80=128), low byte=port number. "
-             "e.g. 0x8001=priority128 port1. Lower port priority = preferred path.")
-    msg_age = get("Message Age (1/256 sec units, enter seconds)", "0",
-        help="0=generated by root. Each hop adds 1. Discarded when msg_age >= max_age.")
-    max_age = get("Max Age (sec)", "20",
-        help="Default 20s. Topology recalculated if BPDU not received within max_age.")
-    hello = get("Hello Time (sec)", "2",
-        help="Root sends Config BPDU every hello_time seconds. Default 2s.")
-    fwd_delay = get("Forward Delay (sec)", "15",
-        help="Time spent in Listening+Learning states (STP only). Default 15s. "
-             "RSTP ignores this for edge/point-to-point links.")
-    print(f"  {C.WARN}  ⚠  RSTP uses Proposal/Agreement — fwd_delay only used for legacy fallback{C.RESET}")
+        # PVST+ = STP config BPDU format (version=0, type=0x00)
+        # Rapid-PVST+ = RST BPDU format (version=2, type=0x02)
+        is_rapid = (version == 'R')
+        bpdu_type = "02" if is_rapid else get(
+            "BPDU Type  00=Config  80=TCN", "00",
+            help="0x00=Configuration BPDU (normal operation)\n"
+                 "0x80=Topology Change Notification (sent toward root)")
 
-    # MSTP-specific fields
-    mstp_name = ""
-    mstp_rev  = "0"
-    mstp_digest = "0"*32
+        if is_rapid or bpdu_type == "00":
+            # Flags: PVST+ (STP base) = only TC(b0) and TCA(b7)
+            # Rapid-PVST+ = full RSTP flags
+            if is_rapid:
+                flags = get("BPDU Flags (hex)", "3c",
+                    help="Rapid-PVST+ uses full RSTP flag byte:\n"
+                         "  bit 0 = TC (Topology Change)\n"
+                         "  bit 1 = Proposal\n"
+                         "  bit 2-3 = Port Role: 00=Unknown 01=Alt/Backup 10=Root 11=Designated\n"
+                         "  bit 4 = Learning\n"
+                         "  bit 5 = Forwarding\n"
+                         "  bit 6 = Agreement\n"
+                         "  bit 7 = TCA\n"
+                         "  0x3C = Designated + Learning + Forwarding (normal designated port)")
+            else:
+                flags = get("BPDU Flags (hex)", "00",
+                    help="PVST+ (STP base) ONLY uses 2 bits:\n"
+                         "  bit 0 = TC  (Topology Change — set on ports toward root during TC)\n"
+                         "  bit 7 = TCA (Topology Change Acknowledgement)\n"
+                         "  bits 1-6 = RESERVED — MUST be 0x00\n"
+                         "  0x00=normal  0x01=TC  0x80=TCA  0x81=TC+TCA")
+        else:
+            flags = "00"
+
+        # Bridge-ID encoding: Prio(4b) + VLAN-ID(12b) + MAC(6b)
+        # Priority MUST be multiple of 4096 (0,4096,8192...61440)
+        print(f"  {C.L1}  Bridge-ID format: Priority(4b, steps 4096) + VLAN-ID(12b) + MAC(48b){C.RESET}")
+        root_prio = get("Root Bridge Priority (multiples of 4096: 0,4096...61440)", "32768",
+            help="Priority encoded in upper 4 bits of Bridge-ID word.\n"
+                 "Must be a multiple of 4096. Lower = preferred root.\n"
+                 "Default=32768. Cisco sets per-VLAN: VLAN1=32769 VLAN2=32770 etc.\n"
+                 "(32768 + VLAN-ID if not manually configured)")
+        root_mac = get("Root Bridge MAC", "00:00:00:00:00:00",
+            help="MAC of root bridge. 00:00:00:00:00:00 = this switch is root.")
+        path_cost = get("Root Path Cost", "0",
+            help="802.1D-2004 short path costs:\n"
+                 "  10Mbps=100  100Mbps=19  1Gbps=4  10Gbps=2  100Gbps=1\n"
+                 "  0 = this switch is the root bridge")
+        br_prio = get("Bridge Priority (multiples of 4096)", "32768",
+            help="Priority of THIS switch. Same encoding as Root Bridge Priority.\n"
+                 "Must be multiple of 4096.")
+        br_mac = get("Bridge MAC", "00:11:22:33:44:55",
+            help="Unique MAC of THIS switch port originating BPDU.")
+        port_id = get("Port ID (hex)", "8001",
+            help="2 bytes: PortPriority(4b, steps 16) + PortNumber(12b)\n"
+                 "Default port priority=0x80 (128). Port number=1.\n"
+                 "e.g. 0x8001=priority128 port1  0x0001=priority0(highest) port1")
+        msg_age   = get("Message Age (seconds, 0=root)", "0",
+            help="Incremented by 1 for each bridge hop from root.\n"
+                 "0=generated directly by root. Frame discarded when msg_age >= max_age.")
+        max_age   = get("Max Age (seconds)", "20",
+            help="Default 20s. If no BPDU received within max_age, topology recalculates.")
+        hello     = get("Hello Time (seconds)", "2",
+            help="Root sends Config BPDUs every hello_time seconds. Default 2s. Range 1-10s.")
+        fwd_delay = get("Forward Delay (seconds)", "15",
+            help="PVST+: time in Listening+Learning states. Default 15s.\n"
+                 "Rapid-PVST+: only used for legacy STP interop fallback.")
+
+        return (version, vlan_id, bpdu_type, flags,
+                root_prio, str(int(vlan_id)), root_mac, path_cost,
+                br_prio, str(int(vlan_id)), br_mac, port_id,
+                msg_age, max_age, hello, fwd_delay,
+                "", "0", "0"*32, [])
+
+    # ── IEEE STP 802.1D-1998 (version=0) ─────────────────────────────────────
+    if version == '0':
+        print(f"  {C.L1}  IEEE 802.1D-1998 STP — classic spanning tree{C.RESET}")
+        print(f"  {C.L1}  Bridge-ID format: Priority(16b full, any value) + MAC(48b){C.RESET}")
+        print(f"  {C.DIM}  Dst MAC: 01:80:C2:00:00:00 (IEEE STP multicast){C.RESET}")
+        print(f"  {C.WARN}  NO System-ID-Extension in 802.1D-1998 — full 16-bit priority{C.RESET}")
+
+        bpdu_type = get("BPDU Type  00=Config  80=TCN", "00",
+            help="0x00=Configuration BPDU — normal operation, sent by designated ports\n"
+                 "0x80=TCN (Topology Change Notification) — sent toward root only")
+
+        if bpdu_type == "80":
+            print(f"  {C.WARN}  TCN BPDU has NO flags, NO bridge IDs, NO timers — just Protocol+Version+Type{C.RESET}")
+            # TCN BPDU is minimal — just 3 bytes: proto(2B)+version(1B)+type(1B) = 4B
+            return ('0', None, '80', '00', '0', '0', '00:00:00:00:00:00', '0',
+                    '0', '0', '00:00:00:00:00:00', '8001', '0', '20', '2', '15',
+                    '', '0', '0'*32, [])
+
+        flags = get("BPDU Flags (hex)", "00",
+            help="IEEE 802.1D-1998 STP uses ONLY 2 flag bits:\n"
+                 "  bit 0 (LSB) = TC  (Topology Change)\n"
+                 "  bit 7 (MSB) = TCA (Topology Change Acknowledgement)\n"
+                 "  bits 1-6 = RESERVED — must be 0x00\n"
+                 "  0x00=normal  0x01=TC active  0x80=TCA  0x81=TC+TCA")
+
+        print(f"  {C.L1}  Bridge-ID = 16-bit priority (any value 0-65535) + 6B MAC{C.RESET}")
+        root_prio = get("Root Bridge Priority (0-65535, any value)", "32768",
+            help="Full 16-bit value — any integer 0-65535.\n"
+                 "Default 32768 (0x8000). Lower value = higher priority.\n"
+                 "NOTE: 802.1D-1998 does NOT restrict to multiples of 4096.")
+        root_mac = get("Root Bridge MAC", "00:00:00:00:00:00",
+            help="MAC address of root bridge. 00:00:00:00:00:00 = this bridge IS root.")
+        path_cost = get("Root Path Cost (802.1D original costs)", "0",
+            help="802.1D-1998 original path costs (4B):\n"
+                 "  10Mbps=100   100Mbps=10   1Gbps=1  (original 802.1D-1998)\n"
+                 "  802.1D-2004 revised: 10Mbps=2000000 100Mbps=200000 1Gbps=20000\n"
+                 "  0 = this bridge is the root bridge")
+        br_prio = get("Bridge Priority (0-65535)", "32768",
+            help="Priority of THIS bridge. Full 16-bit — not restricted to multiples of 4096.")
+        br_mac = get("Bridge MAC", "00:11:22:33:44:55",
+            help="MAC of THIS bridge. Unique identifier used to break priority ties.")
+        port_id = get("Port ID (hex)", "8001",
+            help="2 bytes: PortPriority(8b, 0-255) + PortNumber(8b, 0-255)\n"
+                 "STP 802.1D-1998: port priority is full 8-bit (0-255)\n"
+                 "Default: 0x80 (128) priority, port 0x01\n"
+                 "e.g. 0x8001=priority128 port1")
+        msg_age   = get("Message Age (seconds, 0=root)", "0",
+            help="0=sent by root. Incremented 1 per hop. Max=max_age-1.")
+        max_age   = get("Max Age (seconds)", "20", help="Default 20s. Range 6-40s.")
+        hello     = get("Hello Time (seconds)", "2",  help="Default 2s. Range 1-10s.")
+        fwd_delay = get("Forward Delay (seconds)", "15",
+            help="Time in Listening+Learning. Default 15s. Range 4-30s.")
+
+        # STP uses full 16-bit priority, no sys-ext
+        return ('0', None, bpdu_type, flags,
+                root_prio, '0', root_mac, path_cost,
+                br_prio, '0', br_mac, port_id,
+                msg_age, max_age, hello, fwd_delay,
+                '', '0', '0'*32, [])
+
+    # ── IEEE RSTP 802.1w (version=2) ─────────────────────────────────────────
+    if version == '2':
+        print(f"  {C.L1}  IEEE 802.1w RSTP — rapid spanning tree{C.RESET}")
+        print(f"  {C.L1}  Bridge-ID format: Priority(4b, ×4096) + System-ID-Ext=0(12b) + MAC(48b){C.RESET}")
+        print(f"  {C.DIM}  Dst MAC: 01:80:C2:00:00:00  BPDU Type=0x02  Version=0x02{C.RESET}")
+        print(f"  {C.WARN}  RSTP System-ID-Extension = 0 (RSTP is single-tree — no per-VLAN){C.RESET}")
+
+        bpdu_type = "02"   # RST BPDU — RSTP only uses type 0x02
+        print(f"  {C.DIM}  BPDU Type fixed = 0x02 (RST BPDU — RSTP Configuration BPDU){C.RESET}")
+        print(f"  {C.DIM}  TCN is not sent separately in RSTP — TC bit in RST BPDU instead{C.RESET}")
+
+        flags = get("BPDU Flags (hex)", "3c",
+            help="RSTP full 8-bit flags:\n"
+                 "  bit 0 = TC        (Topology Change)\n"
+                 "  bit 1 = Proposal  (sync request to downstream bridge)\n"
+                 "  bit 2-3 = Port Role: 00=Unknown 01=Alternate/Backup 10=Root 11=Designated\n"
+                 "  bit 4 = Learning  (port is in Learning state)\n"
+                 "  bit 5 = Forwarding (port is in Forwarding state)\n"
+                 "  bit 6 = Agreement (downstream agrees to sync)\n"
+                 "  bit 7 = TCA       (unused in RST BPDU, set to 0)\n"
+                 "  0x3C = Designated+Learning+Forwarding (normal designated port)\n"
+                 "  0x1C = Root port forwarding\n"
+                 "  0x0F = Proposal from designated port\n"
+                 "  0x3E = Agreement from root port")
+
+        print(f"  {C.L1}  Priority must be multiple of 4096 (0,4096,8192...61440){C.RESET}")
+        root_prio = get("Root Bridge Priority (×4096: 0,4096...61440)", "32768",
+            help="Upper 4 bits of Bridge-ID priority word × 4096.\n"
+                 "Default=32768. Multiples: 0,4096,8192,12288,16384,20480,\n"
+                 "24576,28672,32768,36864,40960,45056,49152,53248,57344,61440")
+        root_mac = get("Root Bridge MAC", "00:00:00:00:00:00",
+            help="MAC of root bridge. Lowest Bridge-ID = root.")
+        path_cost = get("Root Path Cost (802.1D-2004 costs)", "0",
+            help="IEEE 802.1D-2004 revised path costs:\n"
+                 "  10Mbps=2000000  100Mbps=200000  1Gbps=20000\n"
+                 "  10Gbps=2000  100Gbps=200  1Tbps=20\n"
+                 "  0 = this bridge is the root")
+        br_prio = get("Bridge Priority (×4096)", "32768",
+            help="Priority of THIS bridge. Must be multiple of 4096.")
+        br_mac = get("Bridge MAC", "00:11:22:33:44:55")
+        port_id = get("Port ID (hex)", "8001",
+            help="RSTP: PortPriority(4b, ×16: 0,16,32...240) + PortNumber(12b, 0-4095)\n"
+                 "Default: 0x8001 = priority128 + port1\n"
+                 "Port priority 0x80=128 (default), in steps of 16")
+        msg_age   = get("Message Age (seconds, 0=root)", "0",
+            help="0=root generated. Incremented per hop. Must be < max_age.")
+        max_age   = get("Max Age (seconds)", "20", help="Default 20s.")
+        hello     = get("Hello Time (seconds)", "2",
+            help="Only meaningful if bridge is root. Otherwise ignored by RSTP.")
+        fwd_delay = get("Forward Delay (seconds)", "15",
+            help="Only used when interoperating with legacy STP bridges.\n"
+                 "RSTP uses Proposal/Agreement for <1s convergence instead.")
+
+        return ('2', None, bpdu_type, flags,
+                root_prio, '0', root_mac, path_cost,
+                br_prio, '0', br_mac, port_id,
+                msg_age, max_age, hello, fwd_delay,
+                '', '0', '0'*32, [])
+
+    # ── IEEE MSTP 802.1s (version=3) ─────────────────────────────────────────
+    print(f"  {C.L1}  IEEE 802.1s MSTP — Multiple Spanning Tree Protocol{C.RESET}")
+    print(f"  {C.L1}  Bridge-ID format: Priority(4b, ×4096) + MSTI-Instance-ID(12b) + MAC(48b){C.RESET}")
+    print(f"  {C.DIM}  CIST (instance 0) = common tree; MSTI 1-64 = per-group trees{C.RESET}")
+    print(f"  {C.WARN}  All bridges in same MST region MUST have identical: RegionName+Revision+VLANmap-digest{C.RESET}")
+
+    bpdu_type = "02"
+    print(f"  {C.DIM}  BPDU Type=0x02  Version=0x03  (MST BPDU always RST BPDU base + MST extension){C.RESET}")
+
+    flags = get("CIST Flags (hex)", "3c",
+        help="MSTP CIST flags (same bit layout as RSTP):\n"
+             "  bit 0=TC  bit1=Proposal  bit2-3=PortRole  bit4=Learning\n"
+             "  bit5=Forwarding  bit6=Agreement  bit7=TCA\n"
+             "  0x3C=Designated+Learning+Forwarding")
+
+    print(f"  {C.L1}  CIST = Common Internal Spanning Tree (instance 0 — VLAN1 default){C.RESET}")
+    root_prio = get("CIST Root Bridge Priority (×4096)", "32768",
+        help="CIST root bridge priority. Multiple of 4096.\n"
+             "CIST Root is elected across ALL MSTP regions.")
+    root_mac = get("CIST Root Bridge MAC", "00:00:00:00:00:00",
+        help="CIST Root Bridge MAC. Bridges outside this region may be CIST root.")
+    path_cost = get("CIST External Root Path Cost", "0",
+        help="Cost from this MST region boundary to CIST root (external cost).\n"
+             "0 if CIST root is in this region. Regional bridges use internal cost.")
+    br_prio = get("CIST Bridge Priority (×4096)", "32768",
+        help="Priority of THIS bridge for CIST. Multiple of 4096.")
+    br_mac = get("Bridge MAC (all instances share same MAC)", "00:11:22:33:44:55",
+        help="MAC unique to this bridge. Used for ALL instances (CIST and MSTIs).")
+    port_id = get("CIST Port ID (hex)", "8001",
+        help="CIST port: PortPriority(4b, ×16) + PortNumber(12b)\n"
+             "Default 0x8001 = priority128 port1")
+    msg_age   = get("Message Age (seconds)", "0",
+        help="MSTP: hops from CIST root to this bridge × message-age-increment.")
+    max_age   = get("Max Age (seconds)", "20")
+    hello     = get("Hello Time (seconds)", "2")
+    fwd_delay = get("Forward Delay (seconds)", "15",
+        help="Used for interoperability with legacy STP bridges.")
+
+    section("MSTP — MST Configuration Identification (Region Identity)")
+    print(f"  {C.WARN}  ALL bridges in same region MUST have byte-for-byte identical Config ID{C.RESET}")
+    mstp_name = get("MST Region Name (up to 32 ASCII chars)", "MST-REGION-1",
+        help="Case-sensitive. Padded with NULLs to 32 bytes.\n"
+             "Mismatch = bridges form separate regions (different CIST topology).")
+    mstp_rev  = get("MST Revision Level (0-65535)", "0",
+        help="Revision number. Must match across all region bridges.")
+    mstp_digest = get("MST VLAN-to-Instance mapping MD5 digest (32 hex chars = 16B)", "00"*16,
+        help="MD5 hash of the 4096-entry VLAN-to-instance mapping table.\n"
+             "All bridges must have same VLAN map to compute same digest.\n"
+             "Generate with: md5(VLAN-map-table) — see IEEE 802.1Q §13.7")
+
+    n_msti = int(get("Number of MSTI records (0-64)", "1",
+        help="One record per active MSTI (instance 1-64).\n"
+             "Each MSTI covers a group of VLANs mapped to it.\n"
+             "Instance 0 = CIST (handled above). Max 64 additional instances."))
+
     mstp_msti = []
-    if version == "3":
-        section("MSTP — MST Configuration Identification")
-        print(f"  {C.DIM}  All bridges in the same MST Region must have identical: Name+Revision+VLAN-mapping-digest{C.RESET}")
-        mstp_name = get("MST Region Name (32 chars)", "MST-REGION-1",
-            help="Up to 32 ASCII chars — all bridges must match exactly (case-sensitive).")
-        mstp_rev  = get("MST Revision Level (0-65535)", "0",
-            help="Revision number. Bridges must match to be in same region.")
-        mstp_digest = get("MST VLAN-mapping digest (32B hex)", "00"*16,
-            help="MD5 hash of VLAN-to-instance mapping table. Same across all region members.")
-        print(f"  {C.WARN}  ⚠  Digest mismatch = bridges form separate MST regions (topology partition){C.RESET}")
-        n_msti = get("Number of MSTI records (0-64)", "1")
-        for i in range(int(n_msti)):
-            section(f"MSTI {i+1} Record")
-            msti_prio = get(f"MSTI {i+1} Regional Root Priority", "32768")
-            msti_mac  = get(f"MSTI {i+1} Regional Root MAC", "00:00:00:00:00:00")
-            msti_cost = get(f"MSTI {i+1} Internal Path Cost", "0")
-            msti_bprio= get(f"MSTI {i+1} Bridge Priority", "32768")
-            msti_port = get(f"MSTI {i+1} Port Priority (hex)", "80")
-            msti_flags= get(f"MSTI {i+1} Flags", "00")
-            msti_rem  = get(f"MSTI {i+1} Remaining Hops", "20")
-            mstp_msti.append((msti_prio,msti_mac,msti_cost,msti_bprio,msti_port,msti_flags,msti_rem))
+    for i in range(n_msti):
+        msti_num = i + 1
+        section(f"MSTI {msti_num} Record (16 bytes)")
+        print(f"  {C.DIM}  MSTI {msti_num} Bridge-ID = Priority(4b,×4096) + MSTI-Number({msti_num:04b}b as 12b) + MAC{C.RESET}")
+        msti_flags = get(f"MSTI {msti_num} Flags (hex)", "00",
+            help="MSTI flags (1B):\n"
+                 "  bit 0 = Master (this is the IST master bridge for this MSTI)\n"
+                 "  bit 1 = Proposal\n"
+                 "  bit 2-3 = Port Role: 00=Unknown 01=Alt/Backup 10=Root 11=Designated\n"
+                 "  bit 4 = Learning\n"
+                 "  bit 5 = Forwarding\n"
+                 "  bit 6 = Agreement\n"
+                 "  bit 7 = TC (Topology Change)\n"
+                 "  0x00=normal 0x7C=Designated+Learning+Forwarding")
+        msti_reg_root_prio = get(f"MSTI {msti_num} Regional Root Priority (×4096)", "32768",
+            help=f"Root bridge priority for MSTI {msti_num} within this region.\n"
+                 "Multiple of 4096. Lower = preferred regional root.")
+        msti_reg_root_mac  = get(f"MSTI {msti_num} Regional Root MAC", "00:00:00:00:00:00",
+            help=f"MAC of MSTI {msti_num} regional root bridge.")
+        msti_int_cost      = get(f"MSTI {msti_num} Internal Root Path Cost", "0",
+            help="Internal path cost within this MST region to MSTI regional root.")
+        msti_br_prio       = get(f"MSTI {msti_num} Bridge Priority (0-240 in steps of 16)", "128",
+            help="1-byte field: upper nibble = priority (0-15 × 16).\n"
+                 "Values: 0,16,32,48,64,80,96,112,128,144,160,176,192,208,224,240\n"
+                 "Default=128. NOTE: this is 1B not 2B (MSTI bridge prio is compact)")
+        msti_port_prio     = get(f"MSTI {msti_num} Port Priority (0-240 in steps of 16)", "128",
+            help="1-byte: upper nibble = port priority for this MSTI.\n"
+                 "Steps of 16: 0,16,32...240. Default=128.")
+        msti_rem_hops      = get(f"MSTI {msti_num} Remaining Hops", "20",
+            help="Decremented by 1 at each bridge. MSTI BPDU discarded when 0.\n"
+                 "Default 20 = MaxHops. Limits MSTI extent within region.")
+        mstp_msti.append((msti_reg_root_prio, str(msti_num), msti_reg_root_mac,
+                          msti_int_cost, msti_br_prio, msti_port_prio,
+                          msti_flags, msti_rem_hops))
 
-    return (version,vlan_id,bpdu_type,flags,root_prio,root_sys_ext,root_mac,path_cost,
-            br_prio,br_sys_ext,br_mac,port_id,msg_age,max_age,hello,fwd_delay,
-            mstp_name,mstp_rev,mstp_digest,mstp_msti)
+    return ('3', None, bpdu_type, flags,
+            root_prio, '0', root_mac, path_cost,
+            br_prio, '0', br_mac, port_id,
+            msg_age, max_age, hello, fwd_delay,
+            mstp_name, mstp_rev, mstp_digest, mstp_msti)
 
 
 def build_stp(inputs):
-    (version,vlan_id,bpdu_type,flags,root_prio,root_sys_ext,root_mac,path_cost,
-     br_prio,br_sys_ext,br_mac,port_id,msg_age,max_age,hello,fwd_delay,
-     mstp_name,mstp_rev,mstp_digest,mstp_msti) = inputs
+    """
+    Build IEEE 802.1D/802.1w/802.1s and Cisco PVST+/Rapid-PVST+ BPDU bytes.
+    Each variant encoded exactly per its spec.
+    """
+    (version, vlan_id, bpdu_type, flags,
+     root_prio, root_sys_ext, root_mac, path_cost,
+     br_prio, br_sys_ext, br_mac, port_id,
+     msg_age, max_age, hello, fwd_delay,
+     mstp_name, mstp_rev, mstp_digest, mstp_msti) = inputs
 
-    # Build Bridge IDs with system ID extension
-    def make_bridge_id(prio_s, sys_ext_s, mac_s):
-        prio = int(prio_s) & 0xF000
-        ext  = int(sys_ext_s) & 0x0FFF
-        return struct.pack("!H", prio | ext) + mac_b(mac_s)
+    # ── Bridge-ID builder — version-aware ─────────────────────────────────────
+    def make_bridge_id(prio_s, sys_ext_s, mac_s, ver):
+        """
+        Build 8-byte Bridge-ID correctly per variant.
+        802.1D-1998 STP: full 16-bit priority (any value), no sys-ext
+        802.1w RSTP:     4-bit priority (×4096) + 12-bit sys-ext=0
+        802.1s MSTP:     4-bit priority (×4096) + 12-bit MSTI-ID
+        PVST+/Rapid:     4-bit priority (×4096) + 12-bit VLAN-ID
+        """
+        if ver == '0':
+            # Classic STP: full 16-bit priority, no extension
+            prio_val = int(prio_s) & 0xFFFF
+            prio_word = struct.pack("!H", prio_val)
+        else:
+            # RSTP/MSTP/PVST+: priority in top 4 bits (×4096), ext in lower 12 bits
+            prio_4b = (int(prio_s) // 4096) & 0x000F   # keep top nibble only
+            ext_12b = int(sys_ext_s) & 0x0FFF
+            prio_word = struct.pack("!H", (prio_4b << 12) | ext_12b)
+        return prio_word + mac_b(mac_s)
 
-    root_id = make_bridge_id(root_prio, root_sys_ext, root_mac)
-    br_id   = make_bridge_id(br_prio,   br_sys_ext,   br_mac)
+    root_id = make_bridge_id(root_prio, root_sys_ext, root_mac, version)
+    br_id   = make_bridge_id(br_prio,   br_sys_ext,   br_mac,   version)
 
-    # BPDU payload (version-aware)
-    proto_id  = bytes.fromhex("0000")
-    ver_b     = hpad("03" if version=="3" else ("02" if version in("2","R") else "00"), 1)
-    btype_b   = hpad("02" if version in("2","3","R") else bpdu_type, 1)
-    flags_b   = hpad(flags, 1)
-    cost_b    = struct.pack("!I", int(path_cost))
-    port_b    = hpad(port_id, 2)
-    # Timers — 1/256 second units
-    def timer(sec): return struct.pack("!H", int(float(sec)*256))
+    proto_id = bytes.fromhex("0000")
 
+    # Version byte — per variant
+    ver_byte_map = {'0':'00', '2':'02', '3':'03', 'C':'00', 'R':'02'}
+    ver_b = hpad(ver_byte_map.get(version, '02'), 1)
+
+    # BPDU type byte
+    btype_b = hpad(bpdu_type, 1)
+
+    # Flags byte — enforcement per variant
+    raw_flags = int(flags, 16)
+    if version == '0' or (version == 'C' and bpdu_type == '00'):
+        # STP / PVST+ Config BPDU: only bits 0 and 7 valid
+        clean_flags = raw_flags & 0x81
+        if clean_flags != raw_flags:
+            raw_flags = clean_flags    # silently clear reserved bits
+    flags_b = struct.pack("!B", raw_flags)
+
+    cost_b  = struct.pack("!I", int(path_cost))
+    port_b  = hpad(port_id, 2)
+
+    def timer(sec_s):
+        """Encode timer as 1/256-second units (2B big-endian)."""
+        return struct.pack("!H", int(float(sec_s) * 256))
+
+    # TCN BPDU — minimal (no flags, no IDs, no timers)
+    if bpdu_type == '80':
+        bpdu = proto_id + ver_b + btype_b
+        fields = [
+            {"layer":3,"name":"Protocol ID",  "raw":proto_id,  "user_val":"0x0000", "note":"IEEE STP always 0"},
+            {"layer":3,"name":"Version",       "raw":ver_b,     "user_val":"0x00",   "note":"STP version 0"},
+            {"layer":3,"name":"BPDU Type",     "raw":btype_b,   "user_val":"0x80",   "note":"Topology Change Notification"},
+        ]
+        return bpdu, fields
+
+    # Configuration BPDU / RST BPDU
     bpdu = (proto_id + ver_b + btype_b + flags_b +
             root_id + cost_b + br_id + port_b +
             timer(msg_age) + timer(max_age) + timer(hello) + timer(fwd_delay))
 
-    # RSTP Version 1 length field
-    if version in ("2","R"):
-        bpdu += bytes.fromhex("0000")   # Version1Length=0
+    # RSTP / Rapid-PVST+ Version1Length field (must be 0x00)
+    if version in ('2', 'R'):
+        bpdu += bytes.fromhex("00")   # Version1Length = 0x00 (1 byte per 802.1w §9.3.3)
 
-    # MSTP additions (IEEE 802.1s / 802.1Q-2005 Section 13)
+    # MSTP additions
     mstp_extra = b""
-    if version == "3":
-        # MST Config ID (51B): Format=1B + Name=32B + Revision=2B + Digest=16B
-        name_b = mstp_name.encode("ascii")[:32].ljust(32, b'\x00')
-        rev_b  = struct.pack("!H", int(mstp_rev))
-        digest_b = bytes.fromhex((mstp_digest+"00"*32)[:32])
-        mst_config_id = bytes([0x00]) + name_b + rev_b + digest_b  # 51B
-        # CIST Internal Root Path Cost (4B) + CIST Bridge ID (8B) + Remaining Hops (1B)
-        cist_internal_cost = struct.pack("!I", 0)
-        cist_bridge_id     = br_id
-        cist_hops          = bytes([20])
-        mstp_extra = mst_config_id + cist_internal_cost + cist_bridge_id + cist_hops
-        # MSTI Config Messages (16B each)
-        for (mp,mm,mc,mbp,mpo,mfl,mr) in mstp_msti:
-            msti_root = make_bridge_id(mp,"0",mm)
-            mstp_extra += (hpad(mfl,1) + msti_root +
-                           struct.pack("!I",int(mc)) +
-                           hpad(mbp,1) + hpad(mpo,1) + hpad(mr,1) + bytes([0]))
-        # Version3Length
+    if version == '3':
+        # MST Configuration ID = 51 bytes:
+        #   Format-Selector(1B=0) + RegionName(32B) + RevisionLevel(2B) + ConfigDigest(16B)
+        name_b    = mstp_name.encode("ascii")[:32].ljust(32, b'\x00')
+        rev_b     = struct.pack("!H", int(mstp_rev))
+        dig_hex   = (mstp_digest.replace(" ","") + "00"*32)[:32]
+        digest_b  = bytes.fromhex(dig_hex)
+        mst_config_id = bytes([0x00]) + name_b + rev_b + digest_b   # 51B
+
+        # CIST Internal Root Path Cost (4B) — cost within MST region to CIST regional root
+        cist_int_cost = struct.pack("!I", 0)
+        # CIST Bridge ID (8B) — same br_id
+        cist_bridge_id = br_id
+        # CIST Remaining Hops (1B)
+        cist_hops = bytes([20])
+
+        mstp_extra = mst_config_id + cist_int_cost + cist_bridge_id + cist_hops
+
+        # MSTI Configuration Messages (16B each per IEEE 802.1s §14.5)
+        # Format: Flags(1B) + RegionalRoot(8B) + IntPathCost(4B) + BridgePrio(1B) + PortPrio(1B) + RemainingHops(1B) + Reserved(1B)
+        for idx, (mrp, msti_id_s, mrm, mic, mbp, mpp, mfl, mr) in enumerate(mstp_msti):
+            msti_num = idx + 1
+            # MSTI Regional Root Bridge ID: priority(4b) + MSTI-number(12b) + MAC(6b)
+            msti_root_id = make_bridge_id(mrp, msti_id_s, mrm, '3')
+            msti_int_cost_b = struct.pack("!I", int(mic))
+            msti_br_prio_b  = bytes([int(mbp) & 0xF0])   # upper nibble only, lower=0
+            msti_port_prio_b= bytes([int(mpp) & 0xF0])   # upper nibble only
+            msti_flags_b    = hpad(mfl, 1)
+            msti_rem_b      = bytes([int(mr)])
+            msti_reserved   = bytes([0])
+            mstp_extra += (msti_flags_b + msti_root_id + msti_int_cost_b +
+                           msti_br_prio_b + msti_port_prio_b + msti_rem_b + msti_reserved)
+
+        # Version1Length(1B=0) + Version3Length(2B) + MST data
         v3len = struct.pack("!H", len(mstp_extra))
-        bpdu += bytes.fromhex("0000") + v3len + mstp_extra  # V1Len + V3Len + data
+        bpdu += bytes.fromhex("00") + v3len + mstp_extra
 
-    # PVST+ adds SNAP + VLAN TLV (0x00 0x00 VID_high VID_low 0x00)
-    pvst_snap = b""
-    pvst_vlan_tlv = b""
-    if vlan_id is not None:
-        pvst_snap    = bytes.fromhex("aaaa03") + bytes.fromhex("00000c") + bytes.fromhex("010b")
-        vid          = int(vlan_id)
-        pvst_vlan_tlv= bytes.fromhex("0000") + struct.pack("!H", vid) + bytes.fromhex("00")
+    # PVST+ framing: SNAP header + optional VLAN TLV appended after BPDU
+    pvst_snap    = b""
+    pvst_vlan_tlv= b""
+    if version in ('C', 'R'):
+        # SNAP: AA AA 03 + OUI(00:00:0C) + PID(01:0B)
+        pvst_snap     = bytes.fromhex("aaaa03") + bytes.fromhex("00000c") + bytes.fromhex("010b")
+        vid           = int(vlan_id)
+        # PVST+ VLAN TLV: 0x0000 + VID(2B) + 0x00 = 5 bytes
+        pvst_vlan_tlv = bytes.fromhex("0000") + struct.pack("!H", vid) + bytes.fromhex("00")
 
-    fields = [
-        {"layer":3,"name":"BPDU Protocol ID","raw":proto_id,"user_val":"0x0000","note":"IEEE STP always 0"},
-        {"layer":3,"name":"BPDU Version",    "raw":ver_b,   "user_val":version,"note":"0=STP 2=RSTP 3=MSTP"},
-        {"layer":3,"name":"BPDU Type",       "raw":btype_b, "user_val":bpdu_type,"note":"00=Config 80=TCN 02=RSTP"},
-        {"layer":3,"name":"BPDU Flags",      "raw":flags_b, "user_val":flags,
-         "note":"bit0=TC bit1=Proposal bit2-3=Role bit4=Learn bit5=Fwd bit6=Agree bit7=TCA"},
-        {"layer":3,"name":"Root Bridge ID",  "raw":root_id, "user_val":f"prio={root_prio}+ext={root_sys_ext} mac={root_mac}",
-         "note":"8B priority+sysExt+MAC"},
-        {"layer":3,"name":"Root Path Cost",  "raw":cost_b,  "user_val":path_cost,"note":"0=this is root"},
-        {"layer":3,"name":"Bridge ID",       "raw":br_id,   "user_val":f"prio={br_prio}+ext={br_sys_ext} mac={br_mac}","note":"8B"},
-        {"layer":3,"name":"Port ID",         "raw":port_b,  "user_val":port_id,"note":"prio(8b)+portnum(8b)"},
-        {"layer":3,"name":"Message Age",     "raw":bpdu[27:29],"user_val":msg_age,"note":"÷256 = seconds"},
-        {"layer":3,"name":"Max Age",         "raw":bpdu[29:31],"user_val":max_age,"note":"÷256 = seconds"},
-        {"layer":3,"name":"Hello Time",      "raw":bpdu[31:33],"user_val":hello,"note":"÷256 = seconds"},
-        {"layer":3,"name":"Forward Delay",   "raw":bpdu[33:35],"user_val":fwd_delay,"note":"÷256 = seconds"},
-    ]
-    if version in ("2","R"):
-        fields.append({"layer":3,"name":"Version1 Length","raw":bpdu[35:37],"user_val":"0","note":"RSTP: 0"})
-    if version == "3" and mstp_extra:
-        fields.append({"layer":3,"name":"MST Config ID","raw":mstp_extra[:51],"user_val":mstp_name,"note":"51B MST region identifier"})
-        fields.append({"layer":3,"name":"MSTP Extra","raw":mstp_extra[51:],"user_val":f"{len(mstp_extra)-51}B","note":"CIST+MSTI records"})
+    # ── Field list for display ─────────────────────────────────────────────────
+    var_name = {"0":"IEEE 802.1D-1998 STP","2":"IEEE 802.1w RSTP","3":"IEEE 802.1s MSTP",
+                "C":"Cisco PVST+","R":"Cisco Rapid-PVST+"}.get(version,"STP")
+
+    if version == '0':
+        flag_note = "bit0=TC  bit7=TCA  (bits1-6 RESERVED in 802.1D-1998 — must be 0)"
+        bid_note  = "Priority(16b full) + MAC(48b)  [NO System-ID-Ext in 802.1D-1998]"
+    elif version in ('2', 'R'):
+        flag_note = "bit0=TC bit1=Proposal bit2-3=Role(01=Alt 10=Root 11=Desg) bit4=Learn bit5=Fwd bit6=Agree bit7=TCA"
+        bid_note  = "Priority(4b,×4096) + System-ID-Ext=0(12b) + MAC(48b)"
+    elif version == '3':
+        flag_note = "CIST: same 8 bits as RSTP"
+        bid_note  = "Priority(4b,×4096) + MSTI-ID(12b) + MAC(48b)"
+    else:  # PVST+
+        flag_note = "bit0=TC  bit7=TCA  (PVST+ = STP base, bits1-6 reserved)"
+        bid_note  = f"Priority(4b,×4096) + VLAN-ID={vlan_id}(12b) + MAC(48b)"
+
+    fields = []
     if pvst_snap:
-        fields.insert(0,{"layer":3,"name":"PVST+ SNAP HDR","raw":pvst_snap,"user_val":"AA:AA:03:00:00:0C:01:0B","note":"Cisco PVST SNAP"})
+        fields.append({"layer":3,"name":"PVST+ SNAP HDR","raw":pvst_snap,
+                        "user_val":"AA:AA:03:00:00:0C:01:0B","note":"Cisco PVST+ SNAP OUI+PID"})
+    fields += [
+        {"layer":3,"name":"Protocol ID",   "raw":proto_id, "user_val":"0x0000",  "note":"IEEE 802.1D always 0"},
+        {"layer":3,"name":"Version",        "raw":ver_b,    "user_val":version,   "note":var_name},
+        {"layer":3,"name":"BPDU Type",      "raw":btype_b,  "user_val":bpdu_type, "note":"00=Config 80=TCN 02=RST"},
+        {"layer":3,"name":"Flags",          "raw":flags_b,  "user_val":flags,     "note":flag_note},
+        {"layer":3,"name":"Root Bridge ID", "raw":root_id,  "user_val":f"prio={root_prio} mac={root_mac}", "note":bid_note},
+        {"layer":3,"name":"Root Path Cost", "raw":cost_b,   "user_val":path_cost, "note":"0=this bridge is root"},
+        {"layer":3,"name":"Bridge ID",      "raw":br_id,    "user_val":f"prio={br_prio} mac={br_mac}", "note":bid_note},
+        {"layer":3,"name":"Port ID",        "raw":port_b,   "user_val":port_id,
+         "note":"STP:Prio(8b)+Num(8b)  RSTP/MSTP/PVST+:Prio(4b,×16)+Num(12b)"},
+        {"layer":3,"name":"Message Age",    "raw":bpdu[27:29],"user_val":msg_age, "note":"÷256=seconds"},
+        {"layer":3,"name":"Max Age",        "raw":bpdu[29:31],"user_val":max_age, "note":"÷256=seconds"},
+        {"layer":3,"name":"Hello Time",     "raw":bpdu[31:33],"user_val":hello,   "note":"÷256=seconds"},
+        {"layer":3,"name":"Forward Delay",  "raw":bpdu[33:35],"user_val":fwd_delay,"note":"÷256=seconds"},
+    ]
+    if version in ('2','R'):
+        fields.append({"layer":3,"name":"Version1Length","raw":bpdu[35:36],"user_val":"0",
+                        "note":"RSTP §9.3.3: always 0x00"})
+    if version == '3' and mstp_extra:
+        offset = 36
+        fields.append({"layer":3,"name":"Version1Length","raw":bpdu[offset:offset+1],
+                        "user_val":"0","note":"0x00 per MSTP spec"})
+        fields.append({"layer":3,"name":"Version3Length","raw":bpdu[offset+1:offset+3],
+                        "user_val":str(len(mstp_extra)),"note":"bytes of MST extension"})
+        fields.append({"layer":3,"name":"MST Config ID","raw":mstp_extra[:51],
+                        "user_val":mstp_name,"note":"51B: Selector(1)+Name(32)+Rev(2)+Digest(16)"})
+        fields.append({"layer":3,"name":"CIST Int Cost","raw":mstp_extra[51:55],
+                        "user_val":"0","note":"internal path cost to CIST regional root"})
+        fields.append({"layer":3,"name":"CIST Bridge ID","raw":mstp_extra[55:63],
+                        "user_val":br_mac,"note":"this bridge ID for CIST within region"})
+        fields.append({"layer":3,"name":"CIST Rem Hops","raw":mstp_extra[63:64],
+                        "user_val":"20","note":"remaining hops in region (default MaxHops)"})
+        if len(mstp_extra) > 64:
+            msti_data = mstp_extra[64:]
+            n_msti = len(msti_data)//16
+            fields.append({"layer":3,"name":f"MSTI Records ({n_msti}×16B)",
+                            "raw":msti_data,"user_val":f"{n_msti} instances",
+                            "note":"Flags+RegRoot+IntCost+BridgePrio+PortPrio+Hops+Rsvd"})
     if pvst_vlan_tlv:
-        fields.append({"layer":3,"name":"PVST+ VLAN TLV","raw":pvst_vlan_tlv,"user_val":f"VLAN {vlan_id}","note":"5B VLAN tag"})
+        fields.append({"layer":3,"name":"PVST+ VLAN TLV","raw":pvst_vlan_tlv,
+                        "user_val":f"VLAN {vlan_id}",
+                        "note":"5B: 0x0000 + VID(2B) + 0x00  — Cisco PVST VLAN tag"})
     return pvst_snap + bpdu + pvst_vlan_tlv, fields
-
 
 def ask_l3_dtp():
     section("LAYER 3 — DTP  (Dynamic Trunking Protocol — Cisco Proprietary)")
