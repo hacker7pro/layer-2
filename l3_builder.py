@@ -1125,7 +1125,21 @@ SWITCH_L3_REGISTRY: dict[str, dict] = {
             127: dict(name="OrgSpec", l4="lldp_orgspec",usage="Optional — org-specific TLVs"),
             0: dict(name="End",       l4=None,          usage="Mandatory — end of LLDPDU"),
         },
-        fields={"TLV chain":"Type(7b)+Length(9b)+Value per TLV"},
+        fields={
+            "TLV Format":       "Each TLV: Type(7b)+Length(9b)+Value(0-511B)",
+            "ChassisID TLV":    "Type=1 Mandatory: SubType(1B)+ChassisID — SubType 4=MAC 5=NetworkAddr 7=Local",
+            "PortID TLV":       "Type=2 Mandatory: SubType(1B)+PortID — SubType 3=MAC 5=IfName 7=Local",
+            "TTL TLV":          "Type=3 Mandatory: Length=2 Seconds(2B) 0=remove neighbour from cache",
+            "PortDesc TLV":     "Type=4 Optional: port description string",
+            "SysName TLV":      "Type=5 Optional: fully qualified system name",
+            "SysDesc TLV":      "Type=6 Optional: system description",
+            "SysCap TLV":       "Type=7 Optional: SysCap(2B)+EnabledCap(2B) — bits: Bridge/Router/WAP/DOCSIS etc.",
+            "MgmtAddr TLV":     "Type=8 Optional: AddrLen(1B)+AddrSubType(1B)+MgmtAddr+IfSubType(1B)+IfNum(4B)+OIDLen(1B)+OID",
+            "OrgSpec TLV":      "Type=127 Optional: OUI(3B)+Subtype(1B)+InfoStr — IEEE 802.1/802.3/MED/PNO",
+            "End TLV":          "Type=0 Length=0 Mandatory last TLV",
+            "Order":            "Mandatory order: ChassisID → PortID → TTL → (optional TLVs) → End",
+            "CAUTION":          "ChassisID and PortID together uniquely identify LLDP neighbour — duplicate pair = misconfigured device",
+        },
         l4_key="tlv_type",
     ),
     "cfm": dict(
@@ -1175,22 +1189,38 @@ SWITCH_L3_REGISTRY: dict[str, dict] = {
         l4_key="macsec_type",
     ),
     "ptp": dict(
-        name="PTP (IEEE 1588 — 0x88F7)",
+        name="PTP (IEEE 1588-2019 — 0x88F7)",
         header_bytes=34,
-        type_field="messageType (4b) at offset 0",
+        type_field="messageType (4b) at bits [3:0] of first byte",
         type_map={
-            0: dict(name="Sync",           l4="ptp_msg",  usage="Master clock sync pulse"),
-            1: dict(name="Delay_Req",      l4="ptp_msg",  usage="Slave delay request"),
-            2: dict(name="Pdelay_Req",     l4="ptp_msg",  usage="Peer delay request"),
-            3: dict(name="Pdelay_Resp",    l4="ptp_msg",  usage="Peer delay response"),
-            8: dict(name="Follow_Up",      l4="ptp_msg",  usage="Two-step precise timestamp"),
-            9: dict(name="Delay_Resp",     l4="ptp_msg",  usage="Master delay response"),
-            11: dict(name="Announce",      l4="ptp_msg",  usage="Best Master Clock announcement"),
-            12: dict(name="Signaling",     l4="ptp_msg",  usage="Unicast negotiation"),
+            0:  dict(name="Sync",                    l4="ptp_msg", usage="Master clock sync pulse — two-step with Follow_Up"),
+            1:  dict(name="Delay_Req",               l4="ptp_msg", usage="Slave→Master delay measurement request"),
+            2:  dict(name="Pdelay_Req",              l4="ptp_msg", usage="Peer delay request — P2P delay mechanism"),
+            3:  dict(name="Pdelay_Resp",             l4="ptp_msg", usage="Peer delay response"),
+            8:  dict(name="Follow_Up",               l4="ptp_msg", usage="Two-step precise egress timestamp for Sync"),
+            9:  dict(name="Delay_Resp",              l4="ptp_msg", usage="Master→Slave delay response with corrected timestamp"),
+            10: dict(name="Pdelay_Resp_Follow_Up",  l4="ptp_msg", usage="Two-step precise timestamp for Pdelay_Resp"),
+            11: dict(name="Announce",               l4="ptp_msg", usage="Best Master Clock Algorithm (BMCA) announcement"),
+            12: dict(name="Signaling",              l4="ptp_msg", usage="Unicast negotiation — request/grant Sync/Announce rates"),
+            13: dict(name="Management",             l4="ptp_msg", usage="PTP management — clock config and status"),
         },
-        fields={"MsgType":"4b","Version":"4b","MsgLen":"2B","Domain":"1B","Flags":"2B",
-                "CorrectionField":"8B","ClockID":"8B","SourcePort":"2B","SeqID":"2B",
-                "LogInterval":"1B"},
+        fields={
+            "Msg Type":        "4b  messageType at bits[3:0] of byte0",
+            "Transport Spec":  "4b  bits[7:4] of byte0 — 0=IEEE 1588 1=ITU-T G.8265 4=IEEE 802.1AS",
+            "Version":         "4b  1=IEEE 1588-2008  2=IEEE 1588-2019 (PTPv2)",
+            "Message Length":  "2B  total PDU length in bytes",
+            "Domain Number":   "1B  clock domain 0-127 — separate sync domains on same network",
+            "Minor Version":   "1B  sub-version (0 for base IEEE 1588-2019)",
+            "Flags":           "2B  twoStepFlag(1b)+unicastFlag(1b)+PTPProfileSpecific(2b)+reserved(3b)+alternateMasterFlag(1b)+frequencyTraceable(1b)+timeTraceable(1b)+ptpTimescale(1b)+utcReasonable(1b)+leap59(1b)+leap61(1b)",
+            "CorrectionField": "8B  correction in nanoseconds×2^16 — added by transparent clocks",
+            "MessageTypeSpec": "4B  profile-specific or reserved",
+            "ClockIdentity":   "8B  EUI-64 of clock (usually OUI+port+MAC)",
+            "SourcePortID":    "2B  port number within clock",
+            "SequenceID":      "2B  matches Sync→Follow_Up; Pdelay_Req→Pdelay_Resp→Pdelay_Resp_FUP",
+            "ControlField":    "1B  0=Sync 1=Delay_Req 2=Follow_Up 3=Delay_Resp 4=Management 5=All-others",
+            "LogMsgInterval":  "1B  signed — log₂ of inter-message interval",
+            "OriginTimestamp": "10B  Sync/Delay_Req: 6B seconds + 4B nanoseconds",
+        },
         l4_key="msg_type",
     ),
     "mvrp": dict(
@@ -1836,9 +1866,714 @@ INDUSTRIAL_L3_REGISTRY: dict[str, dict] = {
 
 NON_IP_L3_REGISTRY.update(INDUSTRIAL_L3_REGISTRY)
 
+# ── Supplemental L3 Registry — fills all remaining spec gaps ──────────────────
+SUPPLEMENTAL_L3_REGISTRY: dict[str, dict] = {
+
+    # ── PPPoE L3 dispatcher (0x8863 Discovery + 0x8864 Session) ───────────────
+    "pppoe": dict(
+        name="PPPoE — Point-to-Point Protocol over Ethernet (RFC 2516)",
+        header_bytes=6,
+        type_field="CODE field (1B) at offset 1 — discovery stage; PPP Protocol (2B) for session",
+        type_map={
+            # Discovery stage (0x8863) CODE values
+            0x09: dict(name="PADI — Active Discovery Initiation",   l4="pppoe_padi",
+                       usage="Client broadcasts to find PPPoE Access Concentrators"),
+            0x07: dict(name="PADO — Active Discovery Offer",         l4="pppoe_pado",
+                       usage="AC unicasts offer with AC-Name and Service-Name tags"),
+            0x19: dict(name="PADR — Active Discovery Request",       l4="pppoe_padr",
+                       usage="Client unicasts to selected AC requesting session"),
+            0x65: dict(name="PADS — Active Discovery Session-confirmation", l4="pppoe_pads",
+                       usage="AC assigns Session-ID — session established"),
+            0xA7: dict(name="PADT — Active Discovery Terminate",     l4="pppoe_padt",
+                       usage="Either end terminates session — Session-ID in header"),
+            0x00: dict(name="Session Data",                           l4="pppoe_session",
+                       usage="0x8864 session stage — CODE=0x00, carries PPP protocol"),
+        },
+        fields={
+            "VER+TYPE": "1B  0x11 — version=1 (4b) + type=1 (4b), always 0x11",
+            "CODE":     "1B  0x09=PADI 0x07=PADO 0x19=PADR 0x65=PADS 0xA7=PADT 0x00=Session",
+            "Session-ID":"2B  0x0000 during discovery; assigned by AC in PADS",
+            "Length":   "2B  total length of payload (not including 6B PPPoE header)",
+            "Tags":     "variable  TLV tags: 0x0101=Service-Name 0x0102=AC-Name 0x0103=Host-Uniq 0x0104=AC-Cookie 0x0110=Relay-Session-ID 0x0201=Service-Name-Error 0x0202=AC-System-Error",
+        },
+        l4_key="pppoe_code",
+    ),
+
+    # ── PPPoE Session stage L3 — PPP Protocol dispatch ────────────────────────
+    "ppp_session": dict(
+        name="PPP Protocol Dispatch (PPPoE Session — RFC 1661)",
+        header_bytes=2,
+        type_field="PPP Protocol (2B) at start of PPP payload",
+        type_map={
+            0x0021: dict(name="IPv4",          l4="ppp_ipv4",    usage="IPv4 datagram"),
+            0x0057: dict(name="IPv6",          l4="ppp_ipv6",    usage="IPv6 datagram"),
+            0x0281: dict(name="MPLS-UC",       l4="ppp_mpls",    usage="MPLS unicast"),
+            0x0283: dict(name="MPLS-MC",       l4="ppp_mpls",    usage="MPLS multicast"),
+            0x8021: dict(name="IPCP",          l4="ppp_ncp",     usage="IP Control Protocol — negotiate IP addr/DNS"),
+            0x8057: dict(name="IPv6CP",        l4="ppp_ncp",     usage="IPv6 Control Protocol"),
+            0xC021: dict(name="LCP",           l4="ppp_lcp",     usage="Link Control Protocol — negotiate MTU/auth/MRU"),
+            0xC023: dict(name="PAP",           l4="ppp_auth",    usage="Password Authentication Protocol (cleartext)"),
+            0xC025: dict(name="LQR",           l4="ppp_lqr",     usage="Link Quality Report"),
+            0xC223: dict(name="CHAP",          l4="ppp_auth",    usage="Challenge Handshake Authentication Protocol"),
+        },
+        fields={
+            "PPP Protocol": "2B  identifies encapsulated protocol",
+            "PPP Data":     "variable  protocol-specific payload",
+        },
+        l4_key="ppp_protocol",
+    ),
+
+    # ── Proprietary / Vendor terminal L3 entries ──────────────────────────────
+    "ip_as": dict(
+        name="IP Autonomous Systems — RFC 1701 GRE key space",
+        header_bytes=8,
+        type_field="Fixed format — no sub-type dispatch",
+        type_map={0: dict(name="IP-AS Frame", l4="ip_as_frame", usage="AS-tagged IP datagram")},
+        fields={
+            "AS Number": "2B  16-bit Autonomous System number",
+            "Reserved":  "2B  0x0000",
+            "IP Payload":"variable  encapsulated IP datagram",
+        },
+        l4_key="ip_as_type",
+    ),
+
+    "secure_data": dict(
+        name="Secure Data — RFC 1701 GRE key space",
+        header_bytes=8,
+        type_field="Fixed format — no sub-type",
+        type_map={0: dict(name="Secure Data", l4="secure_data_frame", usage="Encrypted/secured payload")},
+        fields={
+            "Key":      "4B  GRE key (tunnel or VLAN context identifier)",
+            "Sequence": "4B  optional sequence number",
+            "Payload":  "variable  encrypted payload",
+        },
+        l4_key="secure_type",
+    ),
+
+    "cobranet": dict(
+        name="CobraNet — Cirrus Logic Audio-over-Ethernet",
+        header_bytes=4,
+        type_field="Sub-Type (varies)",
+        type_map={
+            0: dict(name="Beat (Real-time Audio)", l4="cobranet_audio",  usage="Real-time 48kHz audio bundle"),
+            1: dict(name="Bundle (Packed Audio)",  l4="cobranet_audio",  usage="Packed audio samples"),
+            2: dict(name="Management",             l4="cobranet_mgmt",   usage="Device management and config"),
+        },
+        fields={
+            "Sub-Type":  "1B  0=Beat 1=Bundle 2=Management",
+            "Bundle No": "2B  audio bundle number (0-65535)",
+            "Payload":   "variable  audio samples or management data",
+        },
+        l4_key="cobranet_subtype",
+    ),
+
+    "nic_test": dict(
+        name="Wind River Ethernet NIC Test",
+        header_bytes=4,
+        type_field="Test Type (1B) at offset 0",
+        type_map={
+            1: dict(name="Loopback Test", l4="nic_test_frame", usage="Ethernet loopback diagnostic"),
+            2: dict(name="Pattern Test",  l4="nic_test_frame", usage="Fill-pattern data integrity test"),
+        },
+        fields={
+            "Test Type": "1B  1=Loopback  2=Pattern",
+            "Pattern":   "1B  fill byte for pattern test",
+            "Length":    "2B  payload length",
+            "Data":      "variable  test payload",
+        },
+        l4_key="test_type",
+    ),
+
+    "axis_boot": dict(
+        name="Axis Communications Proprietary Bootstrap",
+        header_bytes=5,
+        type_field="Msg Type (1B) at offset 0",
+        type_map={
+            0x01: dict(name="Discovery",  l4="axis_frame", usage="Discover Axis devices on LAN"),
+            0x02: dict(name="IP Assign",  l4="axis_frame", usage="Assign IP to Axis device"),
+        },
+        fields={
+            "Msg Type":  "1B  0x01=Discovery  0x02=IPAssign",
+            "Serial":    "8B  Axis device serial number",
+            "Current IP":"4B  current device IPv4 address",
+            "New IP":    "4B  new IPv4 address to assign",
+            "Subnet":    "4B  subnet mask",
+        },
+        l4_key="axis_type",
+    ),
+
+    "homeplug": dict(
+        name="HomePlug 1.0 MME — HomePlug Alliance",
+        header_bytes=2,
+        type_field="MMType (2B) at offset 0",
+        type_map={
+            0x0000: dict(name="MME-Request",   l4="homeplug_mme", usage="Management request"),
+            0x0001: dict(name="MME-Confirm",   l4="homeplug_mme", usage="Management confirm"),
+            0x0002: dict(name="MME-Indicate",  l4="homeplug_mme", usage="Management indication"),
+            0x0003: dict(name="MME-Response",  l4="homeplug_mme", usage="Management response"),
+        },
+        fields={
+            "MMType":   "2B  management message type code",
+            "MME Data": "variable  management payload",
+        },
+        l4_key="homeplug_mmtype",
+    ),
+
+    "homeplug_av": dict(
+        name="HomePlug AV / Green PHY — IEEE P1901",
+        header_bytes=4,
+        type_field="MMType (2B) at offset 0",
+        type_map={
+            0x6000: dict(name="CM_MME_Request",  l4="homeplug_av_mme", usage="AV management request"),
+            0x6001: dict(name="CM_MME_Confirm",  l4="homeplug_av_mme", usage="AV management confirm"),
+            0x6002: dict(name="CM_MME_Indicate", l4="homeplug_av_mme", usage="AV management indicate"),
+            0x6003: dict(name="CM_MME_Response", l4="homeplug_av_mme", usage="AV management response"),
+            0xA000: dict(name="Vendor-Specific",  l4="homeplug_av_mme", usage="Vendor-specific AV extension"),
+        },
+        fields={
+            "MMType":  "2B  management message type; 0xA000-0xAFFF=vendor specific",
+            "FMI":     "2B  FMI(4b)+FMSN(4b)+FMID(8b) fragmentation/sequence",
+            "MMENTRY": "variable  AV management payload",
+        },
+        l4_key="homeplug_av_mmtype",
+    ),
+
+    "homeplug_av2": dict(
+        name="HomePlug AV2 — IEEE P1901.2",
+        header_bytes=4,
+        type_field="MMType (2B) at offset 0",
+        type_map={
+            0x6000: dict(name="CM_MME_Request",  l4="homeplug_av2_mme", usage="AV2 management request"),
+            0x6001: dict(name="CM_MME_Confirm",  l4="homeplug_av2_mme", usage="AV2 management confirm"),
+            0xA000: dict(name="Vendor-Specific",  l4="homeplug_av2_mme", usage="Vendor AV2 extension"),
+        },
+        fields={
+            "MMType":   "2B  AV2 management message type code",
+            "FMI":      "2B  fragmentation/sequence info",
+            "MMENTRY":  "variable  AV2 capabilities/beacons/link-stats payload",
+        },
+        l4_key="homeplug_av2_mmtype",
+    ),
+
+    "cclink_ie": dict(
+        name="CC-Link IE Field/Controller — CLPA",
+        header_bytes=5,
+        type_field="CC-Link IE Type (1B) at offset 0",
+        type_map={
+            0x01: dict(name="Field",       l4="cclink_ie_pdu", usage="CC-Link IE Field cyclic data"),
+            0x02: dict(name="Controller",  l4="cclink_ie_pdu", usage="CC-Link IE Controller"),
+            0x03: dict(name="Motion",      l4="cclink_ie_pdu", usage="CC-Link IE Motion synchronous"),
+            0x04: dict(name="TSN",         l4="cclink_ie_pdu", usage="CC-Link IE TSN (Time-Sensitive Networking)"),
+        },
+        fields={
+            "CC-Link IE Type":"1B  0x01=Field 0x02=Controller 0x03=Motion 0x04=TSN",
+            "Station No":     "1B  source station number (0-120; 0=master)",
+            "Dst Station":    "1B  destination station (0xFF=broadcast)",
+            "Seq No":         "2B  sequence number for token-passing ring",
+            "PDU":            "variable  cyclic RX/TX data or transient message",
+            "Token Ring":     "Master passes token; only token holder may transmit",
+        },
+        l4_key="cclink_type",
+    ),
+
+    "local_exp": dict(
+        name="IEEE 802 Local Experimental (RFC 9542 §3)",
+        header_bytes=0,
+        type_field="No standard type field — format defined by local agreement",
+        type_map={
+            0: dict(name="Experimental Protocol", l4="local_exp_payload",
+                    usage="User-defined experimental payload"),
+        },
+        fields={
+            "Payload":  "variable  format defined locally — not standardised",
+            "Scope":    "MUST NOT be forwarded beyond local network segment",
+            "Use":      "Protocol prototyping before requesting IANA/IEEE EtherType assignment",
+        },
+        l4_key="exp_type",
+    ),
+}
+
+NON_IP_L3_REGISTRY.update(SUPPLEMENTAL_L3_REGISTRY)
+
+# ── Extended L3 Registry — additional protocols per IEEE/IANA/RFC/Non-Std ──────
+EXTENDED_L3_REGISTRY: dict[str, dict] = {
+
+    # ── IEEE 802.1D / 802.1w / 802.1s STP BPDU dispatcher ────────────────────
+    "stp": dict(
+        name="IEEE STP/RSTP/MSTP BPDU — IEEE 802.1D/802.1w/802.1s",
+        status="IEEE Standard",
+        description="Spanning Tree Protocol family — prevents L2 loops by electing "
+                    "a root bridge and blocking redundant paths. Version 0=Classic STP "
+                    "(30-50s convergence), 2=RSTP (<1s), 3=MSTP (multiple instances).",
+        header_bytes=4,
+        type_field="BPDU Type (1B) at offset 3, combined with Version (1B) at offset 2",
+        type_map={
+            # (bpdu_type, version) encoded as composite key
+            0x00: dict(name="STP Config BPDU (v0)",    l4="stp_config",
+                       usage="IEEE 802.1D-1998 Configuration BPDU — version=0x00 type=0x00"),
+            0x80: dict(name="TCN BPDU (v0)",           l4="stp_tcn",
+                       usage="Topology Change Notification — minimal 4B frame, sent toward root"),
+            0x02: dict(name="RST BPDU (v2 RSTP)",      l4="rstp_bpdu",
+                       usage="IEEE 802.1w RST BPDU — version=0x02 type=0x02, full 8-flag byte"),
+            0x03: dict(name="MST BPDU (v3 MSTP)",      l4="mstp_bpdu",
+                       usage="IEEE 802.1s MST BPDU — version=0x03, includes MST Config ID + MSTI records"),
+        },
+        fields={
+            "Protocol ID":     "2B  0x0000 — IEEE STP always zero",
+            "Version":         "1B  0x00=STP(802.1D-1998) 0x02=RSTP(802.1w) 0x03=MSTP(802.1s)",
+            "BPDU Type":       "1B  0x00=Config 0x80=TCN 0x02=RST/MST",
+            "Flags":           "1B  STP: bit0=TC bit7=TCA (bits1-6 RESERVED=0) | RSTP/MSTP: all 8 bits active",
+            "Root Bridge ID":  "8B  Priority(4b)+SysExt(12b)+MAC(48b) — STP uses full 16b priority",
+            "Root Path Cost":  "4B  cost from sender to root — 0 means sender IS root",
+            "Bridge ID":       "8B  sender's bridge identifier",
+            "Port ID":         "2B  STP:Prio(8b)+Num(8b) RSTP/MSTP:Prio(4b,×16)+Num(12b)",
+            "Message Age":     "2B  1/256-second units; hops from root; discarded when ≥ Max Age",
+            "Max Age":         "2B  default 20s (5120 units); topology recalc if BPDU not received",
+            "Hello Time":      "2B  default 2s (512 units); root BPDU interval",
+            "Forward Delay":   "2B  default 15s (3840); Listening+Learning time (STP only)",
+            "Version1Length":  "1B  RSTP/MSTP only — always 0x00",
+            "CAUTION":         "STP bridge priority MUST be multiples of 4096 for RSTP/MSTP (not STP 802.1D-1998); System-ID-Extension = 0 for RSTP, MSTI-number for MSTP, VLAN-ID for PVST+",
+        },
+        l4_key="bpdu_type",
+    ),
+
+    # ── XTP — Xpress Transfer Protocol (ANSI X3T9.5) ─────────────────────────
+    "xtp": dict(
+        name="XTP — Xpress Transfer Protocol (ANSI X3T9.5 / EtherType 0x817D)",
+        status="ANSI / Non-Standard (obsolete)",
+        description="XTP is a high-performance transport protocol designed as a "
+                    "TCP replacement for high-speed LANs. Designed by Protocol Engines "
+                    "Inc., it supports unicast, multicast, and real-time transfer. "
+                    "Never achieved widespread adoption; effectively obsolete.",
+        header_bytes=12,
+        type_field="DKEY (2B) at offset 8 — destination endpoint key",
+        type_map={
+            0: dict(name="Data Segment",      l4="xtp_data",   usage="XTP data transfer segment"),
+            1: dict(name="Control Segment",   l4="xtp_ctrl",   usage="XTP control — flow/error control"),
+            2: dict(name="Error Segment",     l4="xtp_err",    usage="XTP error report"),
+            3: dict(name="Async Control",     l4="xtp_ctrl",   usage="Asynchronous control message"),
+        },
+        fields={
+            "Key":      "4B  0=reserved; identifies XTP session at receiver",
+            "EOM":      "1b  end-of-message flag",
+            "MULTI":    "1b  multicast flag",
+            "RES":      "6b  reserved",
+            "TYPE":     "1B  0=Data 1=Control 2=Error 3=Async-Control",
+            "DKEY":     "4B  destination key — receiver demultiplex",
+            "SKEY":     "4B  source key",
+            "SEQ":      "4B  32-bit sequence number",
+            "CAUTION":  "XTP is obsolete — ANSI X3T9.5 withdrawn; not deployed in modern networks; documented for legacy analysis only",
+        },
+        l4_key="xtp_type",
+    ),
+
+    # ── MPLS inner payload dispatch ────────────────────────────────────────────
+    "mpls_inner": dict(
+        name="MPLS Inner Payload Dispatch — RFC 3032 bottom-of-stack",
+        status="IETF Standard — RFC 3032 + RFC 4182 + RFC 4928",
+        description="After all MPLS labels are popped (S=1 bottom-of-stack), the "
+                    "payload type is identified by the first nibble of the inner "
+                    "payload (IP version nibble) or by explicit NULL label. This is "
+                    "the MPLS 'implicit null' / 'explicit null' dispatch mechanism.",
+        header_bytes=0,
+        type_field="First nibble of payload (IP version) or explicit null label value",
+        type_map={
+            4:  dict(name="IPv4 payload",         l4="ipv4_inner",   usage="Inner IPv4 datagram — first nibble 0x4"),
+            6:  dict(name="IPv6 payload",         l4="ipv6_inner",   usage="Inner IPv6 datagram — first nibble 0x6"),
+            0:  dict(name="Explicit-NULL IPv4",   l4="ipv4_inner",   usage="Label 0 — IPv4 explicit null, penultimate hop pop"),
+            2:  dict(name="Explicit-NULL IPv6",   l4="ipv6_inner",   usage="Label 2 — IPv6 explicit null"),
+            3:  dict(name="Implicit-NULL (PHP)",  l4="ipv4_inner",   usage="Label 3 — PHP, payload exposed to penultimate LSR"),
+            14: dict(name="OAM Alert Label",      l4="mpls_inner",   usage="Label 14 — MPLS OAM alert per RFC 3429"),
+            15: dict(name="Extension Label (XL)", l4="mpls_inner",   usage="Label 15 — Extension Label base per RFC 7274"),
+        },
+        fields={
+            "Bottom-of-Stack": "S=1 bit in last MPLS label indicates payload follows",
+            "Version nibble":  "first 4 bits of payload: 4=IPv4 6=IPv6 (implicit type detection)",
+            "Explicit NULL":   "Label 0 (IPv4) or Label 2 (IPv6) — preserve EXP/TC bits to egress",
+            "PHP":             "Label 3 — Penultimate Hop Popping; last label popped before egress",
+            "CAUTION":         "MPLS does not carry explicit EtherType — payload identified by IP version nibble; incorrect S-bit causes wrong decode; TTL must be handled carefully at PHP",
+        },
+        l4_key="mpls_payload_type",
+    ),
+
+    # ── Additional complete L3 protocols ──────────────────────────────────────
+
+    # DECnet Phase IV / V (0x6003, 0x8038, 0x803D) — Digital Equipment Corp
+    "decnet_phase5": dict(
+        name="DECnet Phase V / DNA (Digital Network Architecture) — Digital Equipment",
+        status="Vendor Proprietary (Digital Equipment Corporation) — Legacy",
+        description="DECnet Phase V (also called DECnet/OSI or DNA Phase V) extended "
+                    "DECnet to support the OSI protocol stack. Used in VAX/VMS clusters "
+                    "and Digital's commercial networking products. Superseded by TCP/IP.",
+        header_bytes=3,
+        type_field="DNA Type (1B) at offset 2",
+        type_map={
+            0x01: dict(name="DNA Routing",      l4="decnet_routing",  usage="DNA routing message"),
+            0x02: dict(name="DNA Hello",        l4="decnet_hello",    usage="Router hello for adjacency"),
+            0x03: dict(name="DNA End-Node Hello",l4="decnet_hello",   usage="End-node hello"),
+            0x05: dict(name="DNA Level-1 LSP",  l4="decnet_lsp",      usage="Level-1 link state PDU"),
+            0x06: dict(name="DNA Level-2 LSP",  l4="decnet_lsp",      usage="Level-2 link state PDU"),
+        },
+        fields={
+            "DSAP":    "1B  0xFE — ISO CONS/CLNS SAP",
+            "SSAP":    "1B  0xFE",
+            "Control": "1B  0x03 LLC UI frame",
+            "DNA Type":"1B  routing message type",
+            "Hop Count":"1B  decremented per router; max 63 (6b field)",
+            "CAUTION": "DECnet Phase V obsolete since mid-1990s — encountered only on legacy DEC/Compaq networks",
+        },
+        l4_key="dna_type",
+    ),
+
+    # Banyan VINES (0x0BAD) — Banyan Systems
+    "vines_ip": dict(
+        name="Banyan VINES IP — Banyan Systems (EtherType 0x0BAD)",
+        status="Vendor Proprietary (Banyan Systems) — Legacy",
+        description="VINES (Virtual Integrated Network Service) was Banyan Systems' "
+                    "proprietary enterprise networking protocol suite, popular in the "
+                    "late 1980s-1990s for large enterprise networks. Superseded by TCP/IP.",
+        header_bytes=18,
+        type_field="Protocol (2B) at offset 8",
+        type_map={
+            0xBA: dict(name="VINES ICP",   l4="vines_ctrl",  usage="VINES Internet Control Protocol"),
+            0xBB: dict(name="VINES ARP",   l4="vines_ctrl",  usage="VINES Address Resolution"),
+            0xBC: dict(name="VINES RTP",   l4="vines_rtp",   usage="VINES Routing Table Protocol"),
+            0xBD: dict(name="VINES IPC",   l4="vines_data",  usage="VINES Inter-Process Communication"),
+            0xBE: dict(name="VINES SPP",   l4="vines_data",  usage="VINES Sequenced Packet Protocol"),
+        },
+        fields={
+            "Checksum":     "2B  ones-complement over VINES IP header",
+            "Packet Length":"2B  total VINES IP packet length",
+            "Transport Ctrl":"1B  hop count and class of service",
+            "Protocol Type":"1B  0xBA=ICP 0xBB=ARP 0xBC=RTP 0xBD=IPC 0xBE=SPP",
+            "Dest Net":     "4B  destination VINES network number",
+            "Dest Subnet":  "2B  destination subnet (host) ID",
+            "Src Net":      "4B  source VINES network number",
+            "Src Subnet":   "2B  source subnet ID",
+            "CAUTION":      "VINES completely obsolete — Banyan Systems dissolved in 1999; documented for legacy traffic analysis only",
+        },
+        l4_key="vines_protocol",
+    ),
+
+    # AppleTalk DDP extended (0x809B) — Apple Computer
+    "ddp_ext": dict(
+        name="AppleTalk DDP Extended — Apple Computer (EtherType 0x809B)",
+        status="Vendor / IEEE — Legacy (Apple deprecated 2009)",
+        description="AppleTalk Datagram Delivery Protocol extended (long header form). "
+                    "Used in pre-2009 Apple networks. Short-header DDP is encapsulated "
+                    "in 802.2 LLC/SNAP. macOS 10.6 removed AppleTalk support entirely.",
+        header_bytes=13,
+        type_field="DDP Type (1B) at offset 12",
+        type_map={
+            1:  dict(name="RTMP Data",      l4="ddp_rtmp",   usage="Routing Table Maintenance Protocol data"),
+            2:  dict(name="NBP",            l4="ddp_nbp",    usage="Name Binding Protocol — AppleTalk name resolution"),
+            3:  dict(name="ATP",            l4="ddp_atp",    usage="AppleTalk Transaction Protocol"),
+            4:  dict(name="AEP",            l4="aep",        usage="AppleTalk Echo Protocol"),
+            5:  dict(name="RTMP Request",   l4="ddp_rtmp",   usage="RTMP routing request"),
+            6:  dict(name="ZIP",            l4="ddp_zip",    usage="Zone Information Protocol"),
+            8:  dict(name="SNMP",           l4="snmp",       usage="SNMP over AppleTalk"),
+            22: dict(name="ASP",            l4="ddp_asp",    usage="AppleTalk Session Protocol — AFP over ASP"),
+            35: dict(name="AFP/DSP",        l4="ddp_asp",    usage="AppleTalk Filing Protocol"),
+        },
+        fields={
+            "Length":    "10b  datagram length (headers + data)",
+            "Checksum":  "2B  0x0000 = no checksum (DDP never checksums in practice)",
+            "Dest Net":  "2B  destination AppleTalk network number",
+            "Src Net":   "2B  source network number",
+            "Dest Node": "1B  destination node ID (0xFF=broadcast)",
+            "Src Node":  "1B  source node ID",
+            "Dest Socket":"1B  destination socket number",
+            "Src Socket":"1B  source socket number",
+            "DDP Type":  "1B  protocol type",
+            "CAUTION":   "AppleTalk removed in macOS 10.6 (2009) — only encountered on pre-2009 Mac networks or legacy print servers",
+        },
+        l4_key="ddp_type",
+    ),
+
+    # AARP — AppleTalk ARP (0x80F3)
+    "aarp": dict(
+        name="AARP — AppleTalk Address Resolution Protocol (EtherType 0x80F3)",
+        status="Vendor — Legacy (Apple deprecated 2009)",
+        description="AARP maps AppleTalk node addresses to hardware (MAC) addresses, "
+                    "analogous to ARP for IPv4. Also handles AppleTalk address "
+                    "self-assignment via probe/request/response mechanism.",
+        header_bytes=28,
+        type_field="Function (2B) at offset 10",
+        type_map={
+            1: dict(name="AARP Request",  l4="aarp_pdu", usage="Request: who has this AppleTalk address?"),
+            2: dict(name="AARP Response", l4="aarp_pdu", usage="Response: I have this AppleTalk address"),
+            3: dict(name="AARP Probe",    l4="aarp_pdu", usage="Probe for address self-assignment conflict detection"),
+        },
+        fields={
+            "HW Type":   "2B  hardware type: 1=Ethernet",
+            "Proto Type":"2B  0x809B=AppleTalk",
+            "HW Len":    "1B  6 (MAC address length)",
+            "Proto Len": "1B  4 (AppleTalk address = network(2B)+node(1B)+socket(1B))",
+            "Function":  "2B  1=Request 2=Response 3=Probe",
+            "Src HW":    "6B  sender MAC address",
+            "Src Proto": "4B  sender AppleTalk address",
+            "Dst HW":    "6B  target MAC (zeros in request)",
+            "Dst Proto": "4B  target AppleTalk address",
+        },
+        l4_key="aarp_function",
+    ),
+
+    # IPX — Novell (0x8137)
+    "ipx": dict(
+        name="Novell IPX — Internetwork Packet Exchange (EtherType 0x8137/0x8138)",
+        status="Vendor (Novell) — Legacy",
+        description="IPX is Novell's connectionless network layer protocol, derived from "
+                    "Xerox XNS. Used in NetWare networks for file/print sharing. "
+                    "Completely superseded by TCP/IP; Novell deprecated IPX in 2000.",
+        header_bytes=30,
+        type_field="Packet Type (1B) at offset 5",
+        type_map={
+            0:  dict(name="Unknown/Raw",  l4="raw_ipx",       usage="Raw IPX datagram"),
+            1:  dict(name="RIP",          l4="ipx_rip",       usage="IPX Routing Information Protocol"),
+            2:  dict(name="Echo",         l4="raw_ipx",       usage="IPX echo (ping)"),
+            3:  dict(name="Error",        l4="raw_ipx",       usage="IPX error packet"),
+            4:  dict(name="PEX",          l4="raw_ipx",       usage="Packet Exchange Protocol"),
+            5:  dict(name="SPX",          l4="ipx_spx",       usage="Sequenced Packet Exchange — reliable stream"),
+            17: dict(name="NCP",          l4="ipx_ncp",       usage="NetWare Core Protocol — file/print services"),
+            20: dict(name="NetBIOS",      l4="netbios_ipx",   usage="NetBIOS type-20 broadcast propagation"),
+        },
+        fields={
+            "Checksum":    "2B  0xFFFF=no checksum (IPX never uses checksum in practice)",
+            "Length":      "2B  total IPX packet length (header + data)",
+            "Hop Count":   "1B  router hops (max 15; 16=unreachable); incremented per router",
+            "Packet Type": "1B  service type dispatch",
+            "Dest Network":"4B  destination IPX network (0x00000000=local)",
+            "Dest Node":   "6B  destination MAC address",
+            "Dest Socket": "2B  0x0451=NCP 0x0452=SAP 0x0453=RIP 0x0455=NetBIOS 0x0456=Diagnostics",
+            "Src Network": "4B  source network",
+            "Src Node":    "6B  source MAC",
+            "Src Socket":  "2B  source socket",
+            "CAUTION":     "IPX SAP broadcasts every 60s — flood networks at scale; IPX RIP uses hop count not bandwidth; disable on all modern networks",
+        },
+        l4_key="packet_type",
+    ),
+
+    # XNS IDP — Xerox (0x0600)
+    "xns": dict(
+        name="XNS IDP — Xerox Network Systems (EtherType 0x0600)",
+        status="Vendor (Xerox) — Legacy (predecessor to IPX/UDP)",
+        description="XNS (Xerox Network Systems) was developed at Xerox PARC in the "
+                    "1970s-80s. IDP (Internetwork Datagram Protocol) is its network layer, "
+                    "the direct ancestor of Novell IPX and influenced UDP/IP design.",
+        header_bytes=30,
+        type_field="Transport Type (1B) at offset 4",
+        type_map={
+            0:  dict(name="RIP",    l4="raw_idp",   usage="XNS Routing Information Protocol"),
+            1:  dict(name="Echo",   l4="xns_echo",  usage="XNS Echo Protocol"),
+            2:  dict(name="Error",  l4="raw_idp",   usage="XNS Error Protocol"),
+            4:  dict(name="PEX",    l4="raw_idp",   usage="Packet Exchange Protocol"),
+            5:  dict(name="SPP",    l4="raw_idp",   usage="Sequenced Packet Protocol"),
+            12: dict(name="NetBIOS",l4="netbios",   usage="NetBIOS over XNS"),
+        },
+        fields={
+            "Checksum":    "2B  IDP checksum; 0xFFFF=no checksum",
+            "Length":      "2B  total IDP packet length including 30B header",
+            "Transport":   "1B  packet type",
+            "Hop Count":   "1B  router hops (max 15)",
+            "Dest Net":    "4B  destination XNS network number",
+            "Dest Host":   "6B  destination 48-bit host address",
+            "Dest Socket": "2B  destination socket",
+            "Src Net":     "4B  source network",
+            "Src Host":    "6B  source host",
+            "Src Socket":  "2B  source socket",
+            "CAUTION":     "XNS entirely obsolete — only found in museum networks and archived Xerox equipment",
+        },
+        l4_key="xns_transport",
+    ),
+
+    # PUP — Xerox PARC Universal Packet (0x0200)
+    "pup_l3": dict(
+        name="PUP — PARC Universal Packet — Xerox PARC (EtherType 0x0200)",
+        status="Vendor (Xerox PARC) — Historical (1970s precursor to UDP/IP)",
+        description="PUP was the original internetwork datagram protocol developed at "
+                    "Xerox PARC by Bob Metcalfe and others circa 1974, predating UDP/IP. "
+                    "It introduced many concepts later used in TCP/IP including socket "
+                    "addressing and packet-switched internetworking.",
+        header_bytes=20,
+        type_field="PUP Type (1B) at offset 3",
+        type_map={
+            0:  dict(name="Basic PUP",     l4="raw_idp",   usage="Basic PUP datagram"),
+            12: dict(name="PUP Echo",      l4="pup_echo",  usage="PUP echo request/reply"),
+            13: dict(name="PUP Echo Reply",l4="pup_echo",  usage="PUP echo reply"),
+        },
+        fields={
+            "Length":      "2B  total PUP packet length",
+            "Transport":   "1B  hop count + checksum control",
+            "PUP Type":    "1B  protocol type",
+            "PUP ID":      "4B  transaction ID (sequence + timestamp)",
+            "Dest Port":   "10B  dest PUP address: network(4B)+host(6B) (no socket in PUP)",
+            "Src Port":    "10B  source PUP address",
+            "CAUTION":     "PUP entirely obsolete — only in historical documentation and very old Xerox research equipment",
+        },
+        l4_key="pup_type",
+    ),
+
+    # GRE inner payload dispatch — RFC 2784 / RFC 2890
+    "gre_dispatch": dict(
+        name="GRE Inner Payload Dispatch — RFC 2784 / RFC 2890",
+        status="IETF Standard — RFC 2784 (base), RFC 2890 (key/seq extensions)",
+        description="GRE (Generic Routing Encapsulation) carries arbitrary network "
+                    "layer payloads identified by the Protocol Type field (same as "
+                    "EtherType). RFC 2784 is the canonical GRE spec; RFC 1701 is the "
+                    "older version with more options. Used in VPNs and tunnelling.",
+        header_bytes=4,
+        type_field="Protocol Type (2B) at offset 2 — same values as EtherType",
+        type_map={
+            0x0800: dict(name="IPv4",          l4="ipv4_inner",   usage="IPv4 payload over GRE tunnel"),
+            0x86DD: dict(name="IPv6",          l4="ipv6_inner",   usage="IPv6 payload"),
+            0x6558: dict(name="Transparent Eth",l4="gre_eth_inner",usage="Transparent Ethernet Bridging — RFC 1701"),
+            0x8847: dict(name="MPLS-UC",        l4="mpls_inner",   usage="MPLS unicast label stack in GRE"),
+            0x8848: dict(name="MPLS-MC",        l4="mpls_inner",   usage="MPLS multicast in GRE"),
+            0x88BE: dict(name="ERSPAN-II",      l4="erspan_pdu",   usage="Cisco ERSPAN Type II — mirrored traffic"),
+            0x22EB: dict(name="ERSPAN-III",     l4="erspan_pdu",   usage="Cisco ERSPAN Type III"),
+            0x9000: dict(name="Loopback",       l4="loopback_test",usage="GRE loopback / config test"),
+        },
+        fields={
+            "Flags":          "1B  C(1b)+R(1b)+K(1b)+S(1b)+s(1b)+Recur(3b) — C=Checksum K=Key S=Sequence",
+            "Version":        "3b  0 for RFC 2784; 1 for PPTP (RFC 2637)",
+            "Protocol Type":  "2B  EtherType of inner payload",
+            "Checksum":       "optional 2B — only present if C bit set; covers GRE header + payload",
+            "Reserved":       "optional 2B — present with Checksum",
+            "Key":            "optional 4B — present if K bit set; identifies GRE tunnel",
+            "Sequence No":    "optional 4B — present if S bit set; for in-order delivery",
+            "CAUTION":        "GRE has no authentication; use IPsec over GRE (GRE+ESP) for secure tunnels; K bit key is NOT encryption; IP fragmentation applies to outer IP not inner",
+        },
+        l4_key="gre_protocol",
+    ),
+
+    # SNAP inner payload (OUI-extended EtherType dispatch)
+    "snap": dict(
+        name="IEEE 802.2 LLC/SNAP — Sub-Network Access Protocol (IEEE 802.2)",
+        status="IEEE Standard — IEEE 802.2 / RFC 1042",
+        description="SNAP extends 802.2 LLC by prepending a 5-byte SNAP header "
+                    "(3B OUI + 2B PID) after the DSAP/SSAP=0xAA/0x03 bytes. "
+                    "This allows arbitrary EtherType-like dispatch within 802 frames. "
+                    "Used by Cisco CDP/VTP/DTP, AppleTalk, Token Ring, and 802.11.",
+        header_bytes=8,
+        type_field="OUI(3B)+PID(2B) at offset 3 — OUI=0x000000 uses PID as EtherType",
+        type_map={
+            0x000000_0800: dict(name="IPv4 via SNAP",    l4="ipv4_inner",   usage="IPv4 in 802.2 SNAP frame — RFC 1042"),
+            0x000000_0806: dict(name="ARP via SNAP",     l4="arp_inner",    usage="ARP in SNAP"),
+            0x000000_86DD: dict(name="IPv6 via SNAP",    l4="ipv6_inner",   usage="IPv6 in SNAP"),
+            0x00000C_2000: dict(name="CDP",              l4="cdp_tlv",      usage="Cisco Discovery Protocol"),
+            0x00000C_2003: dict(name="VTP",              l4="vtp_pdu",      usage="VLAN Trunking Protocol"),
+            0x00000C_2004: dict(name="DTP",              l4="dtp_pdu",      usage="Dynamic Trunking Protocol"),
+            0x00000C_010B: dict(name="PVST+",            l4="stp_config",   usage="Cisco Per-VLAN Spanning Tree+"),
+            0x000000_809B: dict(name="AppleTalk",        l4="ddp_asp",      usage="AppleTalk DDP via SNAP"),
+        },
+        fields={
+            "DSAP":   "1B  0xAA — SNAP SAP",
+            "SSAP":   "1B  0xAA — SNAP SAP",
+            "Control":"1B  0x03 — LLC UI (Unnumbered Information)",
+            "OUI":    "3B  Organisation Unique Identifier; 0x000000=IANA/standard",
+            "PID":    "2B  Protocol ID; when OUI=0x000000, PID = EtherType",
+            "CAUTION":"SNAP framing differs from Ethernet II — same payload protocols but different encapsulation; bridges must handle both; maximum payload = MTU - 8B SNAP overhead",
+        },
+        l4_key="snap_oui_pid",
+    ),
+
+    # IEEE 802.11 WiFi control (via TDLS EtherType 0x890D — extended)
+    "wifi_ctrl": dict(
+        name="IEEE 802.11 WiFi Direct / Tunnelled Control Frames",
+        status="IEEE Standard — IEEE 802.11-2020",
+        description="Wired-side tunnelling of IEEE 802.11 control and management "
+                    "frames used in Wi-Fi tunnelling scenarios including 802.11r FBT, "
+                    "802.11z TDLS, and 802.11v BSS Transition management.",
+        header_bytes=2,
+        type_field="Frame Control (2B) at offset 0 — 802.11 frame type/subtype",
+        type_map={
+            0x00D0: dict(name="Action Frame",        l4="tdls_setup",   usage="802.11 Action — TDLS/FBT/BSS-TM"),
+            0x0040: dict(name="Probe Request",       l4="tdls_setup",   usage="Tunnelled probe request"),
+            0x0050: dict(name="Probe Response",      l4="tdls_setup",   usage="Tunnelled probe response"),
+            0x0020: dict(name="Reassociation Req",   l4="fbt_action",   usage="FBT fast reassociation"),
+        },
+        fields={
+            "Frame Control": "2B  Protocol Ver(2b)+Type(2b)+Subtype(4b)+ToDS+FromDS+MF+Retry+PwrMgmt+MoreData+Protected+Order",
+            "Duration":      "2B  NAV duration in µs",
+            "Addr1":         "6B  receiver address",
+            "Addr2":         "6B  transmitter address",
+            "Addr3":         "6B  BSSID or other address",
+            "Seq Control":   "2B  Fragment Number(4b) + Sequence Number(12b)",
+            "CAUTION":       "Tunnelled 802.11 frames require AP cooperation; TDLS must be enabled in AP policy; incorrect frame tunnelling can trigger deauthentication",
+        },
+        l4_key="frame_control",
+    ),
+
+    # Slow Protocols extension — LACP details (already in slow_proto but needs sub-dispatch detail)
+    "lacp_ext": dict(
+        name="LACP Extended — IEEE 802.3-2022 Clause 43 / 802.1AX",
+        status="IEEE Standard — IEEE 802.3 Clause 43 / IEEE 802.1AX-2014",
+        description="LACP (Link Aggregation Control Protocol) negotiates LAG (Link "
+                    "Aggregation Group) formation between two devices. IEEE 802.1AX "
+                    "renames 802.3ad and adds DRNI (Distributed Resilient Network "
+                    "Interconnect) for multi-chassis LAG.",
+        header_bytes=110,
+        type_field="Actor TLV Type (1B) at offset 2 — 0x01=Actor 0x02=Partner 0x03=Collector",
+        type_map={
+            0x01: dict(name="Actor Info",    l4="lacp_actor_partner", usage="Sending port's LACP parameters"),
+            0x02: dict(name="Partner Info",  l4="lacp_actor_partner", usage="Received partner's LACP parameters"),
+            0x03: dict(name="Collector Info",l4="lacp_actor_partner", usage="Max delay collector can handle"),
+            0x00: dict(name="Terminator",    l4=None,                 usage="End of LACP PDU TLV chain"),
+        },
+        fields={
+            "Subtype":          "1B  0x01=LACP",
+            "Version":          "1B  0x01",
+            "Actor TLV Type":   "1B  0x01",
+            "Actor TLV Length": "1B  0x14=20 bytes",
+            "Actor Sys Priority":"2B  lower = preferred aggregator (0=highest); default 32768",
+            "Actor Sys ID":     "6B  actor system MAC address",
+            "Actor Key":        "2B  operational key — same key = compatible bundling",
+            "Actor Port Priority":"2B  lower = preferred active port; default 32768",
+            "Actor Port":       "2B  port number within system",
+            "Actor State":      "1B  LACP_Activity(b0)+LACP_Timeout(b1)+Aggregation(b2)+Sync(b3)+Collecting(b4)+Distributing(b5)+Defaulted(b6)+Expired(b7)",
+            "Partner TLV":      "20B  same structure as Actor TLV for partner info",
+            "Collector TLV":    "16B  Max Delay(2B) + Reserved(12B)",
+            "CAUTION":          "Actor Key must match on both sides to bundle; Active+Active forms LAG; Active+Passive forms LAG; Passive+Passive = no LAG; key mismatch = no bundling",
+        },
+        l4_key="lacp_tlv_type",
+    ),
+
+    # IEEE 802.3ah OAM (via slow_proto subtype=3) — extended fields
+    "oam_ext": dict(
+        name="IEEE 802.3ah OAM — Ethernet in First Mile EFM (Clause 57)",
+        status="IEEE Standard — IEEE 802.3ah-2004 / IEEE 802.3-2022 Clause 57",
+        description="EFM OAM (Operations, Administration, and Maintenance) provides "
+                    "link-level fault detection, monitoring, and remote diagnostics for "
+                    "point-to-point Ethernet links, especially DSL last-mile connections.",
+        header_bytes=3,
+        type_field="Code (1B) at offset 2 identifies OAM PDU type",
+        type_map={
+            0x00: dict(name="Information",       l4="oam_pdu",  usage="Mandatory — OAM capability discovery TLVs"),
+            0x01: dict(name="Event Notification",l4="oam_pdu",  usage="Link fault events — link fault, dying gasp, critical"),
+            0x02: dict(name="Variable Request",  l4="oam_pdu",  usage="Request MIB variable from remote OAM entity"),
+            0x03: dict(name="Variable Response", l4="oam_pdu",  usage="Response with requested MIB variable value"),
+            0x04: dict(name="Loopback Control",  l4="oam_pdu",  usage="Enable/disable remote loopback on link"),
+            0xFE: dict(name="Org-Specific",      l4="oam_pdu",  usage="Vendor-specific OAM PDU"),
+        },
+        fields={
+            "Flags":        "2B  Link-Fault(b0)+Dying-Gasp(b1)+Critical-Event(b2)+Local-Eval(b3)+Local-Stable(b4)+Remote-Eval(b5)+Remote-Stable(b6)+Reserved(b7-15)",
+            "Code":         "1B  OAM PDU type",
+            "Information TLV":"Local Info(0x01)+Remote Info(0x02)+Org-Spec(0xFE)+End(0x00)",
+            "Local Info":   "Type=0x01 Length=0x10: OAM-Config+PDU-Config+OUI+Vendor-Specific",
+            "OAM Config":   "1B  OAM-Mode(b0)+Unidirect(b1)+RemoteLoopback(b2)+LinkEvents(b3)+VariableRetrieval(b4)",
+            "PDU Config":   "2B  max OAM PDU size (64-1518B)",
+            "Event TLV":    "Type=0x01 Err-Sym-Period / 0x02 Err-Frame / 0x03 Err-Frame-Period / 0x04 Err-Frame-Seconds-Summary",
+            "CAUTION":      "Remote loopback (Code=0x04) loops ALL traffic — activating on a live link causes full service outage; use with extreme caution",
+        },
+        l4_key="oam_code",
+    ),
+}
+
+NON_IP_L3_REGISTRY.update(EXTENDED_L3_REGISTRY)
 
 
-# ── Cisco / IEEE Switch Protocol L3 registries ────────────────────────────────
+
+
 CISCO_L3_REGISTRY: dict[str, dict] = {
     "mac_ctrl": dict(
         name="IEEE 802.3 MAC Control (0x8808)",
@@ -1951,6 +2686,67 @@ CISCO_L3_REGISTRY: dict[str, dict] = {
 }
 
 NON_IP_L3_REGISTRY.update(CISCO_L3_REGISTRY)
+# ── Fix existing L3 type_map gaps ─────────────────────────────────────────────
+
+# EAPOL: add types 4-11 per IEEE 802.1X-2020
+NON_IP_L3_REGISTRY["eapol"]["type_map"].update({
+    4:  dict(name="EAPOL-Encapsulated-ASF-Alert", l4="eapol_asf",
+             usage="ASF-RMCP alert encapsulated in EAPOL — IEEE 802.1X §11.12"),
+    5:  dict(name="EAPOL-MKA",          l4="eapol_mka",
+             usage="MACsec Key Agreement — IEEE 802.1X-2020 §11.11"),
+    6:  dict(name="EAPOL-Announcement", l4="eapol_announce",
+             usage="Unsolicited announcement — IEEE 802.1X-2020 §11.13"),
+    7:  dict(name="EAPOL-Announcement-Req", l4="eapol_announce",
+             usage="Request for announcement — IEEE 802.1X-2020"),
+    8:  dict(name="EAPOL-SUPP-PDU",     l4="eapol_supp",
+             usage="Supplicant pre-authentication PDU — IEEE 802.1X"),
+    9:  dict(name="EAPOL-PC-Announcement", l4="eapol_announce",
+             usage="Per-port channel announcement — IEEE 802.1X-2020"),
+    10: dict(name="EAPOL-PC-Announcement-Req", l4="eapol_announce",
+             usage="Per-port channel announcement request"),
+    11: dict(name="EAPOL-Announcement-RESP",   l4="eapol_announce",
+             usage="Announcement response — IEEE 802.1X-2020"),
+})
+
+# CFM: add Y.1731 opcodes that belong to 802.1ag framework
+NON_IP_L3_REGISTRY["cfm"]["type_map"].update({
+    37: dict(name="TST",   l4="cfm_tst",  usage="Test signal — ITU-T Y.1731 §9.5"),
+    43: dict(name="APS",   l4="cfm_aps",  usage="Automatic Protection Switching — ITU-T Y.1731 §9.9"),
+    44: dict(name="RAPS",  l4="cfm_raps", usage="Ring APS — ITU-T G.8032 / Y.1731"),
+    45: dict(name="MCC",   l4="cfm_mcc",  usage="Maintenance Communication Channel — Y.1731"),
+    48: dict(name="1DM",   l4="cfm_dm",   usage="One-way Delay Measurement — ITU-T Y.1731 §8.2"),
+})
+
+# MAC Control: add remaining EPON MPCP types per IEEE 802.3av
+NON_IP_L3_REGISTRY["mac_ctrl"]["type_map"].update({
+    4: dict(name="EPON-RegisterReq",  l4="mac_ctrl_epon",
+            usage="MPCP Register Request — ONU requests registration with OLT"),
+    5: dict(name="EPON-Register",     l4="mac_ctrl_epon",
+            usage="MPCP Register — OLT grants LLID to ONU"),
+    6: dict(name="EPON-RegisterAck",  l4="mac_ctrl_epon",
+            usage="MPCP Register Ack — ONU acknowledges registration"),
+})
+
+# PTP: add Pdelay_Resp_Follow_Up
+NON_IP_L3_REGISTRY["ptp"]["type_map"][10] = dict(
+    name="Pdelay_Resp_Follow_Up", l4="ptp_msg",
+    usage="Peer delay response follow-up — IEEE 1588-2019 §11.4.3"
+)
+
+# AVTP: add IEEE 1722-2016 additional subtypes
+NON_IP_L3_REGISTRY["avtp"]["type_map"].update({
+    1:   dict(name="MMA-Stream",  l4="avtp_mma",   usage="MIDI-over-AVB stream — IEEE 1722-2016 §9.5"),
+    5:   dict(name="NTSCF",       l4="avtp_ntscf",  usage="Non-Time-Sensitive Control Format — IEEE 1722-2016 §9.6"),
+    106: dict(name="TSCF",        l4="avtp_tscf",   usage="Time-Sensitive Control Format — IEEE 1722-2016 §9.7"),
+})
+
+# Y.1731: add TST (test signal) opcode 37
+NON_IP_L3_REGISTRY["y1731"]["type_map"][37] = dict(
+    name="TST", l4="cfm_tst",
+    usage="Test Signal — ITU-T Y.1731 §9.5 in-service BER/frame-loss test"
+)
+
+
 
 
 def get_non_ip_l3_info(l3_class: str) -> dict:
