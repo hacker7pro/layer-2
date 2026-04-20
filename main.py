@@ -5030,6 +5030,16 @@ def print_eth_menu():
           f"{C.BOLD}{fixed_count+1}+{C.RESET}{C.DIM} = generic builder "
           f"(asks Dst/Src/payload hex) — {gen_count} EtherTypes selectable{C.RESET}")
     print(f"  {C.SEP_C}{SEP90}{C.RESET}")
+    print(f"\n  {C.NOTE}{C.BOLD}  ── CUSTOM / PRIVATE / UNDISCLOSED  (1 entry) ──{C.RESET}")
+    print(f"  {C.BOLD}{C.L3}     C{C.RESET}  "
+          f"{C.HEX}{'0x????':<11}{C.RESET}  "
+          f"{C.BOLD}{'Custom / Private EtherType':<30}{C.RESET}  "
+          f"{C.L3}{'user-def':<10}{C.RESET}  "
+          f"{C.L4}{'user-defined TLVs':<22}{C.RESET}  "
+          f"{C.NOTE}custom{C.RESET}")
+    print(f"  {C.DIM}      Enter 'C' to build a frame with ANY EtherType 0x0000-0xFFFF{C.RESET}")
+    print(f"  {C.DIM}      Define custom fields, TLVs, raw hex, or structured payload{C.RESET}")
+    print(f"  {C.SEP_C}{SEP90}{C.RESET}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -5818,6 +5828,558 @@ def flow_hw():
     print(f"  {C.WARN}     Platform: {', '.join(bus_info.get('platforms', []))}{C.RESET}")
 
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  CUSTOM / PRIVATE / UNDISCLOSED ETHERTYPE BUILDER
+#  Allows building frames with ANY EtherType — known or unknown
+#  Supports: raw hex payload, structured named fields, TLV chains,
+#            vendor magic headers, and auto-populating from L2 registry
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Custom EtherType session storage — persists across builds in same run
+_CUSTOM_ET_SESSIONS: list[dict] = []   # saved custom definitions
+
+
+def _custom_et_lookup(et_int: int) -> dict:
+    """Look up an EtherType in the registry; return empty dict if not found."""
+    if not _L2_AVAILABLE:
+        return {}
+    try:
+        from l2_builder import ETHERTYPE_REGISTRY
+        return ETHERTYPE_REGISTRY.get(et_int, {})
+    except Exception:
+        return {}
+
+
+def _custom_field_editor(existing_fields: list[dict] | None = None) -> list[dict]:
+    """
+    Interactive field editor — build a list of named fields with values.
+    Each field: {name, size_bytes, value_hex, description, encoding}
+    Returns list of field dicts.
+    Encoding options: hex | ascii | uint | ipv4 | mac | tlv | repeat
+    """
+    fields: list[dict] = list(existing_fields or [])
+
+    ENCODINGS = {
+        '1': ('hex',    'Raw hex bytes  e.g. 0A1B2C3D'),
+        '2': ('uint',   'Unsigned int   e.g. 42  → packed big-endian'),
+        '3': ('ascii',  'ASCII string   e.g. hello'),
+        '4': ('ipv4',   'IPv4 address   e.g. 192.168.1.1'),
+        '5': ('mac',    'MAC address    e.g. 00:11:22:33:44:55'),
+        '6': ('tlv',    'Type-Len-Value  (prompted separately)'),
+        '7': ('repeat', 'Repeated pattern  e.g. FF × N bytes'),
+        '8': ('zero',   'Zero-fill N bytes'),
+    }
+
+    print(f"\n  {C.SECT}{C.BOLD}▌ CUSTOM PAYLOAD FIELD EDITOR{C.RESET}")
+    print(f"  {C.DIM}  Build payload field-by-field. Each field adds bytes to payload.{C.RESET}")
+    print(f"  {C.DIM}  Commands: A=Add field  D=Delete last  C=Clear all  P=Preview  X=Done{C.RESET}")
+
+    while True:
+        # Show current fields
+        if fields:
+            print(f"\n  {C.SEP_C}  Current fields ({len(fields)} total):{C.RESET}")
+            total_bytes = 0
+            for i, f in enumerate(fields, 1):
+                nb = f.get('size_bytes', 0)
+                total_bytes += nb
+                print(f"  {C.DIM}  {i:>3}. {f['name']:<22} {nb:>4}B  {f['encoding']:<7}  {f['value_hex'][:32]}{C.RESET}")
+            print(f"  {C.NOTE}  Total payload: {total_bytes} bytes{C.RESET}")
+        else:
+            print(f"\n  {C.DIM}  (no fields yet){C.RESET}")
+
+        cmd = input(f"\n  {C.PROMPT}Field editor (A/D/C/P/X): {C.RESET}").strip().upper()
+
+        if cmd == 'X' or cmd == '':
+            break
+
+        elif cmd == 'A':
+            # Add a new field
+            fname = input(f"  {C.PROMPT}Field name (e.g. Version, Type, Magic): {C.RESET}").strip()
+            if not fname: fname = f"Field_{len(fields)+1}"
+
+            fdesc = input(f"  {C.PROMPT}Description (optional): {C.RESET}").strip()
+
+            print(f"  {C.DIM}  Encoding: ", end='')
+            for k,(enc,label) in ENCODINGS.items():
+                print(f"{k}={enc}  ", end='')
+            print(f"{C.RESET}")
+            enc_ch = input(f"  {C.PROMPT}Encoding [1=hex]: {C.RESET}").strip() or '1'
+            encoding = ENCODINGS.get(enc_ch, ('hex',''))[0]
+
+            val_hex = b''
+
+            if encoding == 'hex':
+                raw = input(f"  {C.PROMPT}Value (hex bytes, no spaces): {C.RESET}").strip().replace(' ','').replace(':','')
+                if not raw: raw = '00'
+                try:
+                    val_hex = bytes.fromhex(raw)
+                except Exception:
+                    print(f"  {C.WARN}Invalid hex — using 0x00{C.RESET}")
+                    val_hex = b'\x00'
+
+            elif encoding == 'uint':
+                size_s = input(f"  {C.PROMPT}Field size in bytes [1]: {C.RESET}").strip() or '1'
+                try:
+                    size = max(1, min(8, int(size_s)))
+                except Exception:
+                    size = 1
+                val_s = input(f"  {C.PROMPT}Value (decimal or 0x hex): {C.RESET}").strip() or '0'
+                try:
+                    val_int = int(val_s, 0)
+                    val_hex = val_int.to_bytes(size, 'big')
+                except Exception:
+                    val_hex = b'\x00' * size
+
+            elif encoding == 'ascii':
+                val_s = input(f"  {C.PROMPT}String value: {C.RESET}").strip()
+                null_t = input(f"  {C.PROMPT}Null-terminate? (y/n) [n]: {C.RESET}").strip().lower()
+                val_hex = val_s.encode('ascii','replace')
+                if null_t == 'y': val_hex += b'\x00'
+
+            elif encoding == 'ipv4':
+                val_s = input(f"  {C.PROMPT}IPv4 address [0.0.0.0]: {C.RESET}").strip() or '0.0.0.0'
+                try:
+                    val_hex = socket.inet_aton(val_s)
+                except Exception:
+                    val_hex = b'\x00\x00\x00\x00'
+
+            elif encoding == 'mac':
+                val_s = input(f"  {C.PROMPT}MAC address [00:00:00:00:00:00]: {C.RESET}").strip() or '00:00:00:00:00:00'
+                try:
+                    val_hex = mac_b(val_s)
+                except Exception:
+                    val_hex = b'\x00'*6
+
+            elif encoding == 'tlv':
+                print(f"  {C.DIM}  TLV: each entry = Type(N bytes) + Length(N bytes) + Value{C.RESET}")
+                type_size = int(input(f"  {C.PROMPT}Type field size bytes [1]: {C.RESET}").strip() or '1')
+                len_size  = int(input(f"  {C.PROMPT}Length field size bytes [1]: {C.RESET}").strip() or '1')
+                tlv_bytes = b''
+                while True:
+                    t_raw = input(f"  {C.PROMPT}  TLV Type (hex, Enter=done): {C.RESET}").strip()
+                    if not t_raw: break
+                    try:
+                        t_val = int(t_raw, 16)
+                        t_bytes = t_val.to_bytes(type_size, 'big')
+                    except Exception:
+                        t_bytes = b'\x00' * type_size
+                    v_raw = input(f"  {C.PROMPT}  TLV Value (hex bytes): {C.RESET}").strip().replace(' ','')
+                    try:
+                        v_bytes = bytes.fromhex(v_raw)
+                    except Exception:
+                        v_bytes = b''
+                    l_bytes = len(v_bytes).to_bytes(len_size, 'big')
+                    tlv_bytes += t_bytes + l_bytes + v_bytes
+                val_hex = tlv_bytes
+
+            elif encoding == 'repeat':
+                pat_raw = input(f"  {C.PROMPT}Pattern byte (hex) [FF]: {C.RESET}").strip() or 'FF'
+                try:
+                    pat = bytes.fromhex(pat_raw.zfill(2))
+                except Exception:
+                    pat = b'\xFF'
+                count_s = input(f"  {C.PROMPT}Repeat count [4]: {C.RESET}").strip() or '4'
+                try:
+                    count = max(1, int(count_s))
+                except Exception:
+                    count = 4
+                val_hex = pat * count
+
+            elif encoding == 'zero':
+                size_s = input(f"  {C.PROMPT}Zero-fill bytes [4]: {C.RESET}").strip() or '4'
+                try:
+                    size = max(1, int(size_s))
+                except Exception:
+                    size = 4
+                val_hex = b'\x00' * size
+
+            field = {
+                'name':       fname,
+                'description':fdesc,
+                'size_bytes': len(val_hex),
+                'value_hex':  val_hex.hex().upper(),
+                'encoding':   encoding,
+                'raw':        val_hex,
+            }
+            fields.append(field)
+            print(f"  {C.PASS_}  Added: {fname} = {val_hex.hex().upper()} ({len(val_hex)}B){C.RESET}")
+
+        elif cmd == 'D':
+            if fields:
+                removed = fields.pop()
+                print(f"  {C.NOTE}  Removed: {removed['name']}{C.RESET}")
+            else:
+                print(f"  {C.WARN}  No fields to remove{C.RESET}")
+
+        elif cmd == 'C':
+            if input(f"  {C.PROMPT}Clear all fields? (y/n): {C.RESET}").strip().lower() == 'y':
+                fields.clear()
+                print(f"  {C.NOTE}  Cleared.{C.RESET}")
+
+        elif cmd == 'P':
+            # Preview the assembled payload
+            if fields:
+                payload = b''.join(f.get('raw', bytes.fromhex(f['value_hex'])) for f in fields)
+                print(f"\n  {C.SECT}  PAYLOAD PREVIEW ({len(payload)} bytes):{C.RESET}")
+                # Hex dump
+                for off in range(0, len(payload), 16):
+                    chunk = payload[off:off+16]
+                    hex_part  = ' '.join(f'{b:02X}' for b in chunk)
+                    asc_part  = ''.join(chr(b) if 32<=b<127 else '.' for b in chunk)
+                    print(f"  {C.HEX}  {off:04X}:  {hex_part:<47}  {C.DIM}{asc_part}{C.RESET}")
+            else:
+                print(f"  {C.WARN}  No fields to preview{C.RESET}")
+
+    return fields
+
+
+def _custom_et_session_manager() -> dict | None:
+    """
+    Manage saved custom EtherType sessions.
+    Returns a session dict to load, or None to start fresh.
+    """
+    if not _CUSTOM_ET_SESSIONS:
+        return None
+    print(f"\n  {C.SECT}{C.BOLD}▌ SAVED CUSTOM DEFINITIONS ({len(_CUSTOM_ET_SESSIONS)}){C.RESET}")
+    for i, sess in enumerate(_CUSTOM_ET_SESSIONS, 1):
+        et = sess.get('et_int', 0)
+        nm = sess.get('name', 'unnamed')
+        fcount = len(sess.get('fields', []))
+        plen = sess.get('payload_len', 0)
+        print(f"  {C.DIM}  {i}. 0x{et:04X} — {nm}  ({fcount} fields, {plen}B){C.RESET}")
+    ch = input(f"  {C.PROMPT}Load saved? (number / Enter=new): {C.RESET}").strip()
+    if ch.isdigit():
+        idx = int(ch) - 1
+        if 0 <= idx < len(_CUSTOM_ET_SESSIONS):
+            return _CUSTOM_ET_SESSIONS[idx]
+    return None
+
+
+def flow_custom_ethertype():
+    """
+    Full interactive builder for custom, private, undisclosed, or experimental
+    EtherTypes. Features:
+      1. Enter any EtherType 0x0000-0xFFFF
+      2. Auto-lookup in registry (shows known PDU/fields if present)
+      3. Define custom fields interactively (name, size, encoding, value)
+      4. TLV chain builder, raw hex, pattern fill, vendor magic support
+      5. Preview hex dump before building
+      6. Full L1+L2 frame assembly with FCS
+      7. Save definition for reuse in same session
+      8. Export custom definition as Python snippet
+    """
+    global _CUSTOM_ET_SESSIONS
+
+    banner("CUSTOM / PRIVATE / UNDISCLOSED EtherType BUILDER",
+           "Build ANY Ethernet frame — known, private, experimental, or proprietary")
+
+    print(f"""
+  {C.SECT}{C.BOLD}▌ WHAT THIS DOES{C.RESET}
+  {C.DIM}  Ethernet EtherType is a 16-bit field (0x0000-0xFFFF = 65536 values).
+  Only ~300 are registered with IEEE/IANA. The remaining 65000+ are:
+  • Private/undisclosed — registered but spec not public (NDA)
+  • Experimental — test/lab use (IEEE recommends 0x88B5/0x88B6)
+  • Proprietary — vendor internal (Cisco ACI 0x8950, Huawei 0x8905 etc.)
+  • Custom — your own protocol / test tool / research
+  • Unknown captures — seen in pcap but no known dissector
+
+  You can build a valid Ethernet frame with ANY EtherType and ANY payload.
+  The payload can be structured (named fields) or raw hex bytes.{C.RESET}
+""")
+
+    # ── Load saved session? ────────────────────────────────────────────────────
+    loaded = _custom_et_session_manager()
+    if loaded:
+        et_int    = loaded['et_int']
+        et_name   = loaded.get('name', f'0x{et_int:04X}')
+        fields    = list(loaded.get('fields', []))
+        print(f"  {C.PASS_}  Loaded: {et_name} (0x{et_int:04X}){C.RESET}")
+    else:
+        fields = []
+
+        # ── EtherType entry ───────────────────────────────────────────────────
+        section("STEP 1 — ETHERTYPE SELECTION")
+        print(f"""
+  {C.DIM}  Enter any hex value 0x0000-0xFFFF.
+  Examples:
+    0x88B5  — IEEE experimental (safe for lab use)
+    0x88B6  — IEEE experimental (second slot)
+    0x8950  — Cisco ACI (undisclosed)
+    0x9999  — Arista LANZ / F5 HA (documented)
+    0xAAAA  — Your custom protocol
+    0x1234  — Research / test
+    0xF000  — Private (undisclosed range)
+    0xFEFE  — Cisco ISL (documented)
+  {C.RESET}""")
+
+        while True:
+            raw_et = input(f"  {C.PROMPT}EtherType (hex, e.g. 0x88B5 or 88B5): {C.RESET}").strip()
+            raw_et = raw_et.replace('0x','').replace('0X','').strip()
+            try:
+                et_int = int(raw_et, 16)
+                if 0 <= et_int <= 0xFFFF:
+                    break
+                print(f"  {C.WARN}  Must be 0x0000–0xFFFF{C.RESET}")
+            except ValueError:
+                print(f"  {C.WARN}  Invalid hex — try again{C.RESET}")
+
+        # ── Registry lookup ───────────────────────────────────────────────────
+        reg_info = _custom_et_lookup(et_int)
+        if reg_info:
+            print(f"\n  {C.PASS_}{C.BOLD}  ✓ KNOWN EtherType 0x{et_int:04X} found in registry:{C.RESET}")
+            print(f"  {C.NOTE}    Name    : {reg_info.get('name','?')}{C.RESET}")
+            print(f"  {C.NOTE}    PDU     : {reg_info.get('pdu','?')}{C.RESET}")
+            print(f"  {C.NOTE}    Category: {reg_info.get('category','?')}  Status: {reg_info.get('status','?')}{C.RESET}")
+            print(f"  {C.NOTE}    L3 proto: {reg_info.get('l3_proto','—')}{C.RESET}")
+            # Show known fields
+            known_flds = {k:v for k,v in reg_info.get('fields',{}).items() if k.upper()!='CAUTION'}
+            if known_flds:
+                print(f"\n  {C.DIM}  Known fields for this EtherType:{C.RESET}")
+                for fname, fdesc in list(known_flds.items())[:12]:
+                    print(f"  {C.DIM}    {fname:<25} {str(fdesc)[:55]}{C.RESET}")
+            # Show CAUTION
+            caution = reg_info.get('fields',{}).get('CAUTION','')
+            if not caution:
+                for k,v in reg_info.get('fields',{}).items():
+                    if k.upper()=='CAUTION': caution=v; break
+            if caution:
+                print(f"\n  {C.WARN}  ⚠  CAUTION: {caution[:120]}{C.RESET}")
+            et_name = reg_info.get('name', f'0x{et_int:04X}')[:40]
+
+            # Offer to pre-populate fields from registry
+            if known_flds and input(f"\n  {C.PROMPT}Pre-populate fields from registry? (y/n) [y]: {C.RESET}").strip().lower() != 'n':
+                for fname, fdesc in known_flds.items():
+                    # Parse size hint from description (e.g. "2B", "1B", "4B", "6B")
+                    import re as _re
+                    m = _re.search(r'(\d+)B', str(fdesc))
+                    nb = int(m.group(1)) if m else 1
+                    nb = min(nb, 16)  # cap at 16 for pre-pop
+                    fields.append({
+                        'name':        fname,
+                        'description': str(fdesc)[:80],
+                        'size_bytes':  nb,
+                        'value_hex':   '00' * nb,
+                        'encoding':    'hex',
+                        'raw':         b'\x00' * nb,
+                    })
+                print(f"  {C.NOTE}  Pre-populated {len(fields)} fields — edit values below{C.RESET}")
+
+        else:
+            print(f"\n  {C.NOTE}  EtherType 0x{et_int:04X} is {C.BOLD}NOT in the registry{C.RESET}"
+                  f"{C.NOTE} — private / undisclosed / experimental{C.RESET}")
+            print(f"  {C.DIM}  You'll define the payload structure manually.{C.RESET}")
+            et_name = f"Custom 0x{et_int:04X}"
+
+        # Custom name
+        custom_name = input(f"\n  {C.PROMPT}Protocol name / label [{et_name}]: {C.RESET}").strip()
+        if not custom_name: custom_name = et_name
+
+    # ── Payload builder mode ───────────────────────────────────────────────────
+    section("STEP 2 — PAYLOAD BUILDER MODE")
+    print(f"""
+  {C.DIM}  1. Structured fields   — define fields one by one (recommended)
+  2. Raw hex            — paste raw hex bytes directly
+  3. Use fields + raw   — structured fields then append raw hex tail
+  4. Pattern fill       — fill N bytes with a repeating pattern
+  5. Import from file   — paste hex dump or colon-separated bytes{C.RESET}""")
+
+    mode = input(f"  {C.PROMPT}Mode [1]: {C.RESET}").strip() or '1'
+
+    if mode == '1' or mode == '3':
+        fields = _custom_field_editor(fields if mode=='3' else None)
+        payload = b''.join(f.get('raw', bytes.fromhex(f['value_hex'])) for f in fields)
+        if mode == '3':
+            raw_tail = input(f"\n  {C.PROMPT}Append raw hex tail (Enter=none): {C.RESET}").strip().replace(' ','')
+            if raw_tail:
+                try:
+                    payload += bytes.fromhex(raw_tail)
+                except Exception:
+                    print(f"  {C.WARN}  Invalid hex tail — ignored{C.RESET}")
+
+    elif mode == '2':
+        print(f"  {C.DIM}  Paste raw payload as continuous hex (spaces OK, 0x prefix OK){C.RESET}")
+        raw_s = input(f"  {C.PROMPT}Hex payload: {C.RESET}").strip()
+        raw_s = raw_s.replace('0x','').replace(' ','').replace('\t','').replace(':','')
+        try:
+            payload = bytes.fromhex(raw_s)
+        except Exception:
+            print(f"  {C.WARN}  Invalid hex — using empty payload{C.RESET}")
+            payload = b''
+
+    elif mode == '4':
+        pat_s = input(f"  {C.PROMPT}Pattern byte (hex) [AA]: {C.RESET}").strip() or 'AA'
+        try:
+            pat = bytes.fromhex(pat_s.zfill(2))
+        except Exception:
+            pat = b'\xAA'
+        cnt_s = input(f"  {C.PROMPT}Total bytes [64]: {C.RESET}").strip() or '64'
+        try:
+            cnt = max(0, min(65535, int(cnt_s)))
+        except Exception:
+            cnt = 64
+        payload = pat * cnt
+
+    elif mode == '5':
+        print(f"  {C.DIM}  Paste hex dump (any format — colons, spaces, 0x prefixes all OK):{C.RESET}")
+        lines = []
+        while True:
+            ln = input(f"  {C.PROMPT}  > {C.RESET}")
+            if not ln.strip(): break
+            lines.append(ln)
+        raw_s = ' '.join(lines)
+        raw_s = raw_s.replace('0x','').replace(':','').replace('-','')
+        raw_s = ''.join(c for c in raw_s if c in '0123456789abcdefABCDEF')
+        try:
+            payload = bytes.fromhex(raw_s)
+        except Exception:
+            print(f"  {C.WARN}  Could not parse — empty payload{C.RESET}")
+            payload = b''
+    else:
+        payload = b''
+
+    # ── Vendor magic header option ─────────────────────────────────────────────
+    section("STEP 3 — VENDOR MAGIC / PROTOCOL HEADER")
+    print(f"  {C.DIM}  Many vendor protocols start with a 4-byte magic identifier.{C.RESET}")
+    print(f"  {C.DIM}  Examples: ARISTA=0x41524953 CISCO=0x43434353 HUAWEI=0x48574549{C.RESET}")
+    add_magic = input(f"  {C.PROMPT}Add vendor magic header? (y/n) [n]: {C.RESET}").strip().lower()
+    if add_magic == 'y':
+        magic_raw = input(f"  {C.PROMPT}Magic bytes (hex, e.g. 41524953): {C.RESET}").strip().replace('0x','').replace(' ','')
+        try:
+            magic_bytes = bytes.fromhex(magic_raw)
+        except Exception:
+            magic_bytes = b'\x00\x00\x00\x00'
+        payload = magic_bytes + payload
+        print(f"  {C.PASS_}  Magic prepended: {magic_bytes.hex().upper()}{C.RESET}")
+
+    # Pad to minimum Ethernet payload
+    if len(payload) < 46:
+        pad_n = 46 - len(payload)
+        pad_byte_s = input(f"\n  {C.PROMPT}Pad to min 46B with (hex byte) [00]: {C.RESET}").strip() or '00'
+        try:
+            pad_b = bytes.fromhex(pad_byte_s.zfill(2))
+        except Exception:
+            pad_b = b'\x00'
+        payload = payload + pad_b * pad_n
+        print(f"  {C.NOTE}  Padded {pad_n} bytes → {len(payload)}B total payload{C.RESET}")
+
+    # ── L1 ────────────────────────────────────────────────────────────────────
+    section("STEP 4 — LAYER 1 / LAYER 2 HEADERS")
+    preamble, sfd = ask_layer1_eth()
+
+    # ── L2 MAC header ─────────────────────────────────────────────────────────
+    print(f"\n  {C.SECT}{C.BOLD}▌ ETHERNET MAC HEADER{C.RESET}")
+    dst_s = get("Destination MAC", "ff:ff:ff:ff:ff:ff")
+    src_s = get("Source MAC", "aa:bb:cc:dd:ee:ff")
+    dst_mb = mac_b(dst_s)
+    src_mb = mac_b(src_s)
+    et_b   = struct.pack('>H', et_int)
+
+    # ── FCS ───────────────────────────────────────────────────────────────────
+    raw_frame = dst_mb + src_mb + et_b + payload
+    fcs, fcs_note = ask_fcs_eth(raw_frame)
+
+    # ── Assemble ──────────────────────────────────────────────────────────────
+    frame = preamble + sfd + raw_frame + fcs
+
+    # ── Display records ────────────────────────────────────────────────────────
+    records: list[dict] = [
+        {'layer':'L1','field':'Preamble',
+         'value':preamble.hex().upper(),'note':'7B 0x55×7 — clock sync'},
+        {'layer':'L1','field':'SFD',
+         'value':sfd.hex().upper(),'note':'0xD5 — start of frame'},
+        {'layer':'L2','field':'Dst MAC',
+         'value':dst_s,'note':''},
+        {'layer':'L2','field':'Src MAC',
+         'value':src_s,'note':''},
+        {'layer':'L2','field':f'EtherType 0x{et_int:04X}',
+         'value':et_b.hex().upper(),
+         'note':f'{custom_name} ({reg_info.get("status","custom") if reg_info else "custom"})'},
+    ]
+    # Add each custom field as a record
+    off = 0
+    for f in fields:
+        raw = f.get('raw', bytes.fromhex(f['value_hex']))
+        records.append({
+            'layer':'L3',
+            'field':f['name'],
+            'value':raw.hex().upper(),
+            'note':f['description'][:60] if f.get('description') else f'{f["size_bytes"]}B {f["encoding"]}',
+        })
+        off += len(raw)
+    # If raw mode — show as single payload record
+    if mode in ('2','4','5'):
+        records.append({
+            'layer':'L3','field':'Payload',
+            'value':payload.hex().upper()[:64]+('…' if len(payload)>32 else ''),
+            'note':f'{len(payload)}B custom payload',
+        })
+    records.append({'layer':'L2','field':'FCS',
+                    'value':fcs.hex().upper(),'note':fcs_note})
+
+    section("FRAME SUMMARY")
+    print_frame_table(records)
+    print_encapsulation(records, frame)
+
+    # ── Hex dump ───────────────────────────────────────────────────────────────
+    section("HEX DUMP — COMPLETE FRAME")
+    print(f"  {C.DIM}  Total frame: {len(frame)} bytes{C.RESET}\n")
+    print(f"  {C.DIM}  {'Offset':<8} {'00 01 02 03 04 05 06 07  08 09 0A 0B 0C 0D 0E 0F':<49}  ASCII{C.RESET}")
+    print(f"  {C.SEP_C}  {'─'*76}{C.RESET}")
+    for off in range(0, len(frame), 16):
+        chunk = frame[off:off+16]
+        h1 = ' '.join(f'{b:02X}' for b in chunk[:8])
+        h2 = ' '.join(f'{b:02X}' for b in chunk[8:])
+        asc = ''.join(chr(b) if 32<=b<127 else '.' for b in chunk)
+        print(f"  {C.HEX}  {off:04X}    {h1:<23}  {h2:<23}  {C.DIM}{asc}{C.RESET}")
+
+    # Bit-level view of EtherType
+    print(f"\n  {C.SECT}{C.BOLD}▌ ETHERTYPE FIELD ANALYSIS{C.RESET}")
+    print(f"  {C.DIM}  EtherType 0x{et_int:04X} = {et_int} decimal = {et_int:016b} binary{C.RESET}")
+    print(f"  {C.DIM}  High byte: 0x{et_int>>8:02X} ({et_int>>8:08b})  Low byte: 0x{et_int&0xFF:02X} ({et_int&0xFF:08b}){C.RESET}")
+    if et_int >= 0x0600:
+        print(f"  {C.NOTE}  ≥ 0x0600 → EtherType II frame (protocol identifier){C.RESET}")
+    else:
+        print(f"  {C.NOTE}  < 0x0600 → IEEE 802.3 frame (value = payload length = {et_int} bytes){C.RESET}")
+    if et_int in (0x88B5, 0x88B6):
+        print(f"  {C.NOTE}  IEEE 802 Local Experimental — safe for lab/research use{C.RESET}")
+    elif not _custom_et_lookup(et_int):
+        print(f"  {C.WARN}  Private / Undisclosed — not in public registry{C.RESET}")
+
+    # ── Save session ──────────────────────────────────────────────────────────
+    if input(f"\n  {C.PROMPT}Save this definition for reuse? (y/n) [n]: {C.RESET}").strip().lower() == 'y':
+        session = {
+            'et_int':      et_int,
+            'name':        custom_name,
+            'fields':      fields,
+            'payload_len': len(payload),
+            'et_hex':      f'0x{et_int:04X}',
+        }
+        _CUSTOM_ET_SESSIONS.append(session)
+        print(f"  {C.PASS_}  Saved as session #{len(_CUSTOM_ET_SESSIONS)}{C.RESET}")
+
+    # ── Export as Python snippet ───────────────────────────────────────────────
+    if input(f"  {C.PROMPT}Export as Python bytes snippet? (y/n) [n]: {C.RESET}").strip().lower() == 'y':
+        print(f"\n  {C.SECT}{C.BOLD}▌ PYTHON SNIPPET{C.RESET}")
+        print(f"  # Custom EtherType 0x{et_int:04X} — {custom_name}")
+        print(f"  frame = bytes.fromhex(")
+        # Chunk the hex
+        fx = frame.hex().upper()
+        for i in range(0, len(fx), 64):
+            print(f"      '{fx[i:i+64]}'{'  # ' + str(i//2) + 'B' if i==0 else ''}")
+        print(f"  )")
+        print(f"  # EtherType bytes: {et_b.hex().upper()}  ({custom_name})")
+        print(f"  # Payload:         {payload.hex().upper()[:64]}{'…' if len(payload)>32 else ''}")
+
+    verify_report([
+        ("Frame length",      f"{len(frame)}B",        True),
+        ("EtherType",         f"0x{et_int:04X}",        True),
+        ("Payload length",    f"{len(payload)}B",        len(payload)>=46),
+        ("Registry status",   reg_info.get('status','private/custom') if reg_info else 'private/custom', True),
+        ("FCS",               fcs_note,                  True),
+    ])
+
+
 def main():
     """
     Main entry point — 5 options.
@@ -5845,9 +6407,11 @@ def main():
         print_eth_menu()
         total   = len(_ETH_SEL_MAP)
         fixed_n = sum(1 for e in _ETH_SEL_MAP.values() if e[0]=='fixed')
-        ch = input(f"\n  {C.PROMPT}Enter number  (1-{fixed_n}=full builders | {fixed_n+1}-{total}=EtherType generic): {C.RESET}").strip()
+        ch = input(f"\n  {C.PROMPT}Enter number  (1-{fixed_n}=full builders | {fixed_n+1}-{total}=EtherType generic | C=Custom): {C.RESET}").strip()
         entry = _ETH_SEL_MAP.get(ch)
-        if entry is None:
+        if ch.upper() == 'C':
+            flow_custom_ethertype()
+        elif entry is None:
             print(f"  {C.WARN}Invalid — enter 1 to {total}.{C.RESET}")
         elif entry[0] == 'fixed':
             entry[1]()
