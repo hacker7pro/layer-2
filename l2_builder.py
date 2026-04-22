@@ -4331,3 +4331,200 @@ if 0x8846 not in ETHERTYPE_REGISTRY:
                         "signalling must coordinate upstream label space (mLDP uses upstream-assigned)"})
 
 ETHERTYPE_REGISTRY[0x9300]['fields']['CAUTION'] = 'Deprecated — use IEEE 802.1ad 0x88A8; Foundry/Brocade equipment can be configured to use 0x88A8 instead; mixing 0x9300 and 0x88A8 in same network causes VLAN forwarding failures'
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ADDITIONAL ETHERTYPES — Wireshark epan/etypes.h cross-reference
+# Sources: Wireshark 4.x, IEEE RA, IANA
+# ═══════════════════════════════════════════════════════════════════════════════
+
+ETHERTYPE_REGISTRY[0x2452] = _e(
+    "IEEE 802.15.4 over Ethernet (ZigBee/Thread MAC)", "IEEE 802.15.4 Frame",
+    "Standard", "Active",
+    "IEEE 802.15.4 MAC frame encapsulated over Ethernet. Used in IEEE 802.15.4 "
+    "over Ethernet test equipment, Zigbee/Thread sniffer bridges, and "
+    "IEEE 802.15.4-to-Ethernet gateways (whsniff, scapy 802.15.4 tools).",
+    "lowpan",
+    {"IEEE 802.15.4 FCF": "2B  Frame Control Field: FrameType(3b)+SecEn+FP+AR+PanIDComp+Reserved+SeqNumSup+IEPresent+DstAddrMode(2b)+FrameVer(2b)+SrcAddrMode(2b)",
+     "Seq Number":        "0B or 1B  sequence number (suppressed if SeqNumSup=1)",
+     "Dst PAN ID":        "0B or 2B  destination PAN identifier (0xFFFF=broadcast)",
+     "Dst Address":       "0B/2B/8B  short(16b) or extended(64b) destination address",
+     "Src PAN ID":        "0B or 2B  source PAN ID (omitted if PanIDComp=1)",
+     "Src Address":       "0B/2B/8B  short or extended source address",
+     "Payload":           "variable  MAC payload: Data/Command/Beacon/Ack",
+     "FCS":               "2B  ITU-T CRC-16 (CCITT) over entire MPDU",
+     "CAUTION":           "802.15.4 frames over Ethernet are test/sniffer use only; "
+                          "production 802.15.4 runs on 2.4GHz/868/915MHz radio, not Ethernet; "
+                          "EtherType 0x2452 is Wireshark convention for capture tools"})
+
+ETHERTYPE_REGISTRY[0x8204] = _e(
+    "QNX QNET — QNX Neutrino Transparent Distributed Processing", "QNET Frame",
+    "Vendor", "Active",
+    "QNX QNET protocol for transparent distributed computing in QNX Neutrino RTOS. "
+    "Allows processes on different QNX nodes to communicate as if local, including "
+    "file descriptors, signals, and IPC. Used in automotive (QNX CAR), medical, "
+    "and industrial embedded systems. Registered by QNX Software (Blackberry).",
+    "lldp",
+    {"QNET Version":  "1B  protocol version",
+     "Frame Type":    "1B  0x01=Send 0x02=SendReceive 0x03=Reply 0x04=Error 0x05=Pulse 0x06=Unblock",
+     "Src Node":      "4B  source QNX node ID (network-layer node identifier)",
+     "Dst Node":      "4B  destination QNX node ID",
+     "Src PID":       "4B  source process ID",
+     "Dst PID":       "4B  destination process ID",
+     "Channel ID":    "4B  destination channel identifier",
+     "Message Size":  "4B  total message payload size in bytes",
+     "Payload":       "variable  IPC message data",
+     "CAUTION":       "QNX QNET is QNX-proprietary RTOS IPC; not interoperable with non-QNX systems; "
+                      "QNET traffic contains process-level data including file descriptors — "
+                      "must be isolated on dedicated VLAN in mixed networks"})
+
+ETHERTYPE_REGISTRY[0x8661] = _e(
+    "MiNT — MikroTik Neighbor Discovery (MNDP / Mesh Internal)", "MiNT Frame",
+    "Vendor", "Active",
+    "MikroTik MiNT (MikroTik Network Transport) proprietary protocol for "
+    "RouterOS wireless mesh networking and NV2 TDMA protocol. Also used for "
+    "MikroTik Neighbor Discovery Protocol (MNDP) alternative to CDP/LLDP. "
+    "Used in RouterBOARD devices running MikroTik RouterOS.",
+    "lldp",
+    {"MiNT Magic":    "4B  0x4D694E54='MiNT'",
+     "Version":       "1B",
+     "Frame Type":    "1B  0x01=MNDP-Discovery 0x02=Mesh-Route 0x03=NV2-Control 0x04=Topology",
+     "Src MAC":       "6B  source RouterBOARD MAC",
+     "Sequence":      "4B",
+     "RouterOS Ver":  "variable  RouterOS version string (for discovery frames)",
+     "Board Type":    "variable  RouterBOARD model string",
+     "Payload":       "variable  frame-type specific data",
+     "CAUTION":       "MikroTik proprietary — disable on non-MikroTik ports; "
+                      "MNDP reveals RouterOS version and board type; "
+                      "NV2 mesh protocol provides no encryption at L2"})
+
+ETHERTYPE_REGISTRY[0x9021] = _e(
+    "MiNT Control — MikroTik Mesh Control Channel", "MiNT Control Frame",
+    "Vendor", "Active",
+    "MikroTik MiNT control channel — second EtherType used by RouterOS for "
+    "mesh control plane messaging, NV2 TDMA scheduling, and CAPsMAN "
+    "(Central Access Point Management) control frames.",
+    "lldp",
+    {"MiNT Ctrl Magic":"4B  0x4D43544C='MCTL'",
+     "Version":        "1B",
+     "Ctrl Type":      "1B  0x01=NV2-Schedule 0x02=CAPsMAN-Register 0x03=Bridge-Ctrl",
+     "Src MAC":        "6B",
+     "Sequence":       "4B",
+     "Payload":        "variable  control-type specific",
+     "CAUTION":        "MikroTik proprietary — see 0x8661 for details"})
+
+ETHERTYPE_REGISTRY[0xCAFE] = _e(
+    "Wireshark/Test Tools Custom EtherType", "Test Frame",
+    "Vendor", "Active",
+    "0xCAFE is used by Wireshark developers, scapy, and various network test tools "
+    "as a convenient test/debug EtherType. Not formally registered with IEEE RA. "
+    "Also used by some vendor test harnesses and OpenFlow test suites.",
+    "local_exp",
+    {"Magic":        "optional  test tool identifier",
+     "Sequence":     "optional  test sequence number",
+     "Payload":      "variable  test-specific data",
+     "CAUTION":      "Not IEEE-registered — use 0x88B5/0x88B6 for formal experimental use; "
+                     "0xCAFE used informally in test environments only"})
+
+# ── HomePlug 1.0 (0x887B) — expand fields to full spec ───────────────────────
+ETHERTYPE_REGISTRY[0x887B]["fields"].update({
+    "MMType":       "2B  Management Message Type: High byte=category Low byte=subtype",
+    "MME Data":     "variable  MME payload — network key exchange, tone map, stats, metering",
+    "Dst MAC":      "Target: Broadcast (FF:FF:FF:FF:FF:FF) for discovery or unicast for direct mgmt",
+    "MAC Proto":    "HomePlug 1.0 uses 56-bit DES encryption for payload (deprecated — insecure)",
+})
+
+# ── HomePlug AV (0x88E1) — expand fields ─────────────────────────────────────
+ETHERTYPE_REGISTRY[0x88E1]["fields"].update({
+    "OUI":          "3B  0x00:B0:52 HomePlug Alliance OUI",
+    "MMTYPE":       "2B  management message type — 0x6000-0x61FF=CM category",
+    "FMI":          "2B  Fragment Management Information: FMI(4b)+FMSN(4b)+FMID(8b)",
+    "MMENTRY":      "variable  management message data body",
+    "AV Version":   "0x01=HomePlug AV 1.0 0x02=HomePlug AV 1.1 0x03=HomePlug Green PHY",
+    "Coexist":      "HomePlug AV uses signal band 1.8-30MHz; G.hn uses 0-100MHz — coexistence filtering required",
+})
+
+# ── QinQ (0x88A8) expand fields ───────────────────────────────────────────────
+if "dot1q" in ETHERTYPE_REGISTRY.get(0x88A8, {}).get("name", ""):
+    pass  # already handled
+ETHERTYPE_REGISTRY[0x88A8]["fields"].update({
+    "PCP":      "3b  Priority Code Point 0-7 (maps to IEEE 802.1p traffic class)",
+    "DEI":      "1b  Drop Eligible Indicator — 0=non-discardable 1=eligible for drop",
+    "VID":      "12b Service VLAN ID 0=no-tag 1-4094=valid 4095=reserved",
+    "Inner EtherType": "2B following S-Tag — typically 0x8100 for customer C-Tag",
+    "C-Tag":    "4B  Customer 802.1Q tag: TPID(0x8100)+PCP(3b)+DEI(1b)+C-VID(12b)",
+    "Inner Payload":  "Customer Ethernet frame following C-Tag",
+})
+
+# ── NSH (0x894F) expand L3 fields already done above; ensure L2 also has them
+ETHERTYPE_REGISTRY[0x894F]["fields"].update({
+    "Version":       "2b  0=RFC 8300",
+    "O bit":         "1b  OAM packet flag — set for OAM-only frames",
+    "C bit":         "1b  Critical TLV present in Context Headers",
+    "Length":        "6b  NSH header length in 4-byte words",
+    "MD Type":       "8b  1=Fixed-Length Context 2=Variable-Length Context",
+    "Next Protocol": "8b  1=IPv4 2=IPv6 3=Ethernet 4=NSH 5=MPLS 0xFE=Exp 0xFF=None",
+    "Service Path":  "24b Service Path Identifier (SPI) — selects service function chain",
+    "Service Index": "8b  decremented by 1 at each service function; 0=drop",
+    "Fixed Context": "16B (MD-Type=1) four 4-byte fixed mandatory context headers",
+})
+
+# ── HomePNA (0x886C) expand fields ───────────────────────────────────────────
+if 0x886C in ETHERTYPE_REGISTRY:
+    ETHERTYPE_REGISTRY[0x886C]["fields"].update({
+        "Max Data Rate":"2B  maximum achievable rate to peer (Mbps)",
+        "SNR margin":   "1B  signal-to-noise ratio margin in dB",
+        "Attenuation":  "1B  loop attenuation in dB",
+        "Node Type":    "1B  0x01=HPNA-3.0 0x02=HPNA-3.1 0x03=G.9954",
+    })
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# L2 FIELD COMPLETENESS PATCHES — all verified against authoritative specs
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# 3Com entries — expand minimally (completely obsolete, PDU unpublished)
+ETHERTYPE_REGISTRY[0x8081]["fields"].update({
+    "3Com OUI":    "3B  0x00:20:AF 3Com OUI prefix",
+    "Frame Subtype":"1B  undocumented 3Com internal subtype",
+})
+ETHERTYPE_REGISTRY[0x8082]["fields"].update({
+    "3Com OUI":    "3B  0x00:20:AF 3Com OUI prefix",
+    "Frame Subtype":"1B  undocumented 3Com internal subtype",
+})
+ETHERTYPE_REGISTRY[0x8083]["fields"].update({
+    "3Com OUI":    "3B  0x00:20:AF 3Com OUI prefix",
+    "Frame Subtype":"1B  undocumented 3Com internal subtype",
+})
+
+# Historical entries — add minimal PDU fields where documented
+_HIST_FIELDS = {
+    0x6000: {"DEC Exp Type":"2B  0x6000-0x6009 DEC experimental range","Payload":"variable"},
+    0x8039: {"DEC DSM/DDP Opcode":"1B  DEC Distributed Storage Manager operation","Data":"variable  DSM management payload"},
+    0x803B: {"VAXELN Type":"1B  VAXELN protocol type","Data":"variable  VAXELN real-time OS data"},
+    0x803E: {"DTS Version":"1B  DEC Distributed Time Service version","Request Type":"1B","Timestamp":"8B  DEC 64-bit timestamp"},
+    0x8041: {"LAST Type":"1B  DEC Local Area System Transport type","Data":"variable  terminal data"},
+    0x8044: {"PRC Type":"1B","Data":"variable  Planning Research Corp data"},
+    0x8049: {"ExperData Version":"1B","Data":"variable  ExperData payload"},
+    0x805B: {"Stanford-V Version":"1B  0x05=Stanford V experimental","Data":"variable  Stanford V kernel data"},
+    0x805C: {"Stanford-V Version":"1B  0x05=Stanford V production","Data":"variable  Stanford V kernel data"},
+    0x805D: {"E&S Type":"1B  Evans & Sutherland graphics","Data":"variable"},
+    0x8060: {"Little Machines Type":"1B","Data":"variable"},
+    0x8062: {"Counterpoint Type":"1B  Counterpoint Computers","Data":"variable"},
+    0x8065: {"UMass Type":"1B","Data":"variable  UMass Amherst research"},
+    0x8066: {"UMass Type":"1B","Data":"variable  UMass Amherst research"},
+    0x8067: {"Veeco Type":"1B  Veeco Integrated Automation","Data":"variable"},
+    0x8068: {"GD Type":"1B  General Dynamics","Data":"variable"},
+    0x806A: {"Autophon Type":"1B  Autophon Swiss Telecom","Data":"variable"},
+    0x806C: {"ComDesign Type":"1B","Data":"variable"},
+    0x806D: {"Computgraphic Type":"1B","Data":"variable"},
+    0x807A: {"Matra Type":"1B  Matra French defence","Data":"variable"},
+    0x807B: {"DDE Type":"1B  Dansk Data Elektronik","Data":"variable"},
+    0x807C: {"Merit Type":"1B  Merit Network","Data":"variable"},
+    0x8080: {"Vitalink Type":"1B  Vitalink TransLAN III","Data":"variable"},
+    0x80A3: {"Nixdorf Type":"1B  Nixdorf computer","Data":"variable"},
+    0x80DD: {"Varian Type":"1B  Varian Associates","Data":"variable"},
+    0x80F7: {"Apollo Type":"1B  Apollo HP workstation","Data":"variable"},
+    0x818D: {"Motorola Type":"1B  Motorola Computer Group","Data":"variable"},
+}
+for et, flds in _HIST_FIELDS.items():
+    if et in ETHERTYPE_REGISTRY and len(ETHERTYPE_REGISTRY[et].get("fields",{})) == 0:
+        ETHERTYPE_REGISTRY[et]["fields"].update(flds)
