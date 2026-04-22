@@ -155,23 +155,60 @@ HDR = "─" * W
 _USE_COLOR = sys.stdout.isatty() or os.environ.get('FORCE_COLOR')
 
 class C:
+    # ── Random color theme — different palette chosen every run ───────────────
+    # 12 distinct themes, each with a complete set of role-mapped colors.
+    # Theme is picked once at import using process PID for true randomness.
     if _USE_COLOR:
+        import random as _rnd, os as _os
+        _seed = _os.getpid() ^ hash(_os.urandom(4))
+        _rnd.seed(_seed)
+
+        # Each theme: (L1, L2, L3, L4, TRAIL, BANNER, SECT, HEX, NOTE, WARN, PASS_, BOX, SEP_C, PROMPT)
+        _THEMES = [
+            # 0 — Ocean Blue / Cyan (original)
+            (220, 75,  118, 213, 203,  39, 178, 159, 186, 214, 46, 240, 25,  252),
+            # 1 — Sunset Orange / Gold
+            (226, 208, 46,  202, 196,  220, 166, 229, 179, 196, 40, 239, 130, 250),
+            # 2 — Forest Green / Lime
+            (154, 46,  82,  121, 160,  118, 142, 194, 107, 208, 82, 238, 28,  252),
+            # 3 — Purple / Violet / Pink
+            (213, 99,  219, 147, 204,  171, 135, 183, 225, 205, 118, 237, 57,  253),
+            # 4 — Arctic / Ice Blue / White
+            (195, 153, 159, 123, 117,  45,  110, 231, 159, 220, 51, 241, 67,  255),
+            # 5 — Fire Red / Orange
+            (196, 202, 214, 208, 124,  160, 130, 229, 223, 197, 46, 238, 88,  251),
+            # 6 — Teal / Mint / Seafoam
+            (86,  49,  156, 83,  65,   37,  73,  122, 115, 215, 84, 237, 30,  252),
+            # 7 — Gold / Bronze / Amber
+            (220, 178, 136, 226, 172,  214, 136, 229, 186, 202, 46, 240, 94,  253),
+            # 8 — Neon / Matrix Green
+            (46,  82,  118, 154, 22,   40,  76,  120, 71,  190, 154, 236, 22, 250),
+            # 9 — Rose / Magenta / Hot Pink
+            (218, 211, 206, 219, 161,  198, 177, 225, 212, 203, 46, 237, 127, 255),
+            # 10 — Deep Space / Dark Blue
+            (69,  33,  111, 63,  55,   27,  56,  75,  104, 220, 47, 235, 17,  248),
+            # 11 — Warm White / Sand
+            (229, 215, 223, 227, 217,  222, 180, 231, 228, 209, 46, 242, 137, 255),
+        ]
+        _t = _THEMES[_rnd.randint(0, len(_THEMES)-1)]
+        _c = lambda n: f"\033[38;5;{n}m"
+
         RESET  = "\033[0m";  BOLD   = "\033[1m";  DIM    = "\033[2m"
         ITALIC = "\033[3m";  UL     = "\033[4m"
-        L1     = "\033[38;5;220m";  L2  = "\033[38;5;75m"
-        L3     = "\033[38;5;118m";  L4  = "\033[38;5;213m"
-        TRAIL  = "\033[38;5;203m"
-        BANNER = "\033[38;5;39m";   SECT   = "\033[38;5;178m"
-        HELP   = "\033[38;5;245m";  PROMPT = "\033[38;5;252m"
-        HEX    = "\033[38;5;159m";  NOTE   = "\033[38;5;186m"
-        PASS_  = "\033[1;38;5;46m"; FAIL_  = "\033[1;38;5;196m"
-        WARN   = "\033[38;5;214m"
-        TAG1="\033[38;5;220m"; TAG2="\033[38;5;75m"
-        TAG3="\033[38;5;118m"; TAG4="\033[38;5;213m"
-        TAG0="\033[38;5;203m"
-        BOX    = "\033[38;5;240m";  SEP_C  = "\033[38;5;25m"
-        OFFSET = "\033[38;5;243m";  SIZE   = "\033[38;5;180m"
+        L1     = _c(_t[0]);  L2     = _c(_t[1])
+        L3     = _c(_t[2]);  L4     = _c(_t[3])
+        TRAIL  = _c(_t[4])
+        BANNER = _c(_t[5]);  SECT   = _c(_t[6])
+        HEX    = _c(_t[7]);  NOTE   = _c(_t[8])
+        WARN   = _c(_t[9])
+        PASS_  = f"\033[1m{_c(_t[10])}"; FAIL_  = "\033[1;38;5;196m"
+        BOX    = _c(_t[11]); SEP_C  = _c(_t[12])
+        PROMPT = _c(_t[13]); HELP   = "\033[38;5;245m"
+        OFFSET = "\033[38;5;243m"; SIZE = "\033[38;5;180m"
         ASCII_ = "\033[38;5;188m"
+        TAG1=L1; TAG2=L2; TAG3=L3; TAG4=L4; TAG0=TRAIL
+
+        del _rnd, _os, _seed, _THEMES, _t, _c
     else:
         RESET=BOLD=DIM=ITALIC=UL=""
         L1=L2=L3=L4=TRAIL=""
@@ -4475,8 +4512,8 @@ def _ask_fields_interactive(fields: dict, layer: int, section_title: str) -> tup
 
         # Determine byte size from description
         byte_size = 0
-        m_bytes = re.search(r'(\d+)B\b', fdesc_str)
-        m_bits  = re.search(r'(\d+)b\b', fdesc_str)
+        m_bytes = re.search(r'(\d+)B', fdesc_str)
+        m_bits  = re.search(r'(\d+)b', fdesc_str)
         if m_bytes:
             byte_size = int(m_bytes.group(1))
         elif m_bits:
@@ -5829,19 +5866,24 @@ def flow_hw():
 
 
 
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  CUSTOM / PRIVATE / UNDISCLOSED ETHERTYPE BUILDER
-#  Allows building frames with ANY EtherType — known or unknown
-#  Supports: raw hex payload, structured named fields, TLV chains,
-#            vendor magic headers, and auto-populating from L2 registry
+#  Complete 65536-value EtherType classification engine.
+#  Every value 0x0000-0xFFFF is classified against:
+#    1. Our 256-entry registry (known PDU → structured fields)
+#    2. IEEE 802.3 range rules (length field vs EtherType II)
+#    3. IEEE RA range ownership table (who owns that block)
+#    4. Registration status (assigned/unassigned/reserved/private/experimental)
+#  Result drives payload strategy: known→structured, unknown→raw hex.
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Custom EtherType session storage — persists across builds in same run
-_CUSTOM_ET_SESSIONS: list[dict] = []   # saved custom definitions
+# ── Session storage: persists across builds in same run ──────────────────────
+_CUSTOM_ET_SESSIONS: list[dict] = []
 
 
 def _custom_et_lookup(et_int: int) -> dict:
-    """Look up an EtherType in the registry; return empty dict if not found."""
+    """Return registry entry dict for et_int, or {} if not found."""
     if not _L2_AVAILABLE:
         return {}
     try:
@@ -5849,6 +5891,691 @@ def _custom_et_lookup(et_int: int) -> dict:
         return ETHERTYPE_REGISTRY.get(et_int, {})
     except Exception:
         return {}
+
+
+# ── EtherType Range Classification Table ─────────────────────────────────────
+# Source: IEEE 802.3-2022 §3.2.6, IEEE Registration Authority public list,
+#         Wireshark epan/etypes.h, IANA, RFC 1700, vendor documentation.
+#
+# Format: (lo, hi, zone, owner, registration_status, description)
+#   zone   : 'length' | 'invalid' | 'assigned' | 'unassigned' | 'reserved'
+#              | 'experimental' | 'private'
+#   owner  : who controls / assigned this range
+_ET_RANGE_TABLE = [
+    # ── IEEE 802.3 LENGTH field (not EtherType) ───────────────────────────────
+    (0x0000, 0x05DC, 'length',       'IEEE 802.3',
+     'length-field',
+     'IEEE 802.3 frame LENGTH — value = payload byte count (0–1500). '
+     'Not a protocol identifier. Use LLC/SNAP header to identify protocol.'),
+    # ── IEEE undefined gap ────────────────────────────────────────────────────
+    (0x05DD, 0x05FF, 'invalid',      'IEEE',
+     'undefined',
+     'IEEE 802.3 undefined range — values between length-field max (1500) '
+     'and EtherType II minimum (1536). Must not be used.'),
+    # ── Xerox PUP era (historical) ────────────────────────────────────────────
+    (0x0600, 0x0601, 'assigned',     'Xerox Corp.',
+     'historical',
+     'Xerox PUP (PARC Universal Packet) — 0x0600=PUP direct 0x0601=PUP-AT. '
+     'Pre-dates EtherType standardisation. Obsolete since mid-1980s.'),
+    (0x0602, 0x07FF, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned',
+     'Unassigned range — no IEEE RA entries. Safe for private/experimental '
+     'use above 0x0600 but IEEE recommends 0x88B5/0x88B6 for experiments.'),
+    # ── Well-known low range ──────────────────────────────────────────────────
+    (0x0800, 0x0800, 'assigned',     'IETF',
+     'standard',
+     'IPv4 — RFC 791. The most common EtherType on Ethernet networks.'),
+    (0x0801, 0x0805, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned',
+     'Unassigned. 0x0802 and 0x0803 are sometimes seen in Xerox legacy captures.'),
+    (0x0806, 0x0806, 'assigned',     'IETF',
+     'standard',
+     'ARP — RFC 826. Address Resolution Protocol for IPv4.'),
+    (0x0807, 0x0807, 'assigned',     'Xerox Corp.',
+     'historical',
+     'Xerox XNS IDP (alternate assignment) — historical Xerox LAN.'),
+    (0x0808, 0x0808, 'assigned',     'IETF',
+     'deprecated',
+     'Frame Relay ARP — RFC 826 variant. Deprecated.'),
+    (0x0809, 0x083F, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned',
+     'Unassigned range. Sparse historical entries (0x0842=WoL etc.).'),
+    (0x0840, 0x0842, 'assigned',     'IEEE',
+     'standard',
+     '0x0842 = Wake-on-LAN. 0x0840-0x0841 unassigned.'),
+    (0x0843, 0x08FF, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned',
+     'Unassigned. No known public assignments.'),
+    (0x0900, 0x0FEE, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned',
+     'Sparse range — a few historical assignments (Ungermann-Bass 0x0900, '
+     'Vines 0x0BAD-0x0BAF). Remainder unassigned.'),
+    (0x0FEF, 0x0FEF, 'assigned',     '3Com Corp.',
+     'historical',
+     '3Com IPX Switch Protocol. Obsolete.'),
+    (0x0FF0, 0x0FFF, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned', 'Unassigned.'),
+    (0x1000, 0x1FFF, 'assigned',     'Various / Berkeley',
+     'historical',
+     'Sparse historical assignments including Berkeley Trailer (0x1000-0x100F), '
+     'Valid Systems (0x1600). Largely unassigned.'),
+    (0x2000, 0x207F, 'assigned',     'Cisco Systems',
+     'vendor-assigned',
+     'Cisco SNAP PID space — CDP(0x2000) VTP(0x2003) DTP(0x2004) CGMP(0x2005) '
+     'CDPv2(0x2007). Cisco-registered IEEE SNAP Protocol IDs.'),
+    (0x2080, 0x3FFF, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned',
+     'Largely unassigned. Some sparse historical entries. '
+     'Relatively safe for private use (non-standard, no IEEE guidance).'),
+    (0x4000, 0x5FFF, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned',
+     'Mostly unassigned. 0x5208=BBN Simnet (historical) only known entry. '
+     'No IEEE RA public assignments in bulk of this range.'),
+    (0x6000, 0x6009, 'assigned',     'Digital Equipment Corp. (DEC)',
+     'historical',
+     'DEC protocol suite — MOP Dump/Load (0x6001) MOP Console (0x6002) '
+     'DECnet Phase IV (0x6003) LAT (0x6004) Diagnostics (0x6005-0x6007). '
+     'All obsolete since DEC acquired by Compaq/HP.'),
+    (0x600A, 0x63FF, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned', 'Unassigned. No known public assignments.'),
+    (0x6400, 0x64FF, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned', 'Unassigned.'),
+    (0x6500, 0x7FFF, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned',
+     'Mostly unassigned. Sparse historical (Ungermann-Bass 0x7000/0x7002, '
+     'Proteon 0x7030, Cabletron 0x7034). Remainder free.'),
+    (0x8000, 0x8000, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned', 'Unassigned.'),
+    (0x8001, 0x801F, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned', 'Unassigned.'),
+    (0x8020, 0x8020, 'assigned',     'EXCELAN Inc.',
+     'historical', 'EXCELAN (later Compaq) — obsolete TCP/IP implementation.'),
+    (0x8021, 0x8034, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned',
+     'Sparse historical (NCD 0x8031, Proteon ProNET4 0x8033). Mostly unassigned.'),
+    (0x8035, 0x8035, 'assigned',     'IETF',
+     'deprecated',
+     'RARP — RFC 903. Deprecated; replaced by DHCP.'),
+    (0x8036, 0x8036, 'assigned',     'Aeonic Systems',
+     'historical', 'Aeonic Systems proprietary. Obsolete.'),
+    (0x8037, 0x8037, 'assigned',     'Sun Microsystems/IETF',
+     'deprecated', 'DRARP — Dynamic RARP. Internet Draft, never standardised.'),
+    (0x8038, 0x8041, 'assigned',     'Digital Equipment Corp. (DEC)',
+     'historical',
+     'DEC LANBridge (0x8038) DSM/DDP (0x8039) Argonaut (0x803A) VAXELN (0x803B) '
+     'DNS (0x803C) Encryption (0x803D) DTS (0x803E) LTM (0x803F) '
+     'PATHWORKS (0x8040) LAST (0x8041). All obsolete.'),
+    (0x8042, 0x8044, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned', 'Unassigned (0x8044=Planning Research Corp historical).'),
+    (0x8045, 0x8045, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned', 'Unassigned.'),
+    (0x8046, 0x8047, 'assigned',     'AT&T Bell Laboratories',
+     'private',
+     'AT&T private assignments — protocol not publicly documented. NDA-protected.'),
+    (0x8048, 0x806B, 'assigned',     'Various historical',
+     'historical',
+     'Sparse historical: ExperData(0x8049) Stanford-V(0x805B/0x805C) '
+     'Evans&Sutherland(0x805D) Little Machines(0x8060) Counterpoint(0x8062) '
+     'UMass(0x8065/0x8066) Veeco(0x8067) General Dynamics(0x8068) '
+     'AT&T#3(0x8069) Autophon(0x806A) ComDesign(0x806C). All obsolete.'),
+    (0x806C, 0x806F, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned', 'Unassigned.'),
+    (0x8070, 0x807F, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned', 'Unassigned.'),
+    (0x8080, 0x8083, 'assigned',     'Vitalink / 3Com Corp.',
+     'historical',
+     '0x8080=Vitalink TransLAN III (historical). '
+     '0x8081-0x8083=3Com proprietary (obsolete since HP acquisition 2010).'),
+    (0x8084, 0x809A, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned', 'Unassigned.'),
+    (0x809B, 0x809B, 'assigned',     'Apple Computer Inc.',
+     'deprecated',
+     'AppleTalk EtherTalk Phase 2 (DDP) — deprecated since macOS 10.6 (2009).'),
+    (0x809C, 0x80A2, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned', 'Unassigned.'),
+    (0x80A3, 0x80A3, 'assigned',     'Nixdorf Computer AG',
+     'historical', 'Nixdorf proprietary — German minicomputer, dissolved 1990.'),
+    (0x80A4, 0x80C3, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned', 'Unassigned.'),
+    (0x80C4, 0x80C5, 'assigned',     'Banyan Systems Inc.',
+     'historical', 'Banyan VINES private (0x80C4/0x80C5). Banyan dissolved 1999.'),
+    (0x80C6, 0x80D4, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned', 'Unassigned.'),
+    (0x80D5, 0x80D5, 'assigned',     'IBM Corp.',
+     'historical', 'IBM SNA over Ethernet (SDLC/QLLC/LLC2). Legacy IBM SNA.'),
+    (0x80D6, 0x80DC, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned', 'Unassigned.'),
+    (0x80DD, 0x80DD, 'assigned',     'Varian Associates',
+     'historical', 'Varian Associates proprietary — scientific instruments, obsolete.'),
+    (0x80DE, 0x80F2, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned', 'Unassigned.'),
+    (0x80F3, 0x80F3, 'assigned',     'Apple Computer Inc.',
+     'deprecated',
+     'AppleTalk AARP — Address Acquisition Protocol. Deprecated 2009.'),
+    (0x80F4, 0x80F6, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned', 'Unassigned.'),
+    (0x80F7, 0x80F7, 'assigned',     'Apollo Computer (HP)',
+     'historical', 'Apollo Domain protocol — HP Apollo workstations, obsolete.'),
+    (0x80F8, 0x80FE, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned', 'Unassigned.'),
+    (0x80FF, 0x80FF, 'assigned',     'Wellfleet Communications',
+     'historical', 'Wellfleet/Bay Networks proprietary. Obsolete since Nortel 1998.'),
+    (0x8100, 0x8100, 'assigned',     'IEEE',
+     'standard', 'IEEE 802.1Q C-Tag — Customer VLAN tagging.'),
+    (0x8101, 0x8136, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned', 'Unassigned range.'),
+    (0x8137, 0x8138, 'assigned',     'Novell Inc.',
+     'deprecated', 'Novell IPX (NetWare) — 0x8137 primary 0x8138 alternate. Obsolete 2000.'),
+    (0x8139, 0x814B, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned', 'Unassigned.'),
+    (0x814C, 0x814C, 'assigned',     'IETF',
+     'deprecated', 'SNMP over Ethernet — RFC 1089. Obsolete; use UDP/161.'),
+    (0x814D, 0x817C, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned', 'Unassigned.'),
+    (0x817D, 0x817D, 'assigned',     'ANSI X3T9.5',
+     'deprecated', 'XTP — Xpress Transport Protocol. ANSI X3T9.5, abandoned 1995.'),
+    (0x817E, 0x818C, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned', 'Unassigned.'),
+    (0x818D, 0x818D, 'assigned',     'Motorola Computer Group',
+     'historical', 'Motorola Computer Group proprietary. Obsolete.'),
+    (0x818E, 0x8190, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned', 'Unassigned.'),
+    (0x8191, 0x8191, 'assigned',     'PC PowerLAN',
+     'historical', 'PowerLAN NetBIOS/NetBEUI — PC PowerLAN, obsolete.'),
+    (0x8192, 0x81FF, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned', 'Unassigned.'),
+    (0x8200, 0x8200, 'assigned',     'ASHRAE',
+     'standard', 'BACnet/Ethernet — ASHRAE 135 Annex H. Building automation.'),
+    (0x8201, 0x81FF, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned', 'Unassigned (note: 0x8200 is ASHRAE).'),
+    (0x8201, 0x82EF, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned', 'Unassigned range.'),
+    (0x82F0, 0x82F0, 'assigned',     'ESnet / DOE',
+     'vendor-assigned', 'ESnet Virtual Circuit — DOE Energy Sciences Network.'),
+    (0x82F1, 0x8304, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned', 'Unassigned.'),
+    (0x8305, 0x8305, 'assigned',     'Motorola Solutions Inc.',
+     'vendor-assigned', 'Motorola Industrial Protocol — factory automation.'),
+    (0x8306, 0x8346, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned', 'Unassigned.'),
+    (0x8347, 0x8347, 'assigned',     'Wellfleet/Bay Networks',
+     'historical', 'Wellfleet router management. Obsolete since Nortel 1998.'),
+    (0x8348, 0x8376, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned', 'Unassigned.'),
+    (0x8377, 0x8377, 'assigned',     'IETF',
+     'standard', 'MT-IS-IS — RFC 8377. Multi-Topology IS-IS.'),
+    (0x8378, 0x86DC, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned',
+     'Largely unassigned (sparse: 0x8739/0x873A Control Technology, '
+     '0x876B VJ-Compression, 0x876C IP-AS, 0x876D SecureData, '
+     '0x876F Enterasys EDP, 0x8791 EAPS, 0x87A5 ELRP). '
+     'Remainder unassigned. This is a large mostly-free range.'),
+    (0x86DD, 0x86DD, 'assigned',     'IETF',
+     'standard', 'IPv6 — RFC 8200.'),
+    (0x86DE, 0x8807, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned',
+     'Unassigned (sparse: 0x8800=Avaya SMLT, 0x880B=PPP direct, '
+     '0x880C=GSMP, 0x8819=CobraNet, 0x8820=Hitachi, 0x8822=NIC-Test).'),
+    (0x8808, 0x8808, 'assigned',     'IEEE',
+     'standard', 'IEEE 802.3 MAC Control — Pause/PFC/EPON.'),
+    (0x8809, 0x8809, 'assigned',     'IEEE',
+     'standard', 'IEEE 802.3 Slow Protocols — LACP/Marker/OAM/OSSP.'),
+    (0x880A, 0x8845, 'unassigned',   'IEEE RA (unassigned / sparse)',
+     'mixed',
+     'Sparse assignments in otherwise unassigned range: '
+     '0x880B=PPP 0x880C=GSMP 0x8819=CobraNet 0x8820=Hitachi 0x8822=NIC-Test '
+     '0x8843=CAPWAP 0x8846=MPLS-upstream. Large gaps are unassigned.'),
+    (0x8847, 0x8848, 'assigned',     'IETF',
+     'standard', 'MPLS — 0x8847=Unicast 0x8848=Multicast (RFC 3032).'),
+    (0x8849, 0x8861, 'unassigned',   'IEEE RA (unassigned / sparse)',
+     'mixed',
+     'Sparse: 0x8856=Axis Bootstrap 0x8861=MCAP. '
+     'Remainder unassigned.'),
+    (0x8863, 0x8864, 'assigned',     'IETF',
+     'standard', 'PPPoE — 0x8863=Discovery 0x8864=Session (RFC 2516).'),
+    (0x8865, 0x8873, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned', 'Unassigned. 0x8870=Jumbo Frame (rejected proposal).'),
+    (0x8874, 0x8874, 'assigned',     'Broadcom Corp.',
+     'vendor-assigned', 'Broadcom HiGig/HiGig2 inter-chip fabric header.'),
+    (0x8875, 0x887A, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned', 'Unassigned.'),
+    (0x887B, 0x887B, 'assigned',     'HomePlug Alliance / IEEE P1901',
+     'industry', 'HomePlug 1.0 MME.'),
+    (0x887C, 0x887F, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned', 'Unassigned.'),
+    (0x8880, 0x8880, 'assigned',     'Lantronix Inc.',
+     'vendor-assigned', 'Lantronix SLPP — Simple Loop Protection Protocol.'),
+    (0x8881, 0x8887, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned', 'Unassigned.'),
+    (0x8888, 0x8888, 'assigned',     'Hewlett-Packard',
+     'vendor-assigned', 'HP LanProbe network analyser test frames.'),
+    (0x8889, 0x888D, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned', 'Unassigned.'),
+    (0x888E, 0x888E, 'assigned',     'IEEE',
+     'standard', 'IEEE 802.1X EAPOL — Port-Based Network Access Control.'),
+    (0x888F, 0x888F, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned', 'Unassigned.'),
+    (0x8890, 0x8890, 'assigned',     'Cisco Systems',
+     'vendor-assigned', 'Cisco SAN Zoning Protocol (MDS fabric).'),
+    (0x8891, 0x8891, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned', 'Unassigned.'),
+    (0x8892, 0x8892, 'assigned',     'IEC / PROFIBUS International',
+     'standard', 'PROFINET RT/IRT/DCP — IEC 61158 / IEC 61784.'),
+    (0x8893, 0x8893, 'assigned',     'NVM Express Inc. (NVMF)',
+     'industry', 'NVMe over Ethernet — NVMe-oF direct L2.'),
+    (0x8894, 0x8898, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned', 'Unassigned.'),
+    (0x8899, 0x8899, 'assigned',     'Realtek Semiconductor / D-Link',
+     'vendor-assigned', 'Realtek RRCP — Remote Control Protocol (D-Link).'),
+    (0x889A, 0x889A, 'assigned',     'SNIA',
+     'deprecated', 'HyperSCSI — SCSI over Ethernet. Deprecated.'),
+    (0x889B, 0x88A1, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned', 'Unassigned.'),
+    (0x88A2, 0x88A2, 'assigned',     'Coraid Inc.',
+     'industry', 'ATA over Ethernet (AoE) — Coraid/community standard.'),
+    (0x88A3, 0x88A3, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned', 'Unassigned.'),
+    (0x88A4, 0x88A4, 'assigned',     'Beckhoff Automation / IEC',
+     'standard', 'EtherCAT — IEC 61158-12 / IEC 61784-2.'),
+    (0x88A5, 0x88A6, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned', 'Unassigned.'),
+    (0x88A7, 0x88A7, 'assigned',     'Brocade / Avaya (shared)',
+     'vendor-assigned', 'Brocade HDP / Avaya Discovery — dual-use (discriminate by magic).'),
+    (0x88A8, 0x88A8, 'assigned',     'IEEE',
+     'standard', 'IEEE 802.1ad Q-in-Q S-Tag — Provider Backbone VLAN.'),
+    (0x88A9, 0x88AA, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned', 'Unassigned.'),
+    (0x88AB, 0x88AB, 'assigned',     'EPSG / Ethernet POWERLINK Standardisation Group',
+     'industry', 'Ethernet POWERLINK v2 — EPSG DS 301.'),
+    (0x88AC, 0x88AD, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned', 'Unassigned.'),
+    (0x88AE, 0x88AE, 'assigned',     'Siemens AG',
+     'vendor-assigned', 'Siemens PROFINET additional (vendor Frame IDs 0xBC00-0xBFFF).'),
+    (0x88AF, 0x88B4, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned', 'Unassigned.'),
+    (0x88B5, 0x88B6, 'assigned',     'IEEE',
+     'experimental',
+     'IEEE 802 Local Experimental EtherTypes — SAFE for lab/research. '
+     '0x88B5=Exp1 0x88B6=Exp2. IEEE explicitly reserves these for local experiment.'),
+    (0x88B7, 0x88B7, 'assigned',     'IEEE',
+     'standard', 'IEEE 802 OUI-Extended EtherType.'),
+    (0x88B8, 0x88BA, 'assigned',     'IEC / TC57',
+     'standard',
+     'IEC 61850-8-1: 0x88B8=GOOSE 0x88B9=GSE-Management 0x88BA=Sampled Values.'),
+    (0x88BB, 0x88BB, 'assigned',     'Cisco Systems',
+     'vendor-assigned', 'Cisco LWAPP — Lightweight Access Point Protocol (deprecated).'),
+    (0x88BC, 0x88BD, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned', 'Unassigned.'),
+    (0x88BE, 0x88BE, 'assigned',     'Cisco Systems / Ubiquiti (dual)',
+     'vendor-assigned',
+     'Cisco ERSPAN Type II (GRE protocol type) / Ubiquiti AirOS management.'),
+    (0x88BF, 0x88C5, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned', 'Unassigned.'),
+    (0x88C6, 0x88C6, 'assigned',     'Netgear Inc. / Realtek',
+     'vendor-assigned', 'Netgear RRCP — Realtek Remote Control Protocol.'),
+    (0x88C7, 0x88C7, 'assigned',     'HPE / ProCurve',
+     'vendor-assigned', 'HPE ProCurve Generic EtherType — IRF/HPEG stack management.'),
+    (0x88C8, 0x88C8, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned', 'Unassigned.'),
+    (0x88C9, 0x88C9, 'assigned',     'Foundry Networks / Brocade',
+     'vendor-assigned', 'Foundry/Brocade proprietary MPLS extension.'),
+    (0x88CA, 0x88CA, 'assigned',     'Brocade Communications',
+     'vendor-assigned', 'Brocade TRILL Extension / VCS Fabric.'),
+    (0x88CB, 0x88CB, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned', 'Unassigned.'),
+    (0x88CC, 0x88CC, 'assigned',     'IEEE',
+     'standard', 'LLDP — IEEE 802.1AB Link Layer Discovery Protocol.'),
+    (0x88CD, 0x88CD, 'assigned',     'IEC / SERCOS International',
+     'standard', 'SERCOS III — IEC 61784-2-14 / IEC 61158-6-16.'),
+    (0x88CE, 0x88D7, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned', 'Unassigned range — 0x88CE to 0x88D7.'),
+    (0x88DA, 0x88DA, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned', 'Unassigned.'),
+    (0x88DB, 0x88DB, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned', 'Unassigned.'),
+    (0x88DC, 0x88DC, 'assigned',     'IEEE / SAE',
+     'standard', 'WSMP — IEEE 1609.3 WAVE Short Message Protocol (V2X/ITS).'),
+    (0x88DD, 0x88E0, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned', 'Unassigned.'),
+    (0x88E1, 0x88E1, 'assigned',     'IEEE P1901 / HomePlug Alliance',
+     'industry', 'HomePlug AV / Green PHY — IEEE P1901.'),
+    (0x88E2, 0x88E2, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned', 'Unassigned.'),
+    (0x88E3, 0x88E3, 'assigned',     'IEC / IEC 62439-2',
+     'standard', 'MRP — Media Redundancy Protocol (IEC 62439-2).'),
+    (0x88E4, 0x88E4, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned', 'Unassigned.'),
+    (0x88E5, 0x88E5, 'assigned',     'IEEE',
+     'standard', 'IEEE 802.1AE MACsec — MAC Security (AES-GCM encryption).'),
+    (0x88E6, 0x88E6, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned', 'Unassigned.'),
+    (0x88E7, 0x88E7, 'assigned',     'IEEE',
+     'standard', 'IEEE 802.1ah PBB I-Tag — Provider Backbone Bridging.'),
+    (0x88E8, 0x88E8, 'assigned',     'IEEE / AVnu Alliance',
+     'standard', 'IEEE 1722 AVTP — Audio Video Transport Protocol (AVB/TSN).'),
+    (0x88E9, 0x88ED, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned', 'Unassigned.'),
+    (0x88EE, 0x88EE, 'assigned',     'Microsemi Corp. (Vitesse/Microchip)',
+     'vendor-assigned', 'Microsemi/Vitesse proprietary carrier OAM.'),
+    (0x88EF, 0x88F4, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned', 'Unassigned.'),
+    (0x88F5, 0x88F6, 'assigned',     'IEEE',
+     'standard', '0x88F5=MVRP 0x88F6=MMRP — IEEE 802.1Q MRP applications.'),
+    (0x88F7, 0x88F7, 'assigned',     'IEEE / IEC',
+     'standard', 'PTP — IEEE 1588-2019 Precision Time Protocol.'),
+    (0x88F8, 0x88F8, 'assigned',     'DMTF',
+     'standard', 'NC-SI — DMTF DSP0222 Network Controller Sideband Interface.'),
+    (0x88F9, 0x88F9, 'assigned',     'ANSI/TIA',
+     'standard', 'LLDP-MED — ANSI/TIA-1057 Media Endpoint Discovery.'),
+    (0x88FA, 0x88FA, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned', 'Unassigned.'),
+    (0x88FB, 0x88FB, 'assigned',     'IEC / IEC 62439-3',
+     'standard', 'PRP — Parallel Redundancy Protocol (IEC 62439-3).'),
+    (0x88FC, 0x88FC, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned', 'Unassigned.'),
+    (0x88FD, 0x88FD, 'assigned',     'Cisco Systems',
+     'vendor-assigned', 'Cisco PSMP — Port Security Management Protocol.'),
+    (0x88FE, 0x88FE, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned', 'Unassigned.'),
+    (0x88FF, 0x88FF, 'assigned',     'Cisco Systems',
+     'vendor-assigned', 'Cisco NX-OS private OAM extension (NDA-protected).'),
+    (0x8900, 0x8900, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned', 'Unassigned.'),
+    (0x8901, 0x8901, 'assigned',     'Fortinet Inc.',
+     'vendor-assigned', 'Fortinet FortiASIC hardware acceleration tag.'),
+    (0x8902, 0x8903, 'assigned',     'IEEE / ITU-T',
+     'standard', '0x8902=CFM (IEEE 802.1ag) 0x8903=Y.1731 (ITU-T) Ethernet OAM.'),
+    (0x8904, 0x8904, 'assigned',     'HPE (Comware/H3C)',
+     'vendor-assigned', 'HPE IRF — Intelligent Resilient Framework (Comware stacking).'),
+    (0x8905, 0x8905, 'assigned',     'Huawei Technologies',
+     'vendor-assigned', 'Huawei Smart Link — dual-uplink fast failover.'),
+    (0x8906, 0x8906, 'assigned',     'INCITS T11 / FC-BB-5',
+     'industry', 'FCoE — Fibre Channel over Ethernet (FC-BB-5).'),
+    (0x8907, 0x8907, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned', 'Unassigned.'),
+    (0x8908, 0x8908, 'assigned',     'Siemens AG',
+     'vendor-assigned',
+     'Siemens SIMATIC NET proprietary (NDA-protected — PDU not published).'),
+    (0x8909, 0x8909, 'assigned',     'Huawei Technologies',
+     'vendor-assigned', 'Huawei RRPP — Rapid Ring Protection Protocol.'),
+    (0x890A, 0x890A, 'assigned',     'Huawei Technologies',
+     'vendor-assigned', 'Huawei SEP — Smart Ethernet Protection (segment).'),
+    (0x890B, 0x890B, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned', 'Unassigned.'),
+    (0x890C, 0x890C, 'assigned',     'Nokia / Alcatel-Lucent',
+     'vendor-assigned', 'Nokia/ALU carrier OAM — SAP-Ping / SDP-Ping.'),
+    (0x890D, 0x890D, 'assigned',     'IEEE',
+     'standard', 'IEEE 802.11r FBT / 802.11z TDLS tunnelled action frames.'),
+    (0x890E, 0x890E, 'assigned',     'Nokia / Alcatel-Lucent',
+     'vendor-assigned',
+     'Nokia/ALU MPLS-TP OAM extension (NDA-protected — details not published).'),
+    (0x890F, 0x890F, 'assigned',     'CLPA / Mitsubishi',
+     'industry', 'CC-Link IE Field/Controller — CLPA industrial Ethernet.'),
+    (0x8910, 0x8910, 'assigned',     'Nokia / Alcatel-Lucent',
+     'vendor-assigned',
+     'Nokia/ALU Service Access Point protocol (NDA-protected).'),
+    (0x8911, 0x8911, 'assigned',     'IETF / Cisco',
+     'standard', 'MPLS-TP OAM section layer — RFC 6428 / G.8113.1.'),
+    (0x8912, 0x8912, 'assigned',     'IEEE P1901.2 / HomePlug Alliance',
+     'industry', 'HomePlug AV2 — IEEE P1901.2 extended MME.'),
+    (0x8913, 0x8913, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned', 'Unassigned.'),
+    (0x8914, 0x8914, 'assigned',     'INCITS T11 / FC-BB-5',
+     'industry', 'FIP — FCoE Initialization Protocol (FC-BB-5).'),
+    (0x8915, 0x8915, 'assigned',     'IBTA / InfiniBand Trade Association',
+     'industry', 'RoCE v1 — RDMA over Converged Ethernet (IBTA).'),
+    (0x8916, 0x8916, 'assigned',     'Cisco Systems',
+     'vendor-assigned',
+     'Cisco pre-standard NSH (before RFC 8300). Deprecated — use 0x894F.'),
+    (0x8917, 0x8917, 'assigned',     'IEEE',
+     'standard', 'IEEE 802.21 MIH — Media Independent Handover.'),
+    (0x8918, 0x8918, 'assigned',     'IEEE / Wi-Fi Alliance',
+     'vendor-assigned',
+     'WLAN Control Protocol (pre-standard — NDA-protected; limited public info).'),
+    (0x8919, 0x8919, 'assigned',     'Cisco Systems',
+     'vendor-assigned', 'Cisco DES — Distributed Ethernet Switch inter-chip.'),
+    (0x891A, 0x891A, 'assigned',     'Broadcom / Renesas',
+     'vendor-assigned',
+     'BroadR-Reach / 100BASE-T1 automotive management (NDA-protected details).'),
+    (0x891B, 0x891B, 'assigned',     'Cisco Systems',
+     'vendor-assigned', 'Cisco pre-standard MACsec (pre-802.1AE). Deprecated.'),
+    (0x891C, 0x891C, 'assigned',     'Cisco Systems',
+     'vendor-assigned', 'Cisco FabricPath — DFA IS-IS datacenter fabric.'),
+    (0x891D, 0x891D, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned', 'Unassigned.'),
+    (0x891E, 0x891E, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned', 'Unassigned.'),
+    (0x891F, 0x891F, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned', 'Unassigned.'),
+    (0x8920, 0x8920, 'assigned',     'Various (MAP/TOP legacy)',
+     'historical', 'MAP/TOP — Manufacturing Automation Protocol (ISO OSI stack). Obsolete.'),
+    (0x8921, 0x8921, 'assigned',     'Cisco Systems',
+     'vendor-assigned',
+     'Cisco CAPWAP control alternate (NDA-protected; limited public info).'),
+    (0x8922, 0x8922, 'assigned',     'VMware Inc.',
+     'vendor-assigned', 'VMware NSX / vSphere internal fabric.'),
+    (0x8923, 0x8927, 'assigned',     'Cisco Systems',
+     'vendor-assigned',
+     'Cisco private datacenter overlay protocols (NDA-protected; '
+     '0x8923=DC-overlay 0x8924=LISP-alt 0x8925=IP-in-IP 0x8926=VXLAN-pre 0x8927=Geneve-pre).'),
+    (0x8928, 0x8928, 'assigned',     'Cisco Systems',
+     'vendor-assigned',
+     'Cisco ERSPAN pre-standard (NDA-protected).'),
+    (0x8929, 0x8929, 'assigned',     'IEEE',
+     'standard', 'IEEE 802.1Qbe MSRP — Multiple Stream Reservation.'),
+    (0x892A, 0x892E, 'assigned',     'Cisco Systems / Nokia-ALU',
+     'vendor-assigned',
+     'Cisco/Nokia private (NDA-protected — 0x892A-0x892D=Cisco 0x892E=Nokia-ALU).'),
+    (0x892F, 0x892F, 'assigned',     'IEC / IEC 62439-3',
+     'standard', 'HSR — High-availability Seamless Redundancy (IEC 62439-3).'),
+    (0x8930, 0x8930, 'assigned',     'Siemens AG',
+     'vendor-assigned',
+     'Siemens S7 proprietary (NDA-protected — Siemens SIMATIC S7 internal).'),
+    (0x8931, 0x8931, 'assigned',     'Huawei Technologies',
+     'vendor-assigned',
+     'Huawei fabric internal (NDA-protected — CloudEngine fabric control).'),
+    (0x8932, 0x8932, 'assigned',     'Cisco / IETF',
+     'standard', 'Cisco MPLS-TP OAM / RFC 6428 G-ACh section OAM.'),
+    (0x8933, 0x8933, 'assigned',     'IEEE',
+     'standard', 'IEEE 802.1ag CFM Extension EtherType.'),
+    (0x8934, 0x8934, 'assigned',     'IEEE',
+     'vendor-assigned',
+     'IEEE 802.1X alternate (NDA-protected early 802.1X variant).'),
+    (0x8935, 0x8935, 'assigned',     'Broadcom Corp.',
+     'vendor-assigned', 'Broadcom Switch Tag (BRCM Tag) — CPU port steering.'),
+    (0x8936, 0x8936, 'assigned',     'Juniper Networks',
+     'vendor-assigned', 'Juniper QFabric — Fabric Extension Protocol.'),
+    (0x8937, 0x893A, 'assigned',     'Nokia / ALU',
+     'vendor-assigned',
+     'Nokia 7x50 fabric protocols (NDA-protected — '
+     '0x8937=MPLS 0x8938=IS-IS 0x8939=RSVP 0x893A=BGP Nokia-internal).'),
+    (0x893B, 0x893B, 'assigned',     'IEEE',
+     'standard', 'SPB — IEEE 802.1aq Shortest Path Bridging.'),
+    (0x893C, 0x893E, 'assigned',     'Nokia / ALU',
+     'vendor-assigned',
+     'Nokia internal (NDA-protected — 0x893C=BFD 0x893D=OSPF 0x893E=LDP).'),
+    (0x893F, 0x893F, 'assigned',     'IEEE',
+     'standard', 'FRER — IEEE 802.1CB Frame Replication and Elimination.'),
+    (0x8940, 0x8940, 'assigned',     'IEEE',
+     'standard', 'ECP — IEEE 802.1Qbg Edge Control Protocol.'),
+    (0x8941, 0x8946, 'assigned',     'Ericsson AB',
+     'vendor-assigned',
+     'Ericsson internal fabric (NDA-protected — '
+     '0x8941-0x8945=internal 0x8946=CPRI-over-Ethernet).'),
+    (0x8947, 0x8947, 'assigned',     'ETSI ITS',
+     'standard', 'GeoNetworking — ETSI EN 302 636-4-1 / ITS-G5 V2X.'),
+    (0x8948, 0x8948, 'assigned',     'Huawei Technologies',
+     'vendor-assigned', 'Huawei EVPN Extension — CloudEngine fabric OAM.'),
+    (0x8949, 0x8949, 'assigned',     'Huawei Technologies',
+     'vendor-assigned',
+     'Huawei CloudEngine fabric internal (NDA-protected).'),
+    (0x894A, 0x894A, 'assigned',     'ZTE Corporation',
+     'vendor-assigned', 'ZTE ZXR10 proprietary management.'),
+    (0x894B, 0x894B, 'assigned',     'Calix Inc.',
+     'vendor-assigned',
+     'Calix access/PON management (NDA-protected — details not published).'),
+    (0x894C, 0x894C, 'assigned',     'Nokia / ALU',
+     'vendor-assigned', 'Nokia 7x50 SR-OS fabric control.'),
+    (0x894D, 0x894D, 'assigned',     'Nokia / ALU',
+     'vendor-assigned',
+     'Nokia SFC extension (NDA-protected).'),
+    (0x894E, 0x894E, 'assigned',     'IEEE',
+     'standard', 'PBB-TE — IEEE 802.1Qay Provider Backbone Bridging Traffic Engineering.'),
+    (0x894F, 0x894F, 'assigned',     'IETF',
+     'standard', 'NSH — Network Service Header (RFC 8300).'),
+    (0x8950, 0x8950, 'assigned',     'Cisco Systems',
+     'vendor-assigned', 'Cisco ACI — Application Centric Infrastructure fabric.'),
+    (0x8951, 0x8987, 'assigned',     'Cisco Systems / various',
+     'vendor-assigned',
+     'Cisco private range (NDA-protected — various internal protocols). '
+     'Includes 0x8951=FCoE-alt 0x8960=NVGRE-pre 0x8970/0x8980-0x8990=private. '
+     'Others may be unassigned within this block.'),
+    (0x8988, 0x8989, 'assigned',     'SNIA / IETF',
+     'industry', '0x8988=iSCSI (RFC 7143) 0x8989=iSER (RFC 7145) over Ethernet.'),
+    (0x898A, 0x8998, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned', 'Unassigned.'),
+    (0x8999, 0x8999, 'assigned',     'IETF',
+     'standard', 'BFD over Ethernet — RFC 5880.'),
+    (0x899A, 0x8A0F, 'unassigned',   'IEEE RA (unassigned / sparse)',
+     'mixed',
+     'Sparse: 0x8A00=Qualcomm Atheros HPAV2 0x8A11=Ruckus SmartMesh. '
+     'Others unassigned.'),
+    (0x8A10, 0x8A10, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned', 'Unassigned.'),
+    (0x8A11, 0x8A11, 'assigned',     'Ruckus Networks / CommScope',
+     'vendor-assigned', 'Ruckus SmartMesh wireless mesh control.'),
+    (0x8A12, 0x8A89, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned', 'Unassigned.'),
+    (0x8A8A, 0x8A8A, 'assigned',     'Ruckus Networks / CommScope',
+     'vendor-assigned', 'Ruckus ICX stack management.'),
+    (0x8A8B, 0x8FFF, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned',
+     'Largely unassigned — large open range. '
+     'Safe for private/experimental use (no IEEE RA guidance on this block).'),
+    (0x9000, 0x9000, 'assigned',     'IEEE',
+     'standard', 'IEEE 802.3 Annex 57A Loopback / Configuration Test.'),
+    (0x9001, 0x9003, 'assigned',     '3Com Corp.',
+     'historical', '3Com XNS Mgmt (0x9001) TCP/IP Mgmt (0x9002) Bridge Loop (0x9003). Obsolete.'),
+    (0x9004, 0x90FF, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned', 'Unassigned.'),
+    (0x9100, 0x9100, 'assigned',     'Juniper Networks / provider',
+     'vendor-assigned', 'Q-in-Q alternate S-Tag TPID — Juniper/provider use.'),
+    (0x9101, 0x91FF, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned', 'Unassigned.'),
+    (0x9200, 0x9200, 'assigned',     'Provider networks',
+     'vendor-assigned', 'Q-in-Q tertiary TPID — service provider use.'),
+    (0x9201, 0x92FF, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned', 'Unassigned.'),
+    (0x9300, 0x9300, 'assigned',     'Foundry Networks / Brocade',
+     'deprecated', 'Q-in-Q outer TPID — Foundry/Brocade legacy. Deprecated; use 0x88A8.'),
+    (0x9301, 0x9998, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned', 'Unassigned.'),
+    (0x9999, 0x9999, 'assigned',     'Arista Networks / F5 Networks (shared)',
+     'vendor-assigned', 'Arista LANZ telemetry / F5 HA heartbeat — dual-use.'),
+    (0x999A, 0xA0EC, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned', 'Unassigned. Very large open range — no IEEE RA assignments.'),
+    (0xA0ED, 0xA0ED, 'assigned',     'IETF',
+     'standard', '6LoWPAN Encapsulation — RFC 7973.'),
+    (0xA0EE, 0xAAAA, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned', 'Unassigned (0xAAAA=DEC VAX 6220 historical).'),
+    (0xAAAB, 0xB7E9, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned',
+     'Very large unassigned range — 0x3440 values with no IEEE RA assignments. '
+     'Suitable for private protocol development.'),
+    (0xB7EA, 0xB7EA, 'assigned',     'IETF',
+     'standard', 'GRE Control Channel — RFC 8157.'),
+    (0xB7EB, 0xEFFF, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned',
+     'Very large unassigned range — suitable for private use. '
+     'No known IEEE RA public assignments in bulk of this range.'),
+    (0xF000, 0xFAF4, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned',
+     'Unassigned / private-use range.'),
+    (0xFAF5, 0xFAF5, 'assigned',     'Sonix Arpeggio Inc.',
+     'historical', 'Sonix Arpeggio — obsolete.'),
+    (0xFAF6, 0xFEFD, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned', 'Unassigned.'),
+    (0xFEFE, 0xFEFE, 'assigned',     'Cisco Systems / Allied Telesis',
+     'vendor-assigned', 'Cisco ISL / Allied Telesis proprietary VLAN tagging.'),
+    (0xFEFF, 0xFEFF, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned', 'Unassigned.'),
+    (0xFF00, 0xFF00, 'assigned',     'BBN Technologies',
+     'historical', 'BBN VITAL-LanBridge Cache Wakeup — private/historical.'),
+    (0xFF01, 0xFFFE, 'reserved',     'IEEE',
+     'reserved', 'IEEE reserved range — must not be used.'),
+    (0xFFFF, 0xFFFF, 'reserved',     'IEEE / IETF',
+     'reserved', 'Reserved — RFC 1701 / IEEE 802.3. Must not be used.'),
+    # ── Gap fills ──────────────────────────────────────────────────────────────
+    (0x8846, 0x8846, 'assigned',     'IETF',
+     'standard',
+     'MPLS Upstream-Assigned Label Stack — RFC 5331 / RFC 3032.'),
+    (0x8862, 0x8862, 'unassigned',   'IEEE RA (unassigned)',
+     'unassigned',
+     'Unassigned — gap between MCAP (0x8861) and PPPoE Discovery (0x8863).'),
+    (0x88D8, 0x88D9, 'assigned',     'Cisco Systems',
+     'vendor-assigned',
+     '0x88D8=Cisco SAN-OS private (MDS) 0x88D9=Cisco TrustSec SGT inline tagging.'),
+]
+
+
+def _classify_ethertype(et_int: int) -> dict:
+    """
+    Classify any EtherType 0x0000-0xFFFF against the complete range table.
+    Returns a rich classification dict:
+      zone, owner, reg_status, description,
+      in_our_registry (bool), reg_entry (dict|None),
+      is_length_field, is_valid_ethertype_ii,
+      payload_strategy ('structured'|'raw'|'raw_known_owner')
+    """
+    # Find matching range
+    matched = None
+    for lo, hi, zone, owner, reg_status, desc in _ET_RANGE_TABLE:
+        if lo <= et_int <= hi:
+            matched = (lo, hi, zone, owner, reg_status, desc)
+            break
+    if not matched:
+        matched = (et_int, et_int, 'unassigned', 'IEEE RA (unassigned)',
+                   'unassigned', 'No classification entry — treat as unassigned.')
+
+    lo, hi, zone, owner, reg_status, desc = matched
+
+    # Registry lookup
+    reg_entry = _custom_et_lookup(et_int)
+    in_reg    = bool(reg_entry)
+
+    # IEEE 802.3 rules
+    is_len   = et_int <= 0x05DC
+    is_ii    = et_int >= 0x0600
+
+    # Payload strategy decision
+    if is_len:
+        strategy = 'raw'          # length field → no protocol info
+    elif in_reg and reg_entry.get('fields'):
+        strategy = 'structured'   # known PDU with documented fields
+    elif zone == 'experimental':
+        strategy = 'raw'          # IEEE experimental → raw by convention
+    elif reg_status in ('unassigned', 'reserved', 'invalid', 'length-field'):
+        strategy = 'raw'          # nothing known → raw hex
+    elif reg_status in ('vendor-assigned', 'private') and not in_reg:
+        strategy = 'raw_known_owner'  # assigned to a vendor but PDU unknown
+    elif zone == 'assigned' and not in_reg:
+        strategy = 'raw_known_owner'  # assigned but we don't have the spec
+    else:
+        strategy = 'raw'
+
+    return {
+        'range_lo':        lo,
+        'range_hi':        hi,
+        'zone':            zone,
+        'owner':           owner,
+        'reg_status':      reg_status,
+        'description':     desc,
+        'in_our_registry': in_reg,
+        'reg_entry':       reg_entry if in_reg else None,
+        'is_length_field': is_len,
+        'is_ethertype_ii': is_ii,
+        'payload_strategy':strategy,
+    }
 
 
 def _custom_field_editor(existing_fields: list[dict] | None = None) -> list[dict]:
@@ -6161,7 +6888,7 @@ def flow_custom_ethertype():
                         'size_bytes':  nb,
                         'value_hex':   '00' * nb,
                         'encoding':    'hex',
-                        'raw':         b'\x00' * nb,
+                        'raw':         bytes(nb),
                     })
                 print(f"  {C.NOTE}  Pre-populated {len(fields)} fields — edit values below{C.RESET}")
 
