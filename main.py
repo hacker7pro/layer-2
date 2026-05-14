@@ -3079,55 +3079,505 @@ def ask_ip_options():
         return opt_bytes, [{"layer":3,"name":"IP Option Custom","raw":opt_bytes,
                             "user_val":opt_bytes.hex()[:24],"note":f"{len(opt_bytes)}B"}]
 
+def _build_ip_proto_pdu(proto_num: int) -> tuple[bytes, list[dict], int]:
+    """
+    Interactive PDU field builder for any IP protocol number.
+    Pulls field definitions from IP_PROTOCOL_REGISTRY and presents each
+    field to the user for input. Returns (raw_bytes, records, proto_num).
+    """
+    if not _L3_AVAILABLE:
+        return b'', [], proto_num
+
+    from l3_builder import IP_PROTOCOL_REGISTRY
+
+    info = IP_PROTOCOL_REGISTRY.get(proto_num, {})
+    name = info.get('name', f'Protocol-{proto_num}')
+    desc = info.get('description', '')
+    fields = info.get('fields', {})
+    apps  = info.get('applications', '')
+
+    section(f"IP PROTOCOL {proto_num} — {name}")
+    print(f"  {C.DIM}  {desc[:100]}{C.RESET}")
+    if apps:
+        print(f"  {C.NOTE}  Uses: {apps[:90]}{C.RESET}")
+
+    # ── Protocol-specific full builders ─────────────────────────────────────
+    raw = b''; records = []
+
+    # ── GRE (47) ─────────────────────────────────────────────────────────────
+    if proto_num == 47:
+        print(f"\n  {C.DIM}  GRE flags: C=Checksum present  K=Key present  S=Seq present{C.RESET}")
+        c_bit = input(f"  {C.PROMPT}Checksum present? (y/n) [n]: {C.RESET}").strip().lower()=='y'
+        k_bit = input(f"  {C.PROMPT}Key present?      (y/n) [n]: {C.RESET}").strip().lower()=='y'
+        s_bit = input(f"  {C.PROMPT}Sequence present? (y/n) [n]: {C.RESET}").strip().lower()=='y'
+        proto_s = input(f"  {C.PROMPT}Inner EtherType (hex) [0x0800=IPv4]: {C.RESET}").strip() or '0800'
+        try:    inner_et = int(proto_s.replace('0x',''), 16)
+        except: inner_et = 0x0800
+        flags = ((1<<15) if c_bit else 0) | ((1<<13) if k_bit else 0) | ((1<<12) if s_bit else 0)
+        hdr = struct.pack('>HH', flags, inner_et)
+        if c_bit:
+            hdr += struct.pack('>HH', 0, 0)   # checksum+reserved (fill after)
+        if k_bit:
+            key_s = input(f"  {C.PROMPT}GRE Key (decimal) [12345]: {C.RESET}").strip() or '12345'
+            hdr += struct.pack('>I', int(key_s) & 0xFFFFFFFF)
+        if s_bit:
+            seq_s = input(f"  {C.PROMPT}GRE Sequence (decimal) [0]: {C.RESET}").strip() or '0'
+            hdr += struct.pack('>I', int(seq_s) & 0xFFFFFFFF)
+        print(f"  {C.DIM}  Inner payload hex (Enter=empty — add encapsulated packet bytes):{C.RESET}")
+        inner_s = input(f"  {C.PROMPT}Inner payload hex: {C.RESET}").strip().replace(' ','')
+        try:    inner = bytes.fromhex(inner_s)
+        except: inner = b''
+        raw = hdr + inner
+        records = [
+            {'layer':4,'name':'GRE Flags','raw':hdr[0:2],'user_val':f'0x{flags:04X}',
+             'note':f'C={int(c_bit)} K={int(k_bit)} S={int(s_bit)}'},
+            {'layer':4,'name':'GRE Protocol','raw':hdr[2:4],'user_val':f'0x{inner_et:04X}',
+             'note':f'inner EtherType 0x{inner_et:04X}'},
+        ]
+        if inner: records.append({'layer':4,'name':'GRE Payload','raw':inner,
+                                   'user_val':f'{len(inner)}B','note':'encapsulated packet'})
+
+    # ── ESP (50) ──────────────────────────────────────────────────────────────
+    elif proto_num == 50:
+        spi_s = input(f"  {C.PROMPT}SPI — Security Parameter Index (hex) [0x00000001]: {C.RESET}").strip() or '00000001'
+        seq_s = input(f"  {C.PROMPT}Sequence Number (decimal) [1]: {C.RESET}").strip() or '1'
+        print(f"  {C.DIM}  Encrypted payload hex (represents ciphertext — AES-GCM-128/256):{C.RESET}")
+        pay_s = input(f"  {C.PROMPT}Encrypted payload hex [00×16]: {C.RESET}").strip().replace(' ','') or '00'*16
+        icv_s = input(f"  {C.PROMPT}ICV/Auth tag hex (16B=AES-GCM-128) [00×16]: {C.RESET}").strip().replace(' ','') or '00'*16
+        try:    spi = bytes.fromhex(spi_s.replace('0x','').zfill(8))
+        except: spi = b'\x00\x00\x00\x01'
+        seq = struct.pack('>I', int(seq_s) & 0xFFFFFFFF)
+        try:    pay = bytes.fromhex(pay_s)
+        except: pay = b'\x00'*16
+        try:    icv = bytes.fromhex(icv_s)
+        except: icv = b'\x00'*16
+        raw = spi + seq + pay + icv
+        records = [
+            {'layer':4,'name':'ESP SPI','raw':spi,'user_val':spi.hex().upper(),'note':'Security Parameter Index'},
+            {'layer':4,'name':'ESP Sequence','raw':seq,'user_val':seq_s,'note':'anti-replay counter'},
+            {'layer':4,'name':'ESP Payload','raw':pay,'user_val':f'{len(pay)}B','note':'encrypted ciphertext'},
+            {'layer':4,'name':'ESP ICV','raw':icv,'user_val':f'{len(icv)}B','note':'integrity check value'},
+        ]
+
+    # ── AH (51) ───────────────────────────────────────────────────────────────
+    elif proto_num == 51:
+        nh_s  = input(f"  {C.PROMPT}Next Header (decimal) [6=TCP 17=UDP 50=ESP]: {C.RESET}").strip() or '6'
+        spi_s = input(f"  {C.PROMPT}SPI (hex) [0x00000001]: {C.RESET}").strip().replace('0x','') or '00000001'
+        seq_s = input(f"  {C.PROMPT}Sequence Number (decimal) [1]: {C.RESET}").strip() or '1'
+        icv_s = input(f"  {C.PROMPT}ICV hex (12B=HMAC-SHA-96) [00×12]: {C.RESET}").strip().replace(' ','') or '00'*12
+        try:    spi = bytes.fromhex(spi_s.zfill(8))
+        except: spi = b'\x00\x00\x00\x01'
+        seq   = struct.pack('>I', int(seq_s) & 0xFFFFFFFF)
+        try:    icv = bytes.fromhex(icv_s)
+        except: icv = b'\x00'*12
+        pl_len = (len(icv) // 4) + 1   # AH payload len in 32-bit words minus 2
+        hdr = struct.pack('>BBH', int(nh_s), pl_len, 0)
+        raw = hdr + spi + seq + icv
+        records = [
+            {'layer':4,'name':'AH Next Header','raw':hdr[0:1],'user_val':nh_s,'note':f'IP#{nh_s}'},
+            {'layer':4,'name':'AH Payload Len','raw':hdr[1:2],'user_val':str(pl_len),'note':'(4B words) - 2'},
+            {'layer':4,'name':'AH Reserved','raw':hdr[2:4],'user_val':'0','note':'must be 0x0000'},
+            {'layer':4,'name':'AH SPI','raw':spi,'user_val':spi.hex().upper(),'note':'Security Parameter Index'},
+            {'layer':4,'name':'AH Sequence','raw':seq,'user_val':seq_s,'note':'anti-replay'},
+            {'layer':4,'name':'AH ICV','raw':icv,'user_val':f'{len(icv)}B','note':'HMAC-SHA-96 or AES-XCBC-96'},
+        ]
+
+    # ── OSPF (89) ─────────────────────────────────────────────────────────────
+    elif proto_num == 89:
+        OSPF_TYPES = {1:'Hello',2:'DBD',3:'LSR',4:'LSU',5:'LSAck'}
+        print(f"  {C.DIM}  OSPF message types: {OSPF_TYPES}{C.RESET}")
+        t_s   = input(f"  {C.PROMPT}OSPF Type [1=Hello]: {C.RESET}").strip() or '1'
+        rid_s = input(f"  {C.PROMPT}Router ID (IPv4 format) [1.1.1.1]: {C.RESET}").strip() or '1.1.1.1'
+        aid_s = input(f"  {C.PROMPT}Area ID  (IPv4 format) [0.0.0.0=backbone]: {C.RESET}").strip() or '0.0.0.0'
+        try:    t = int(t_s)
+        except: t = 1
+        try:    rid = socket.inet_aton(rid_s)
+        except: rid = b'\x01\x01\x01\x01'
+        try:    aid = socket.inet_aton(aid_s)
+        except: aid = b'\x00\x00\x00\x00'
+        body = b''
+        if t == 1:  # Hello — add Hello-specific fields
+            nmask_s  = input(f"  {C.PROMPT}Network Mask [255.255.255.0]: {C.RESET}").strip() or '255.255.255.0'
+            hello_s  = input(f"  {C.PROMPT}Hello Interval seconds [10]: {C.RESET}").strip() or '10'
+            dead_s   = input(f"  {C.PROMPT}Dead Interval seconds [40]: {C.RESET}").strip() or '40'
+            dr_s     = input(f"  {C.PROMPT}Designated Router IP [0.0.0.0]: {C.RESET}").strip() or '0.0.0.0'
+            bdr_s    = input(f"  {C.PROMPT}Backup DR IP [0.0.0.0]: {C.RESET}").strip() or '0.0.0.0'
+            try:    nmask = socket.inet_aton(nmask_s)
+            except: nmask = b'\xff\xff\xff\x00'
+            try:    dr  = socket.inet_aton(dr_s)
+            except: dr  = b'\x00\x00\x00\x00'
+            try:    bdr = socket.inet_aton(bdr_s)
+            except: bdr = b'\x00\x00\x00\x00'
+            body = nmask + struct.pack('>HBB', int(hello_s), 0x02, 0) + struct.pack('>H', int(dead_s)) + dr + bdr
+        pkt_len = 24 + len(body)
+        hdr = struct.pack('>BBH', 2, t, pkt_len) + rid + aid + struct.pack('>HH', 0, 0)
+        ck_val = inet_cksum(hdr + body)
+        hdr = hdr[:12] + struct.pack('>H', ck_val) + hdr[14:]
+        raw = hdr + body
+        records = [
+            {'layer':4,'name':'OSPF Version','raw':raw[0:1],'user_val':'2','note':'OSPFv2 RFC 2328'},
+            {'layer':4,'name':'OSPF Type','raw':raw[1:2],'user_val':t_s,'note':OSPF_TYPES.get(t,str(t))},
+            {'layer':4,'name':'OSPF Pkt Len','raw':raw[2:4],'user_val':str(pkt_len),'note':'bytes'},
+            {'layer':4,'name':'OSPF Router ID','raw':rid,'user_val':rid_s,'note':'originating router'},
+            {'layer':4,'name':'OSPF Area ID','raw':aid,'user_val':aid_s,'note':'0.0.0.0=backbone'},
+            {'layer':4,'name':'OSPF Checksum','raw':raw[12:14],'user_val':f'0x{ck_val:04X}','note':'auto'},
+            {'layer':4,'name':'OSPF AuType','raw':raw[14:16],'user_val':'0','note':'null auth'},
+            {'layer':4,'name':'OSPF Auth','raw':raw[16:24],'user_val':'0x00×8','note':'null auth data'},
+        ]
+        if body:
+            records.append({'layer':4,'name':'OSPF Body','raw':body,'user_val':f'{len(body)}B',
+                            'note':f'Type-{t} ({OSPF_TYPES.get(t,"")}) specific fields'})
+
+    # ── PIM (103) ─────────────────────────────────────────────────────────────
+    elif proto_num == 103:
+        PIM_TYPES={0:'Hello',1:'Register',2:'Register-Stop',3:'Join/Prune',
+                   4:'Bootstrap',5:'Assert',9:'State-Refresh'}
+        print(f"  {C.DIM}  PIM types: {PIM_TYPES}{C.RESET}")
+        t_s = input(f"  {C.PROMPT}PIM Type [0=Hello]: {C.RESET}").strip() or '0'
+        try:   t = int(t_s)
+        except: t = 0
+        hdr = struct.pack('>BBH', 0x20, t, 0)  # ver=2 type=t reserved=0 checksum=0
+        body = b'\x00\x01\x00\x00' if t==0 else b''  # Hello: option 1 (holdtime=0)
+        ck_val = inet_cksum(hdr + body)
+        hdr = hdr[:2] + struct.pack('>H', ck_val)
+        raw = hdr + body
+        records = [
+            {'layer':4,'name':'PIM Ver+Type','raw':raw[0:1],'user_val':f'ver=2 type={t}','note':PIM_TYPES.get(t,str(t))},
+            {'layer':4,'name':'PIM Reserved','raw':raw[1:2],'user_val':'0','note':''},
+            {'layer':4,'name':'PIM Checksum','raw':raw[2:4],'user_val':f'0x{ck_val:04X}','note':'auto RFC 7761'},
+        ]
+        if body: records.append({'layer':4,'name':'PIM Body','raw':body,'user_val':f'{len(body)}B','note':f'Type-{t} payload'})
+
+    # ── VRRP (112) ────────────────────────────────────────────────────────────
+    elif proto_num == 112:
+        vrid_s = input(f"  {C.PROMPT}Virtual Router ID (1-255) [1]: {C.RESET}").strip() or '1'
+        prio_s = input(f"  {C.PROMPT}Priority (0-255, 100=default, 255=owner) [100]: {C.RESET}").strip() or '100'
+        adv_s  = input(f"  {C.PROMPT}Advertisement Interval centiseconds [100=1s]: {C.RESET}").strip() or '100'
+        vip_s  = input(f"  {C.PROMPT}Virtual IP address [0.0.0.0]: {C.RESET}").strip() or '0.0.0.0'
+        try:    vip = socket.inet_aton(vip_s)
+        except: vip = b'\x00\x00\x00\x00'
+        vrid=int(vrid_s)&0xFF; prio=int(prio_s)&0xFF; adv=int(adv_s)&0xFFFF
+        hdr = struct.pack('>BBBBHH', 0x21, vrid, prio, 1, 0, adv) + vip
+        ck_val = inet_cksum(hdr)
+        hdr = hdr[:4] + struct.pack('>H', ck_val) + hdr[6:]
+        raw = hdr
+        records = [
+            {'layer':4,'name':'VRRP Ver+Type','raw':raw[0:1],'user_val':'ver=2 type=1','note':'Advertisement'},
+            {'layer':4,'name':'VRRP VRID','raw':raw[1:2],'user_val':vrid_s,'note':'Virtual Router ID'},
+            {'layer':4,'name':'VRRP Priority','raw':raw[2:3],'user_val':prio_s,'note':'100=default 255=owner'},
+            {'layer':4,'name':'VRRP Count','raw':raw[3:4],'user_val':'1','note':'1 virtual IP'},
+            {'layer':4,'name':'VRRP Checksum','raw':raw[4:6],'user_val':f'0x{ck_val:04X}','note':'auto RFC 5798'},
+            {'layer':4,'name':'VRRP Adv Int','raw':raw[6:8],'user_val':adv_s,'note':'centiseconds'},
+            {'layer':4,'name':'VRRP Virtual IP','raw':vip,'user_val':vip_s,'note':'protected gateway'},
+        ]
+
+    # ── SCTP (132) ────────────────────────────────────────────────────────────
+    elif proto_num == 132:
+        sp_s  = input(f"  {C.PROMPT}Source Port [49152]: {C.RESET}").strip() or '49152'
+        dp_s  = input(f"  {C.PROMPT}Destination Port [5000]: {C.RESET}").strip() or '5000'
+        vtag_s= input(f"  {C.PROMPT}Verification Tag (hex) [0x00000000]: {C.RESET}").strip() or '00000000'
+        SCTP_CHUNKS={0:'DATA',1:'INIT',2:'INIT-ACK',3:'SACK',4:'HB',5:'HB-ACK',6:'ABORT',7:'SHUTDOWN',14:'ERROR'}
+        print(f"  {C.DIM}  SCTP chunk types: {SCTP_CHUNKS}{C.RESET}")
+        ct_s  = input(f"  {C.PROMPT}Chunk Type [0=DATA]: {C.RESET}").strip() or '0'
+        try:    vtag = int(vtag_s.replace('0x',''), 16)
+        except: vtag = 0
+        try:    ct = int(ct_s)
+        except: ct = 0
+        sp=int(sp_s)&0xFFFF; dp=int(dp_s)&0xFFFF
+        chunk = struct.pack('>BBH', ct, 0, 4)   # minimal chunk: type+flags+len
+        hdr   = struct.pack('>HHII', sp, dp, vtag, 0)
+        ck_val = _sctp_crc32c(hdr + chunk) if '_sctp_crc32c' in dir() else 0
+        hdr   = hdr[:8] + struct.pack('>I', ck_val)
+        raw   = hdr + chunk
+        records = [
+            {'layer':4,'name':'SCTP Src Port','raw':raw[0:2],'user_val':sp_s,'note':''},
+            {'layer':4,'name':'SCTP Dst Port','raw':raw[2:4],'user_val':dp_s,'note':''},
+            {'layer':4,'name':'SCTP VTag','raw':raw[4:8],'user_val':f'0x{vtag:08X}','note':'Verification Tag'},
+            {'layer':4,'name':'SCTP Checksum','raw':raw[8:12],'user_val':f'0x{ck_val:08X}','note':'CRC-32c RFC 9260'},
+            {'layer':4,'name':'SCTP Chunk','raw':chunk,'user_val':f'Type={ct}','note':SCTP_CHUNKS.get(ct,str(ct))},
+        ]
+
+    # ── L2TP (115) ───────────────────────────────────────────────────────────
+    elif proto_num == 115:
+        print(f"  {C.DIM}  L2TP v3 over IP (RFC 3931) — control or data session{C.RESET}")
+        sess_s = input(f"  {C.PROMPT}Session ID (hex) [0x00000001]: {C.RESET}").strip() or '00000001'
+        cookie_s = input(f"  {C.PROMPT}Cookie hex (0/4/8 bytes, Enter=none): {C.RESET}").strip()
+        try:    sess = int(sess_s.replace('0x',''), 16)
+        except: sess = 1
+        try:    cookie = bytes.fromhex(cookie_s.replace(' ',''))
+        except: cookie = b''
+        hdr = struct.pack('>I', sess) + cookie
+        pay_s = input(f"  {C.PROMPT}L2TP payload hex (inner L2 frame, Enter=empty): {C.RESET}").strip()
+        try:    pay = bytes.fromhex(pay_s.replace(' ',''))
+        except: pay = b''
+        raw = hdr + pay
+        records = [
+            {'layer':4,'name':'L2TP Session ID','raw':raw[0:4],'user_val':f'0x{sess:08X}','note':'RFC 3931'},
+        ]
+        if cookie: records.append({'layer':4,'name':'L2TP Cookie','raw':cookie,'user_val':cookie.hex().upper(),'note':f'{len(cookie)}B cookie'})
+        if pay:    records.append({'layer':4,'name':'L2TP Payload','raw':pay,'user_val':f'{len(pay)}B','note':'inner L2 frame'})
+
+    # ── IGMP (2) ─────────────────────────────────────────────────────────────
+    elif proto_num == 2:
+        IGMP_TYPES={0x11:'Membership Query',0x16:'v2 Report',0x22:'v3 Report',0x17:'Leave Group'}
+        print(f"  {C.DIM}  IGMP types: {IGMP_TYPES}{C.RESET}")
+        t_s   = input(f"  {C.PROMPT}IGMP Type hex [0x11=Query]: {C.RESET}").strip() or '11'
+        mrt_s = input(f"  {C.PROMPT}Max Response Time (tenths of sec) [100=10s]: {C.RESET}").strip() or '100'
+        grp_s = input(f"  {C.PROMPT}Group Address [224.0.0.1]: {C.RESET}").strip() or '224.0.0.1'
+        try:    t = int(t_s, 16)
+        except: t = 0x11
+        try:    grp = socket.inet_aton(grp_s)
+        except: grp = b'\xe0\x00\x00\x01'
+        hdr = struct.pack('>BBH', t, int(mrt_s)&0xFF, 0) + grp
+        ck_val = inet_cksum(hdr)
+        hdr = hdr[:2] + struct.pack('>H', ck_val) + hdr[4:]
+        raw = hdr
+        records = [
+            {'layer':4,'name':'IGMP Type','raw':raw[0:1],'user_val':f'0x{t:02X}','note':IGMP_TYPES.get(t,str(t))},
+            {'layer':4,'name':'IGMP Max Resp','raw':raw[1:2],'user_val':mrt_s,'note':'tenths of seconds'},
+            {'layer':4,'name':'IGMP Checksum','raw':raw[2:4],'user_val':f'0x{ck_val:04X}','note':'auto'},
+            {'layer':4,'name':'IGMP Group','raw':grp,'user_val':grp_s,'note':'multicast group (0.0.0.0=general query)'},
+        ]
+
+    # ── EIGRP (88) ────────────────────────────────────────────────────────────
+    elif proto_num == 88:
+        EIGRP_OP={1:'Update',3:'Query',4:'Reply',5:'Hello',10:'SIA-Query',11:'SIA-Reply'}
+        print(f"  {C.DIM}  EIGRP opcodes: {EIGRP_OP}{C.RESET}")
+        op_s  = input(f"  {C.PROMPT}Opcode [5=Hello]: {C.RESET}").strip() or '5'
+        as_s  = input(f"  {C.PROMPT}Autonomous System Number [1]: {C.RESET}").strip() or '1'
+        seq_s = input(f"  {C.PROMPT}Sequence Number [0]: {C.RESET}").strip() or '0'
+        ack_s = input(f"  {C.PROMPT}Acknowledge Number [0]: {C.RESET}").strip() or '0'
+        try:   op=int(op_s); asn=int(as_s); seq=int(seq_s); ack=int(ack_s)
+        except: op=5; asn=1; seq=0; ack=0
+        hdr = struct.pack('>BBHIII', 2, op, 0, asn, seq, ack)
+        ck_val = inet_cksum(hdr)
+        hdr = hdr[:2] + struct.pack('>H', ck_val) + hdr[4:]
+        raw = hdr
+        records = [
+            {'layer':4,'name':'EIGRP Version','raw':raw[0:1],'user_val':'2','note':'RFC 7868'},
+            {'layer':4,'name':'EIGRP Opcode','raw':raw[1:2],'user_val':op_s,'note':EIGRP_OP.get(op,str(op))},
+            {'layer':4,'name':'EIGRP Checksum','raw':raw[2:4],'user_val':f'0x{ck_val:04X}','note':'auto'},
+            {'layer':4,'name':'EIGRP AS','raw':raw[4:8],'user_val':as_s,'note':'Autonomous System'},
+            {'layer':4,'name':'EIGRP Sequence','raw':raw[8:12],'user_val':seq_s,'note':''},
+            {'layer':4,'name':'EIGRP Acknowledge','raw':raw[12:16],'user_val':ack_s,'note':''},
+        ]
+
+    # ── IPv4-in-IPv4 (4) / EtherIP (97/143) / IPIP (94) ─────────────────────
+    elif proto_num in (4, 94, 97, 143):
+        label = {4:'IPv4-in-IPv4',94:'IPIP-Encap',97:'EtherIP',143:'EtherIP'}.get(proto_num, str(proto_num))
+        print(f"  {C.DIM}  {label} — encapsulate inner packet as hex payload{C.RESET}")
+        inner_s = input(f"  {C.PROMPT}Inner packet hex (e.g. IP header + payload): {C.RESET}").strip().replace(' ','')
+        try:    inner = bytes.fromhex(inner_s)
+        except: inner = b''
+        if proto_num in (97, 143):
+            hdr = struct.pack('>H', 0x0300)   # EtherIP version=3
+            raw = hdr + inner
+            records = [
+                {'layer':4,'name':'EtherIP Ver','raw':hdr,'user_val':'0x0300','note':'ver=3 per RFC 3378'},
+            ]
+        else:
+            raw = inner
+            records = []
+        if inner:
+            records.append({'layer':4,'name':f'{label} Payload','raw':inner,
+                            'user_val':f'{len(inner)}B','note':'encapsulated packet'})
+
+    # ── RSVP (46) ────────────────────────────────────────────────────────────
+    elif proto_num == 46:
+        RSVP_MSG={1:'Path',2:'Resv',3:'PathErr',4:'ResvErr',5:'PathTear',6:'ResvTear',9:'Hello'}
+        print(f"  {C.DIM}  RSVP message types: {RSVP_MSG}{C.RESET}")
+        t_s = input(f"  {C.PROMPT}RSVP Msg Type [1=Path]: {C.RESET}").strip() or '1'
+        try:   t = int(t_s)
+        except: t = 1
+        hdr = struct.pack('>BBHBBH', 1, t, 0, 0, 0xFF, 4)   # ver+flags, type, cksum, reserved, ttl, rsvp-length
+        ck_val = inet_cksum(hdr)
+        hdr = hdr[:2] + struct.pack('>H', ck_val) + hdr[4:]
+        raw = hdr
+        records = [
+            {'layer':4,'name':'RSVP Version+Flags','raw':raw[0:1],'user_val':'1','note':'version=1'},
+            {'layer':4,'name':'RSVP Msg Type','raw':raw[1:2],'user_val':t_s,'note':RSVP_MSG.get(t,str(t))},
+            {'layer':4,'name':'RSVP Checksum','raw':raw[2:4],'user_val':f'0x{ck_val:04X}','note':'auto RFC 2205'},
+            {'layer':4,'name':'RSVP Reserved','raw':raw[4:5],'user_val':'0','note':''},
+            {'layer':4,'name':'RSVP TTL','raw':raw[5:6],'user_val':'255','note':'send TTL'},
+            {'layer':4,'name':'RSVP Length','raw':raw[6:8],'user_val':'4','note':'total length in bytes'},
+        ]
+
+    # ── IS-IS (124) ───────────────────────────────────────────────────────────
+    elif proto_num == 124:
+        ISIS_PDU={15:'L1-LAN-Hello',16:'L2-LAN-Hello',17:'P2P-Hello',18:'L1-LSP',20:'L2-LSP',24:'L1-CSNP',25:'L2-CSNP'}
+        print(f"  {C.DIM}  IS-IS PDU types: {ISIS_PDU}{C.RESET}")
+        t_s = input(f"  {C.PROMPT}PDU Type [17=P2P-Hello]: {C.RESET}").strip() or '17'
+        try:   t = int(t_s)
+        except: t = 17
+        raw = struct.pack('>BBBBBB', 0x83, 27, 1, 1, t, 0)
+        records = [
+            {'layer':4,'name':'IS-IS NLPID','raw':raw[0:1],'user_val':'0x83','note':'ISO 9577 IS-IS identifier'},
+            {'layer':4,'name':'IS-IS Hdr Len','raw':raw[1:2],'user_val':'27','note':'header length bytes'},
+            {'layer':4,'name':'IS-IS Version','raw':raw[2:3],'user_val':'1','note':'IS-IS version'},
+            {'layer':4,'name':'IS-IS IDLen','raw':raw[3:4],'user_val':'1','note':'System-ID length (RFC 1195)'},
+            {'layer':4,'name':'IS-IS PDU Type','raw':raw[4:5],'user_val':t_s,'note':ISIS_PDU.get(t,str(t))},
+            {'layer':4,'name':'IS-IS Version2','raw':raw[5:6],'user_val':'0','note':'must be 0'},
+        ]
+
+    # ── ICMPv6 (58) ───────────────────────────────────────────────────────────
+    elif proto_num == 58:
+        ICMP6_TYPES={1:'Dest-Unreachable',2:'Packet-Too-Big',3:'Time-Exceeded',4:'Param-Problem',
+                     128:'Echo-Request',129:'Echo-Reply',133:'Router-Solicitation',
+                     134:'Router-Advertisement',135:'Neighbour-Solicitation',136:'Neighbour-Advertisement'}
+        print(f"  {C.DIM}  ICMPv6 types: {ICMP6_TYPES}{C.RESET}")
+        t_s = input(f"  {C.PROMPT}ICMPv6 Type [128=Echo-Request]: {C.RESET}").strip() or '128'
+        c_s = input(f"  {C.PROMPT}ICMPv6 Code [0]: {C.RESET}").strip() or '0'
+        try:   t=int(t_s); c=int(c_s)
+        except: t=128; c=0
+        if t in (128,129):
+            id_s  = input(f"  {C.PROMPT}Echo ID [1]: {C.RESET}").strip() or '1'
+            seq_s = input(f"  {C.PROMPT}Echo Seq [1]: {C.RESET}").strip() or '1'
+            body  = struct.pack('>HH', int(id_s)&0xFFFF, int(seq_s)&0xFFFF)
+        else:
+            body = struct.pack('>I', 0)
+        hdr = struct.pack('>BBH', t, c, 0)
+        ck_val = inet_cksum(hdr + body)
+        hdr = hdr[:2] + struct.pack('>H', ck_val)
+        raw = hdr + body
+        records = [
+            {'layer':4,'name':'ICMPv6 Type','raw':raw[0:1],'user_val':t_s,'note':ICMP6_TYPES.get(t,str(t))},
+            {'layer':4,'name':'ICMPv6 Code','raw':raw[1:2],'user_val':c_s,'note':'sub-code'},
+            {'layer':4,'name':'ICMPv6 Checksum','raw':raw[2:4],'user_val':f'0x{ck_val:04X}','note':'pseudo-hdr over IPv6'},
+            {'layer':4,'name':'ICMPv6 Body','raw':body,'user_val':f'{len(body)}B','note':'type-specific'},
+        ]
+
+    # ── NSH (145) ────────────────────────────────────────────────────────────
+    elif proto_num == 145:
+        spi_s = input(f"  {C.PROMPT}Service Path Identifier (decimal) [1]: {C.RESET}").strip() or '1'
+        si_s  = input(f"  {C.PROMPT}Service Index (1-255) [255]: {C.RESET}").strip() or '255'
+        try:   spi=int(spi_s)&0xFFFFFF; si=int(si_s)&0xFF
+        except: spi=1; si=255
+        # NSH Base Header: ver=0 O=0 C=0 len=2 MD-Type=1 NextProto=3(Eth)
+        bhdr = struct.pack('>HBB', 0x0002, 1, 3)      # flags+len, MD-type, next-proto
+        sphdr = struct.pack('>I', (spi<<8)|si)          # SPI(24b)+SI(8b)
+        ctx   = b'\x00'*16                              # 4×32b fixed context headers
+        raw   = bhdr + sphdr + ctx
+        records = [
+            {'layer':4,'name':'NSH Base Hdr','raw':bhdr,'user_val':'ver=0 len=6W','note':'RFC 8300 §2.2'},
+            {'layer':4,'name':'NSH SPI+SI','raw':sphdr,'user_val':f'SPI={spi} SI={si}','note':'service path + index'},
+            {'layer':4,'name':'NSH Context','raw':ctx,'user_val':'16B','note':'MD-Type=1 fixed context headers'},
+        ]
+
+    # ── Generic fallback — field-by-field from registry ───────────────────────
+    else:
+        section(f"IP#{proto_num} — {name} — FIELD ENTRY")
+        print(f"  {C.DIM}  Enter each field value (hex bytes, Enter=skip/zero-fill):{C.RESET}")
+        all_bytes = b''
+        for fname, fdesc in fields.items():
+            if fname in ('CAUTION','Note','Status','Use Case','Foreign Agent','Inner Payload',
+                         'Inner IP Hdr','Outer IP Hdr','No Payload','note','applications'): continue
+            import re as _re
+            m = _re.search(r'(\d+)B\b', str(fdesc))
+            nb = max(1, min(64, int(m.group(1)))) if m else 1
+            hint = str(fdesc)[:60]
+            print(f"  {C.L3}  {fname:<28}{C.RESET}  {C.DIM}{hint}{C.RESET}")
+            val_s = input(f"  {C.PROMPT}    Value (hex, {nb}B) [{'00'*nb}]: {C.RESET}").strip().replace(' ','')
+            try:
+                val_b = bytes.fromhex(val_s.zfill(nb*2))[:nb]
+                if len(val_b) < nb: val_b = val_b + b'\x00'*(nb-len(val_b))
+            except:
+                val_b = b'\x00' * nb
+            all_bytes += val_b
+            records.append({'layer':4,'name':fname,'raw':val_b,
+                            'user_val':val_b.hex().upper(),'note':hint})
+        raw = all_bytes
+
+    return raw, records, proto_num
+
+
 def ask_ip_payload(preselected: str = ""):
     """
-    Ask user for IPv4 L4 payload type.
-    Shows all options mapped from l3_builder (IP protocols) and l4_builder (services).
-    If preselected is provided (from print_ipv4_l4_menu), use it directly.
+    Full IP protocol selection menu — all 46 active IANA protocols.
+    Shows categorised menu, returns (payload_bytes, records, proto_override).
     """
+    # Legacy compat — if called with preselected from old menu
     if preselected and preselected in ('1','2','3','4','5','6'):
-        # Map sub-menu choices to old 1-5 scheme
         MAP = {'1':'1','2':'2','3':'3','4':'4','5':'4','6':'5'}
         return MAP.get(preselected, '1')
 
-    section("IPv4 PAYLOAD  —  L4 Protocol Selection")
+    section("IPv4 PAYLOAD — IP PROTOCOL SELECTION")
 
-    # Pull IP protocol list from l3_builder
     if _L3_AVAILABLE:
         from l3_builder import IP_PROTOCOL_REGISTRY
-        print(f"  {C.DIM}  IP Protocol Registry: {len(IP_PROTOCOL_REGISTRY)} protocols "
-              f"(1=ICMP 6=TCP 17=UDP 47=GRE 50=ESP 89=OSPF ...){C.RESET}")
-
-    # Pull ICMP types from l3_builder
-    if _L3_AVAILABLE:
-        from l3_builder import ICMP_EXTENDED
-        icmp_names = [f"{t}={ICMP_EXTENDED[t]['name'][:12]}" for t in sorted(ICMP_EXTENDED)[:6]]
-        print(f"    {C.L4}1 = ICMP{C.RESET}  {C.DIM}Echo·Unreachable·TTL-Exceeded·Redirect  "
-              f"({len(ICMP_EXTENDED)} types: {' '.join(icmp_names)}...){C.RESET}")
+        ip_reg = IP_PROTOCOL_REGISTRY
     else:
-        print("    1 = ICMP  (Echo Request/Reply/Unreachable/Time Exceeded ...)")
+        ip_reg = {}
 
-    # Pull TCP states from l4_builder
-    if _L4_AVAILABLE:
-        from l4_builder import TCP_HANDSHAKE_STATES
-        tcp_names = '/'.join(list(TCP_HANDSHAKE_STATES.keys())[:5])
-        print(f"    {C.L4}2 = TCP{C.RESET}   {C.DIM}SYN/SYN-ACK/ACK/PSH+ACK/FIN/RST  "
-              f"(states: {tcp_names}...){C.RESET}")
-    else:
-        print("    2 = TCP   (SYN / SYN-ACK / ACK / PSH+ACK / FIN / RST)")
+    # Build categorised display
+    CATS = [
+        ("Transport",         [6,17,33,132,136],
+         "TCP · UDP · DCCP · SCTP · UDPLite"),
+        ("ICMP / Control",    [1,2,58,112,103,46],
+         "ICMP · IGMP · ICMPv6 · VRRP · PIM · RSVP"),
+        ("Routing",           [88,89,124],
+         "EIGRP · OSPF · IS-IS"),
+        ("Security / VPN",    [50,51,115,141],
+         "ESP · AH · L2TP · WESP"),
+        ("Tunnelling",        [4,41,47,94,97,143,108],
+         "IPv4-in-IP · IPv6 · GRE · IPIP · EtherIP · IPComp"),
+        ("IPv6 Extensions",   [0,43,44,59,60,135,140],
+         "HOPOPT · Route · Frag · NoNxt · Opts · MobileHdr · Shim6"),
+        ("Advanced / New",    [138,139,142,144,145],
+         "MANET · HIP · ROHC · AGGFRAG · NSH"),
+        ("Routing Protocols", [8,9,98,121,133],
+         "EGP · IGP · ENCAP · SMP · FC"),
+        ("Experimental",      [253,254],
+         "Exp1 · Exp2 (RFC 3692 §2.1 — lab use only)"),
+    ]
 
-    # Pull UDP ports from l4_builder
-    if _L4_AVAILABLE:
-        from l4_builder import PORT_REGISTRY
-        udp_svcs = [f"{p}/{i['name'][:8]}" for p,i in sorted(PORT_REGISTRY.items())
-                    if 'udp' in i.get('proto',[]) and i.get('status')=='Active'][:6]
-        print(f"    {C.L4}3 = UDP{C.RESET}   {C.DIM}{' · '.join(udp_svcs)}...{C.RESET}")
-    else:
-        print("    3 = UDP   (DNS / NTP / SNMP / custom ...)")
+    print(f"\n  {C.SECT}{C.BOLD}  ALL 46 IANA ACTIVE IP PROTOCOLS:{C.RESET}")
+    for cat_name, nums, shortlist in CATS:
+        avail = [n for n in nums if n in ip_reg]
+        print(f"\n  {C.L3}{cat_name:<18}{C.RESET}  {C.DIM}{shortlist}{C.RESET}")
+        for n in avail:
+            v   = ip_reg[n]
+            nm  = v.get('name','')[:20]
+            app = v.get('applications','')[:45]
+            print(f"    {C.HEX}{n:>3}{C.RESET}  {C.NOTE}{nm:<22}{C.RESET}  {C.DIM}{app[:50]}{C.RESET}")
 
-    print(f"    {C.L4}4 = Raw hex{C.RESET}  {C.DIM}GRE(47)·ESP(50)·AH(51)·OSPF(89) or any protocol{C.RESET}")
-    print(f"    {C.L4}5 = Empty{C.RESET}    {C.DIM}IPv4 header only — no L4 payload{C.RESET}")
-    return get("Payload type", "1")
+    print(f"\n  {C.SEP_C}{'─'*68}{C.RESET}")
+    print(f"  {C.BOLD}  BUILT-IN FULL BUILDERS  (show all fields interactively):{C.RESET}")
+    print(f"  {C.L4}    1{C.RESET} = ICMP  {C.DIM}(Type/Code/ID/Seq + full ICMP type table){C.RESET}")
+    print(f"  {C.L4}    2{C.RESET} = TCP   {C.DIM}(SYN/SYN-ACK/ACK/PSH/FIN/RST state machine){C.RESET}")
+    print(f"  {C.L4}    3{C.RESET} = UDP   {C.DIM}(src/dst port + payload + checksum){C.RESET}")
+    print(f"  {C.L4}  <num>{C.RESET} = Any protocol number above  {C.DIM}(interactive field entry){C.RESET}")
+    print(f"  {C.L4}    r{C.RESET}  = Raw hex  {C.DIM}(paste your own bytes directly){C.RESET}")
+    print(f"  {C.L4}    e{C.RESET}  = Empty    {C.DIM}(IPv4 header only, no payload){C.RESET}")
+
+    ch = input(f"\n  {C.PROMPT}Enter protocol number or (1=ICMP 2=TCP 3=UDP r=raw e=empty): {C.RESET}").strip().lower()
+
+    if ch == '1' or ch == 'icmp': return '1'
+    if ch == '2' or ch == 'tcp':  return '2'
+    if ch == '3' or ch == 'udp':  return '3'
+    if ch in ('r','raw','4'):      return '4'
+    if ch in ('e','empty','5',''):  return '5'
+
+    try:
+        proto_num = int(ch) & 0xFF
+    except ValueError:
+        print(f"  {C.WARN}  Unrecognised — defaulting to ICMP{C.RESET}")
+        return '1'
+
+    # Build PDU for the selected protocol
+    if proto_num == 1:  return '1'
+    if proto_num == 6:  return '2'
+    if proto_num == 17: return '3'
+
+    raw, records, pnum = _build_ip_proto_pdu(proto_num)
+    # Store result in global for the caller to pick up
+    global _IP_PROTO_PDU_RESULT
+    _IP_PROTO_PDU_RESULT = (raw, records, pnum)
+    return 'X'   # sentinel — caller must check _IP_PROTO_PDU_RESULT
+
+
+# Sentinel storage for IP protocol PDU results
+_IP_PROTO_PDU_RESULT: tuple = (b'', [], 0)
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  SECTION 9 — FLOW CONTROLLERS
@@ -4384,6 +4834,24 @@ def flow_ip_standalone(preselected_l4: str = ""):
         if l4_payload:
             l4_records = [{"layer":4,"name":"Raw Payload","raw":l4_payload,
                            "user_val":f"{len(l4_payload)}B","note":"raw hex"}]
+    elif payload_ch == 'X':
+        # Full IP protocol PDU built by _build_ip_proto_pdu()
+        _pdu_raw, _pdu_recs, _pdu_proto = _IP_PROTO_PDU_RESULT
+        l4_payload        = _pdu_raw
+        l4_proto_override = _pdu_proto
+        # Convert _build_ip_proto_pdu records to display records
+        l4_records = [
+            {"layer": r.get('layer', 4),
+             "name":  r.get('name', ''),
+             "raw":   r.get('raw', b''),
+             "user_val": r.get('user_val', ''),
+             "note":  r.get('note', '')}
+            for r in _pdu_recs
+        ]
+        if l4_payload:
+            from l3_builder import IP_PROTOCOL_REGISTRY
+            _proto_name = IP_PROTOCOL_REGISTRY.get(_pdu_proto, {}).get('name', f'IP#{_pdu_proto}')
+            print(f"\n  {C.PASS_}  Built {_proto_name} PDU — {len(l4_payload)}B{C.RESET}")
     # payload_ch == '5': empty — stays b''
 
     if l4_proto_override: proto_num = l4_proto_override
@@ -4710,7 +5178,7 @@ def flow_eth_generic(et_int: int):
             print(f"  {C.DIM}  {l3_entry.get('type_field','Type field')} determines the L4 protocol:{C.RESET}")
             type_list = list(l3_type_map.items())
             for i, (tval, tinfo) in enumerate(type_list, 1):
-                print(f"  {C.L3}  [{i:>2}]  {tval:<6}  {tinfo['name']:<20}  {C.DIM}{tinfo['usage']}{C.RESET}")
+                print(f"  {C.L3}  [{i:>2}]  {tval:<6}  {tinfo.get('name',''):<20}  {C.DIM}{tinfo.get('usage','')}{C.RESET}")
             type_ch = input(f"  {C.PROMPT}Choose type (1-{len(type_list)}, or Enter=1): {C.RESET}").strip() or '1'
             try:
                 tidx = int(type_ch) - 1
@@ -4719,7 +5187,7 @@ def flow_eth_generic(et_int: int):
                 tidx = 0
             chosen_type_val, chosen_type_info = type_list[tidx]
             l4_cls = chosen_type_info.get('l4', '')
-            print(f"  {C.PASS_}  → Selected: {chosen_type_info['name']} (type={chosen_type_val}){C.RESET}")
+            print(f"  {C.PASS_}  → Selected: {chosen_type_info.get('name','')} (type={chosen_type_val}){C.RESET}")
 
             # Encode the type value into the appropriate field
             # Find which field carries the type (usually it's in l3_fields or the 'type_field' desc)
@@ -4733,7 +5201,7 @@ def flow_eth_generic(et_int: int):
                         type_bytes = bytes([int(str(chosen_type_val), 16)])
                     all_payload += type_bytes
                     all_records.append({"layer":3,"name":f"Type ({type_key})","raw":type_bytes,
-                                        "user_val":str(chosen_type_val),"note":chosen_type_info['name']})
+                                        "user_val":str(chosen_type_val),"note":chosen_type_info.get('name','')})
                 except Exception:
                     pass
 
@@ -4932,8 +5400,8 @@ def _build_eth_selection_map() -> dict[str, object]:
             sel[str(num)] = (
                 'generic', et_int,
                 f"0x{et_int:04X}", pdu, l3c, cat,
-                info.get('usage','')[:60], info['name'][:50],
-                l4hint, info['status']
+                info.get('usage','')[:60], info.get('name','')[:50],
+                l4hint, info.get('status','')
             )
             num += 1
 
@@ -5574,7 +6042,7 @@ def print_ipv4_l4_menu():
     if icmp_types:
         print(f"       {C.DIM}ICMP Types from l3_builder ({len(icmp_types)} defined):{C.RESET}")
         for tnum, tinfo in sorted(icmp_types.items()):
-            print(f"         {C.L3}Type {tnum:>2}{C.RESET}  {C.DIM}{tinfo['name']:<32}  "
+            print(f"         {C.L3}Type {tnum:>2}{C.RESET}  {C.DIM}{tinfo.get('name',''):<32}  "
                   f"{tinfo.get('usage','')[:35]}{C.RESET}")
 
     # Option 2: TCP — show states from l4_builder TCP_HANDSHAKE_STATES
@@ -5597,25 +6065,112 @@ def print_ipv4_l4_menu():
                     if 'udp' in i.get('proto', []) and i.get('status') == 'Active'][:20]
         print(f"       {C.DIM}Well-known UDP ports from l4_builder ({len(udp_list)} shown):{C.RESET}")
         for port, pinfo in udp_list:
-            print(f"         {C.HEX}{port:>5}{C.RESET}  {C.DIM}{pinfo['name']:<22}  "
+            print(f"         {C.HEX}{port:>5}{C.RESET}  {C.DIM}{pinfo.get('name',''):<22}  "
                   f"{pinfo.get('usage','')[:35]}{C.RESET}")
 
-    # Option 4: Other IP protocols
-    print(f"\n  {C.BOLD}{C.L4}  [4]  Other IP Protocol{C.RESET}  "
-          f"{C.DIM}GRE(47) · ESP(50) · AH(51) · OSPF(89) · EIGRP(88) · SCTP(132) etc.{C.RESET}")
-    print(f"       {C.DIM}Enter protocol number manually — payload accepted as raw hex bytes{C.RESET}")
+    # ── Option 4+: ALL other IP protocols — full interactive PDU builders ───
+    print(f"\n  {C.BOLD}{C.L4}  [4+]  ALL OTHER IP PROTOCOLS — Enter the protocol number directly{C.RESET}")
+    print(f"  {C.SEP_C}  {'─'*70}{C.RESET}")
+
+    # Categorised listing of every non-TCP/UDP/ICMP protocol
+    _CATS = [
+        ("Security / VPN",
+         [50,51,115,141],
+         [(50,'ESP','IPsec encrypted tunnel — AES-GCM SPI+Seq+Payload+ICV'),
+          (51,'AH','IPsec auth-only — HMAC-SHA NextHdr+SPI+Seq+ICV'),
+          (115,'L2TP','Layer-2 Tunnel — SessionID+Cookie+inner L2 frame'),
+          (141,'WESP','Wrapped ESP — middlebox-visible ESP-NULL tunnel')]),
+        ("Tunnelling / Encap",
+         [47,4,94,97,143,108],
+         [(47,'GRE','Generic Routing Encap — Flags+Protocol+Key+Seq+inner'),
+          (4,'IPv4-in-IPv4','IP-in-IP tunnel — RFC 2003 outer+inner IPv4'),
+          (94,'IPIP','IP-in-IP variant — Mobile IPv4 foreign-agent tunnel'),
+          (97,'EtherIP','Ethernet in IP — RFC 3378 transparent L2 bridging'),
+          (143,'EtherIP-alt','Ethernet in IP (alt num) — same as 97 per RFC'),
+          (108,'IPComp','IP Payload Compression — DEFLATE/LZS before ESP')]),
+        ("ICMP / Control",
+         [2,58,112,103,46],
+         [(2,'IGMP','Multicast membership — Type+MaxRespTime+GroupAddr'),
+          (58,'ICMPv6','NDP/Router-Adv/Echo for IPv6 — Type+Code+Cksum'),
+          (112,'VRRP','Gateway redundancy — VRID+Priority+AdvInt+VirtualIP'),
+          (103,'PIM','Multicast routing — Hello/Join-Prune/Register/Assert'),
+          (46,'RSVP','Traffic engineering reservation — Path/Resv/Hello')]),
+        ("Routing Protocols",
+         [88,89,124],
+         [(88,'EIGRP','Cisco EIGRP — Opcode+AS+Seq+Ack+TLV payload'),
+          (89,'OSPF','Link-state IGP — Type+RouterID+AreaID+Hello/DBD/LSU'),
+          (124,'IS-IS','IS-IS over IP — PDU-Type+SystemID (RFC 1195)')]),
+        ("Transport / New",
+         [33,132,136,145],
+         [(33,'DCCP','Congestion-controlled datagrams — RFC 4340'),
+          (132,'SCTP','Multi-homed streams — SrcPort+DstPort+VTag+CRC32c'),
+          (136,'UDPLite','Partial-checksum UDP — media over lossy links'),
+          (145,'NSH','Service Function Chaining — SPI+SI+ContextHdrs')]),
+        ("IPv6 Extension Headers",
+         [0,43,44,59,60,135,140],
+         [(0,'HOPOPT','Hop-by-Hop Options — router-alert, jumbogram'),
+          (43,'IPv6-Route','Source Routing / SRv6 — Segment List'),
+          (44,'IPv6-Frag','Fragment Header — source-only fragmentation'),
+          (59,'IPv6-NoNxt','No Next Header — empty after last ext header'),
+          (60,'IPv6-Opts','Destination Options — Home Address, PDM'),
+          (135,'Mobility-Hdr','Mobile IPv6 BU/BA/HoTI/CoTI — RFC 6275'),
+          (140,'Shim6','Multihoming without BGP — RFC 5533')]),
+        ("Advanced / Research",
+         [138,139,142,144],
+         [(138,'MANET','OLSRv2/NHDP/DLEP mesh routing — RFC 7181'),
+          (139,'HIP','Host Identity Protocol — RFC 7401 id/locator split'),
+          (142,'ROHC','RoHC header compression — LTE/5G PDCP'),
+          (144,'AGGFRAG','ESP inner aggregation — RFC 9347 high-PPS IPsec')]),
+        ("Experimental",
+         [253,254],
+         [(253,'Exp1','RFC 3692 §2.1 — controlled lab use only'),
+          (254,'Exp2','RFC 3692 §2.1 — controlled lab use only')]),
+    ]
+
+    for cat_name, nums, entries in _CATS:
+        print(f"\n  {C.L3}  ── {cat_name} ──{C.RESET}")
+        for num, short_name, desc in entries:
+            avail_mark = f"{C.PASS_}[{num:>3}]{C.RESET}" if num in ip_protos else f"{C.DIM}[{num:>3}]{C.RESET}"
+            print(f"  {avail_mark}  {C.NOTE}{short_name:<14}{C.RESET}  {C.DIM}{desc[:55]}{C.RESET}")
+
+    print(f"\n  {C.DIM}  → Enter the number directly (e.g. 47 for GRE, 89 for OSPF){C.RESET}")
+    print(f"  {C.DIM}  → Each protocol shows its full PDU fields interactively{C.RESET}")
+    print(f"  {C.DIM}  → Checksums and lengths computed automatically where possible{C.RESET}")
 
     # Option 5: Raw hex
-    print(f"\n  {C.BOLD}{C.L4}  [5]  Raw hex payload{C.RESET}  "
+    print(f"\n  {C.BOLD}{C.L4}  [r]  Raw hex payload{C.RESET}  "
           f"{C.DIM}Any bytes — custom protocol / test pattern / tunnelled packet{C.RESET}")
 
     # Option 6: Empty
-    print(f"\n  {C.BOLD}{C.L4}  [6]  Empty{C.RESET}  "
+    print(f"\n  {C.BOLD}{C.L4}  [e]  Empty{C.RESET}  "
           f"{C.DIM}IPv4 header only — no L4 payload{C.RESET}")
 
     print(f"\n  {C.SEP_C}{SEP}{C.RESET}")
-    ch = input(f"  {C.PROMPT}Choose L4 option (1=ICMP  2=TCP  3=UDP  4=Other  5=Raw  6=Empty): {C.RESET}").strip()
-    return ch
+    ch = input(f"  {C.PROMPT}Choose: 1=ICMP  2=TCP  3=UDP  r=Raw  e=Empty  or protocol number (47/89/50…): {C.RESET}").strip().lower()
+
+    # Map old choices and new protocol numbers
+    if ch == '1' or ch == 'icmp':  return '1'
+    if ch == '2' or ch == 'tcp':   return '2'
+    if ch == '3' or ch == 'udp':   return '3'
+    if ch in ('4', 'raw', 'r', '5'): return '4'
+    if ch in ('6', 'empty', 'e', ''): return '5'
+
+    # Numeric protocol — pass to full builder
+    try:
+        proto_num = int(ch) & 0xFF
+    except ValueError:
+        print(f"  {C.WARN}  Unrecognised — defaulting to ICMP{C.RESET}")
+        return '1'
+
+    if proto_num == 1:  return '1'
+    if proto_num == 6:  return '2'
+    if proto_num == 17: return '3'
+
+    # Build full PDU for selected protocol
+    _raw, _recs, _pnum = _build_ip_proto_pdu(proto_num)
+    global _IP_PROTO_PDU_RESULT
+    _IP_PROTO_PDU_RESULT = (_raw, _recs, _pnum)
+    return 'X'
 
 
 def print_hw_menu():
@@ -5651,7 +6206,7 @@ def print_hw_menu():
     for i, (key, info) in enumerate(platforms, 1):
         buses = info['buses']
         chips = ', '.join(info['chipsets'][:2])
-        print(f"  {C.BOLD}{C.L2}  [{i:>2}]  {info['name'][:50]:<50}{C.RESET}")
+        print(f"  {C.BOLD}{C.L2}  [{i:>2}]  {info.get('name','')[:50]:<50}{C.RESET}")
         print(f"         {C.DIM}Chipsets : {chips}{C.RESET}")
         print(f"         {C.L3}Buses    : {len(buses)} protocols — {' · '.join(buses[:5])}{'...' if len(buses)>5 else ''}{C.RESET}")
         print(f"         {C.WARN}Attacks  : {info['attack_notes'][:75]}{C.RESET}")
@@ -5683,10 +6238,10 @@ def flow_hw():
     buses = plat_info['buses']
 
     SEP = '─' * 88
-    banner(f"HARDWARE FRAME — {plat_info['name']}",
+    banner(f"HARDWARE FRAME — {plat_info.get('name','')}",
            "Ethernet payload encapsulating hardware bus protocol frames")
 
-    print(f"\n  {C.SECT}{C.BOLD}▌ BUS PROTOCOLS for {plat_info['name']}{C.RESET}")
+    print(f"\n  {C.SECT}{C.BOLD}▌ BUS PROTOCOLS for {plat_info.get('name','')}{C.RESET}")
     print(f"  {C.SEP_C}{SEP}{C.RESET}")
     print(f"  {C.DIM}  {'No':>3}  {'Bus Protocol':<28}  {'Frame Boundary':<35}  {'Frame Size'}{C.RESET}")
     print(f"  {C.SEP_C}  {'─'*82}{C.RESET}")
