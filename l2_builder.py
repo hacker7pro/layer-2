@@ -4528,3 +4528,13 @@ _HIST_FIELDS = {
 for et, flds in _HIST_FIELDS.items():
     if et in ETHERTYPE_REGISTRY and len(ETHERTYPE_REGISTRY[et].get("fields",{})) == 0:
         ETHERTYPE_REGISTRY[et]["fields"].update(flds)
+
+# 0x88F6 MMRP — add "Attribute Type" searchable key per IEEE 802.1Q §10.8
+ETHERTYPE_REGISTRY[0x88F6]["fields"]["Attribute Type"] = (
+    "1B  0x01=MAC-Address 0x02=Service-VLAN-ID — MMRP attribute type per IEEE 802.1Q-2018 §10.8.3")
+ETHERTYPE_REGISTRY[0x88F6]["fields"]["Attribute Value"] = (
+    "variable  6B for MAC-Address or 2B for Service-VLAN-ID")
+
+ETHERTYPE_REGISTRY[0x8912]['fields']['OUI'] = '3B  0x00:B0:52 HomePlug Alliance Organizationally Unique Identifier — identifies HomePlug AV2 management frame'
+ETHERTYPE_REGISTRY[0x8912]['fields']['oui'] = ETHERTYPE_REGISTRY[0x8912]['fields']['OUI']
+ETHERTYPE_REGISTRY[0x88E1]['fields']['oui'] = ETHERTYPE_REGISTRY[0x88E1]['fields'].get('OUI', ETHERTYPE_REGISTRY[0x88E1]['fields'].get('oui','3B  0x00:B0:52 HomePlug Alliance OUI'))
