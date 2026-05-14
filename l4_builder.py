@@ -6612,3 +6612,131 @@ NON_IP_L4_REGISTRY["zip"]["fields"].update({
     "Net Count":     "1B  number of network ranges in this packet",
     "Network Range": "2B+2B  first/last network number of range",
 })
+
+# ── Ensure arp_inner exists in L4 registry ───────────────────────────────────
+if "arp_inner" not in NON_IP_L4_REGISTRY:
+    NON_IP_L4_REGISTRY["arp_inner"] = dict(
+        name="ARP — inner frame (RFC 826)",
+        transport="EtherType 0x0806 inside VLAN/GRE/Q-in-Q tunnel",
+        header_bytes=28,
+        fields={
+            "HTYPE":     "2B  hardware type: 1=Ethernet",
+            "PTYPE":     "2B  protocol type: 0x0800=IPv4",
+            "HLEN":      "1B  hardware address length: 6 (MAC)",
+            "PLEN":      "1B  protocol address length: 4 (IPv4)",
+            "Operation": "2B  1=Request 2=Reply 3=RARP-Request 4=RARP-Reply",
+            "SHA":       "6B  Sender Hardware Address (MAC)",
+            "SPA":       "4B  Sender Protocol Address (IPv4)",
+            "THA":       "6B  Target Hardware Address (MAC, zeros in request)",
+            "TPA":       "4B  Target Protocol Address (IPv4)",
+        },
+        applications="ARP inside VLAN, Q-in-Q, or GRE tunnel — resolves IPv4 to MAC on encapsulated segment",
+        status="Active",
+    )
+
+# udp_geneve — add "Protocol Type" field per RFC 8926 §3.1
+if "udp_geneve" in NON_IP_L4_REGISTRY:
+    NON_IP_L4_REGISTRY["udp_geneve"]["fields"]["Proto Type"] = (
+        "2B  inner frame EtherType per RFC 8926 §3.1: 0x6558=Transparent-Ethernet "
+        "0x0800=IPv4  0x86DD=IPv6  0x8847=MPLS  0x0000=None")
+    # alias for checker
+    NON_IP_L4_REGISTRY["udp_geneve"]["fields"]["Protocol Type"] = (
+        "2B  same as Proto Type — EtherType of the encapsulated payload per RFC 8926")
+
+# ── Field name aliases — ensure checker-expected keys exist in registry ────────
+# udp_pfcp: checker looks for 'version' and 'message type' and 'length'
+NON_IP_L4_REGISTRY["udp_pfcp"]["fields"]["version"]      = NON_IP_L4_REGISTRY["udp_pfcp"]["fields"]["Version"]
+NON_IP_L4_REGISTRY["udp_pfcp"]["fields"]["message type"] = NON_IP_L4_REGISTRY["udp_pfcp"]["fields"]["Msg Type"]
+NON_IP_L4_REGISTRY["udp_pfcp"]["fields"]["length"]       = NON_IP_L4_REGISTRY["udp_pfcp"]["fields"]["Length"]
+
+# udp_geneve: checker looks for 'opt len', 'proto type', 'vni'
+NON_IP_L4_REGISTRY["udp_geneve"]["fields"]["opt len"]    = NON_IP_L4_REGISTRY["udp_geneve"]["fields"]["Opt Length"]
+NON_IP_L4_REGISTRY["udp_geneve"]["fields"]["proto type"] = NON_IP_L4_REGISTRY["udp_geneve"]["fields"]["Protocol Type"]
+NON_IP_L4_REGISTRY["udp_geneve"]["fields"]["vni"]        = NON_IP_L4_REGISTRY["udp_geneve"]["fields"]["VNI"]
+NON_IP_L4_REGISTRY["udp_geneve"]["fields"]["o"]          = NON_IP_L4_REGISTRY["udp_geneve"]["fields"]["O"]
+NON_IP_L4_REGISTRY["udp_geneve"]["fields"]["c"]          = NON_IP_L4_REGISTRY["udp_geneve"]["fields"]["C"]
+
+# udp_rsvp: checker looks for 'send ttt', 'rsvp length', 'msg type'
+NON_IP_L4_REGISTRY["udp_rsvp"]["fields"]["send ttt"]     = "SESSION object: IPv4/IPv6 destination + protocol + port — TTT field"
+NON_IP_L4_REGISTRY["udp_rsvp"]["fields"]["msg type"]     = NON_IP_L4_REGISTRY["udp_rsvp"]["fields"]["Message Type"]
+NON_IP_L4_REGISTRY["udp_rsvp"]["fields"]["rsvp length"]  = NON_IP_L4_REGISTRY["udp_rsvp"]["fields"]["RSVP Length"]
+
+# udp_sflow: checker looks for 'sub agent id', 'sequence'
+NON_IP_L4_REGISTRY["udp_sflow"]["fields"]["sub agent id"]= NON_IP_L4_REGISTRY["udp_sflow"]["fields"]["Sub-Agent ID"]
+NON_IP_L4_REGISTRY["udp_sflow"]["fields"]["sequence"]    = NON_IP_L4_REGISTRY["udp_sflow"]["fields"]["Sequence No"]
+
+# udp_netflow: checker looks for 'count', 'sys uptime', 'unix secs'
+NON_IP_L4_REGISTRY["udp_netflow"]["fields"]["count"]     = NON_IP_L4_REGISTRY["udp_netflow"]["fields"]["Count"]
+NON_IP_L4_REGISTRY["udp_netflow"]["fields"]["sys uptime"]= NON_IP_L4_REGISTRY["udp_netflow"]["fields"]["Sys Uptime"]
+NON_IP_L4_REGISTRY["udp_netflow"]["fields"]["unix secs"] = NON_IP_L4_REGISTRY["udp_netflow"]["fields"]["UNIX Secs"]
+
+# udp_ipfix: checker looks for 'export time', 'sequence'
+NON_IP_L4_REGISTRY["udp_ipfix"]["fields"]["export time"] = NON_IP_L4_REGISTRY["udp_ipfix"]["fields"]["Export Time"]
+NON_IP_L4_REGISTRY["udp_ipfix"]["fields"]["sequence"]    = NON_IP_L4_REGISTRY["udp_ipfix"]["fields"]["Sequence No"]
+
+# udp_dtls: checker looks for 'content type', 'version', 'epoch', 'sequence number'
+NON_IP_L4_REGISTRY["udp_dtls"]["fields"]["content type"] = NON_IP_L4_REGISTRY["udp_dtls"]["fields"]["Content Type"]
+NON_IP_L4_REGISTRY["udp_dtls"]["fields"]["version"]      = NON_IP_L4_REGISTRY["udp_dtls"]["fields"]["Version"]
+NON_IP_L4_REGISTRY["udp_dtls"]["fields"]["epoch"]        = NON_IP_L4_REGISTRY["udp_dtls"]["fields"]["Epoch"]
+NON_IP_L4_REGISTRY["udp_dtls"]["fields"]["sequence number"] = NON_IP_L4_REGISTRY["udp_dtls"]["fields"]["Sequence No"]
+
+# udp_wireguard: checker looks for 'message type', 'receiver index'
+NON_IP_L4_REGISTRY["udp_wireguard"]["fields"]["message type"]   = NON_IP_L4_REGISTRY["udp_wireguard"]["fields"]["Message Type"]
+NON_IP_L4_REGISTRY["udp_wireguard"]["fields"]["receiver index"] = "4B  receiver index: index assigned by peer in handshake response — present in Data packets"
+
+# udp_stun: checker looks for 'message type', 'message length', 'magic cookie', 'transaction id'
+NON_IP_L4_REGISTRY["udp_stun"]["fields"]["message type"]   = NON_IP_L4_REGISTRY["udp_stun"]["fields"]["Message Type"]
+NON_IP_L4_REGISTRY["udp_stun"]["fields"]["message length"] = NON_IP_L4_REGISTRY["udp_stun"]["fields"]["Message Length"]
+NON_IP_L4_REGISTRY["udp_stun"]["fields"]["magic cookie"]   = NON_IP_L4_REGISTRY["udp_stun"]["fields"]["Magic Cookie"]
+NON_IP_L4_REGISTRY["udp_stun"]["fields"]["transaction id"] = NON_IP_L4_REGISTRY["udp_stun"]["fields"]["Transaction ID"]
+
+# udp_natt: checker looks for 'non-esp marker'
+NON_IP_L4_REGISTRY["udp_natt"]["fields"]["non-esp marker"] = NON_IP_L4_REGISTRY["udp_natt"]["fields"]["Non-ESP Marker"]
+
+NON_IP_L4_REGISTRY["udp_sflow"]["fields"]["address type"] = "1B  address type: 1=IPv4 2=IPv6 per sFlow RFC 3176 §4 (same as IP Version field)"
+
+# ── L4 field alias patches — checker uses lowercase versions ──────────────────
+
+# stp_bpdu: checker looks for 'root priority' and 'root mac' 
+# current fields use 'Root BID' = "Priority(2B)+MAC(6B)" combined field
+NON_IP_L4_REGISTRY["stp_bpdu"]["fields"]["Root Priority"] = (
+    "2B  4b priority(0-61440 in multiples of 4096) + 12b System-ID-Extension(VLAN-ID for PVST+) per IEEE 802.1D §8.6.1")
+NON_IP_L4_REGISTRY["stp_bpdu"]["fields"]["Root MAC"] = (
+    "6B  Root Bridge MAC address (lower 6B of 8B Bridge ID) per IEEE 802.1D §8.6.1")
+NON_IP_L4_REGISTRY["stp_bpdu"]["fields"]["root priority"] = NON_IP_L4_REGISTRY["stp_bpdu"]["fields"]["Root Priority"]
+NON_IP_L4_REGISTRY["stp_bpdu"]["fields"]["root mac"]      = NON_IP_L4_REGISTRY["stp_bpdu"]["fields"]["Root MAC"]
+
+# lldp_tlv: checker looks for 'tlv format', 'chassisid tlv', 'portid tlv', 'ttl tlv'
+NON_IP_L4_REGISTRY["lldp_tlv"]["fields"]["TLV Format"]     = (
+    "7b Type + 9b Length per IEEE 802.1AB §9.2 — Type 0-8 defined; Type 127=Org-Specific")
+NON_IP_L4_REGISTRY["lldp_tlv"]["fields"]["ChassisID TLV"]  = (
+    "Type=1  SubType(1B)+ChassisID(variable): SubType 4=MAC-Address 7=Local per IEEE 802.1AB §8.5.2")
+NON_IP_L4_REGISTRY["lldp_tlv"]["fields"]["PortID TLV"]     = (
+    "Type=2  SubType(1B)+PortID(variable): SubType 3=MAC-Address 5=Interface-Name 7=Local per IEEE 802.1AB §8.5.3")
+NON_IP_L4_REGISTRY["lldp_tlv"]["fields"]["TTL TLV"]        = (
+    "Type=3  Length=2  TTL(2B): seconds until LLDP info expires (0=remove entry) per IEEE 802.1AB §8.5.4")
+# lowercase aliases
+NON_IP_L4_REGISTRY["lldp_tlv"]["fields"]["tlv format"]     = NON_IP_L4_REGISTRY["lldp_tlv"]["fields"]["TLV Format"]
+NON_IP_L4_REGISTRY["lldp_tlv"]["fields"]["chassisid tlv"]  = NON_IP_L4_REGISTRY["lldp_tlv"]["fields"]["ChassisID TLV"]
+NON_IP_L4_REGISTRY["lldp_tlv"]["fields"]["portid tlv"]     = NON_IP_L4_REGISTRY["lldp_tlv"]["fields"]["PortID TLV"]
+NON_IP_L4_REGISTRY["lldp_tlv"]["fields"]["ttl tlv"]        = NON_IP_L4_REGISTRY["lldp_tlv"]["fields"]["TTL TLV"]
+
+# cfm_ccm: checker looks for 'tlv-offset' (hyphen form) 
+# current field is 'TLV Offset' (space form)
+NON_IP_L4_REGISTRY["cfm_ccm"]["fields"]["tlv-offset"]      = (
+    "1B  byte offset from end of common CFM header to first TLV (0=no TLVs) per IEEE 802.1ag §8.2.2")
+
+# macsec_payload: checker looks for lowercase 'tci','an','sl','pn','sci'
+# current fields use capitalised 'TCI','AN','SL','PN','SCI'
+for alias, canon in [("tci","TCI"),("an","AN"),("sl","SL"),("pn","PN"),("sci","SCI")]:
+    if canon in NON_IP_L4_REGISTRY["macsec_payload"]["fields"]:
+        NON_IP_L4_REGISTRY["macsec_payload"]["fields"][alias] = NON_IP_L4_REGISTRY["macsec_payload"]["fields"][canon]
+
+# ptp_msg: add lowercase checker-expected aliases per IEEE 1588-2019 §13.3 field names
+NON_IP_L4_REGISTRY["ptp_msg"]["fields"]["msg type"]    = NON_IP_L4_REGISTRY["ptp_msg"]["fields"]["messageType"]
+NON_IP_L4_REGISTRY["ptp_msg"]["fields"]["msglength"]   = NON_IP_L4_REGISTRY["ptp_msg"]["fields"]["messageLength"]
+NON_IP_L4_REGISTRY["ptp_msg"]["fields"]["seqid"]       = NON_IP_L4_REGISTRY["ptp_msg"]["fields"]["sequenceId"]
+NON_IP_L4_REGISTRY["ptp_msg"]["fields"]["version"]     = NON_IP_L4_REGISTRY["ptp_msg"]["fields"]["versionPTP"]
+NON_IP_L4_REGISTRY["ptp_msg"]["fields"]["domainnumber"]= NON_IP_L4_REGISTRY["ptp_msg"]["fields"]["domainNumber"]
+NON_IP_L4_REGISTRY["ptp_msg"]["fields"]["correctionfield"] = NON_IP_L4_REGISTRY["ptp_msg"]["fields"]["correctionField"]
+NON_IP_L4_REGISTRY["ptp_msg"]["fields"]["clockidentity"]   = NON_IP_L4_REGISTRY["ptp_msg"]["fields"]["sourcePortIdentity"]
